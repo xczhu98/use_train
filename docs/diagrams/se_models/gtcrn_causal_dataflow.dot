@@ -1,0 +1,33 @@
+digraph GTCRNCausalDataflow {
+  graph [rankdir=LR, bgcolor="white", pad="0.20", nodesep="0.28", ranksep="0.50",
+    splines=ortho, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=22,
+    fontcolor="#142338", labelloc=t, label="GTCRN｜因果数据流（模型边界内）"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=12,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.6,
+    margin="0.14,0.10"];
+  edge [color="#2E6EB5", penwidth=1.9, arrowsize=0.75];
+
+  input [label="noisy_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+  erb [label="特征构造 + ERB 压缩\n[B, 9, T, 129]", fillcolor="#E7F5EC", color="#388B57"];
+  enc [label="causal encoder\n仅左侧时间 padding\n保存 5 级 skip", fillcolor="#E7F5EC", color="#388B57"];
+
+  subgraph cluster_dp {
+    label="每个 G-DPRNN block"; color="#D6A23D"; fillcolor="#FFF9E8"; style="rounded,filled";
+    intra [label="intra：逐帧沿 F\n双向 grouped GRU\n同一时刻内可看全频率", fillcolor="#FFF3D1", color="#C78300"];
+    inter [label="inter：逐频带沿 T\n单向 grouped GRU\n只依赖当前与过去帧", fillcolor="#FFF3D1", color="#C78300"];
+    residual [label="Linear + LayerNorm\nresidual update", fillcolor="#FFF7E3", color="#C78300"];
+    intra -> inter -> residual;
+  }
+
+  dec [label="causal decoder\n对应 skip 相加\n时间转置卷积保持因果", fillcolor="#F1E8FA", color="#7047A3"];
+  crm [label="complex ratio mask\nERB Band Split 后作用于 noisy complex", fillcolor="#FDE8EE", color="#B33A55"];
+  output [label="enhanced_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+
+  input -> erb -> enc -> intra;
+  residual -> dec -> crm -> output;
+  enc -> dec [style=dashed, color="#6E8191", label="5-level skip"];
+  input -> crm [style=dashed, color="#6E8191", label="noisy complex"];
+
+  note [shape=note, label="Framework / Trainer 在模型外完成\nwaveform → STFT 与 iSTFT → waveform", fillcolor="#EEF3F7", color="#6E8191"];
+  note -> input [style=dotted, color="#6E8191", arrowhead=none, constraint=false];
+}

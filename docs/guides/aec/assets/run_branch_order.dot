@@ -1,0 +1,45 @@
+digraph AECBranchOrder {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.18", margin="0.05",
+    nodesep="0.24", ranksep="0.42", splines=ortho,
+    outputorder=edgesfirst, fontname="Noto Sans CJK SC",
+    fontsize=26, fontcolor="#142338",
+    labelloc=t, label="dynamic_aec：Layer A–F 七路分支与共同 post-mix"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
+    fontsize=13, color="#365875", fontcolor="#142338",
+    penwidth=1.6, margin="0.15,0.10"
+  ];
+  edge [color="#526E86", penwidth=1.7, arrowsize=0.76];
+
+  a [label="Layer A 完成\nclean speech 已预处理", fillcolor="#EAF2FA", color="#2E6EB5"];
+  b [label="Layer B｜一次均匀抽样\nAEC 七路互斥分支 · 概率和 = 1", fillcolor="#FFF0DA", color="#D56A16", penwidth=2.0];
+
+  clean [label="prob_target_only\nC-0 early RIR\nmic = clean target", fillcolor="#E7F5EC", color="#388B57"];
+  noise [label="noise_only\nC-1 / C-2 / C-3 noise\ntarget：joint=0 · aec=noise", fillcolor="#F5EDFC", color="#7651A8"];
+  echo [label="prob_echo_only\nC-aec echo\nmic = echo · target=0", fillcolor="#E5F4F2", color="#248277"];
+  necho [label="prob_noise_echo_only\nnoise + C-aec echo\ntarget：joint=0 · aec=noise", fillcolor="#F5EDFC", color="#7651A8"];
+  nn [label="prob_target_noise\nC-0 + noise\ntarget：joint=clean · aec=noisy", fillcolor="#E7F5EC", color="#388B57"];
+  nee [label="prob_target_echo\nC-0 + C-aec echo\ntarget：joint=clean · aec=noisy", fillcolor="#E7F5EC", color="#388B57"];
+  nne [label="prob_target_noise_echo\nC-0 + noise + C-aec echo\ntarget：joint=clean · aec=noisy", fillcolor="#E7F5EC", color="#388B57"];
+
+  merge [label="共同组包\nmic + nearend + farend + echo + noise stems", fillcolor="#EEF3F7", color="#365875", penwidth=2.0];
+  pre [label="pre-finite", fillcolor="#F5F8FA", color="#6E8191"];
+  dn [label="Layer D / D-normalize\n可配置 peak normalization · 默认 off", fillcolor="#F5EDFC", color="#7651A8"];
+  dg [label="Layer D / D-guard\n确定性线性安全缩放 · 固定执行\nmic-related stems 共用 scale；farend 独立保护", fillcolor="#FFF3D1", color="#C78300", penwidth=2.0];
+  ef [label="Layer E → Layer F\nchannel degradation → observation / device degradation", fillcolor="#FDE8DD", color="#B85A32"];
+  final [label="task-post-EF → final-guard → post-finite", fillcolor="#E5F4F2", color="#248277"];
+  time [label="scene-wide TimeTransformPlan\n→ 11/12 元组样本 → aec_collate_fn\n→ AECBatch", fillcolor="#DCEAF7", color="#183B66", penwidth=2.0];
+  frontend [label="AECDeploymentFrontend\nTrainer / Inference：STFT 前\n不属于 Dataset 仿真", fillcolor="#FDE8EE", color="#D84A73", penwidth=2.0];
+
+  a -> b;
+  { rank=same; clean; noise; echo; necho; }
+  { rank=same; nn; nee; nne; }
+  { rank=same; time; frontend; }
+  b -> clean; b -> noise; b -> echo; b -> necho; b -> nn; b -> nee; b -> nne;
+  clean -> merge; noise -> merge; echo -> merge; necho -> merge;
+  nn -> merge; nee -> merge; nne -> merge;
+  merge -> pre -> dn -> dg -> ef -> final -> time;
+  time -> frontend [style=dashed, color="#D84A73"];
+}

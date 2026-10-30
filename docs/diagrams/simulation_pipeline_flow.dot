@@ -1,0 +1,55 @@
+digraph SimulationPipelineFlow {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.18", margin="0.04",
+    nodesep="0.24", ranksep="0.38", splines=ortho,
+    outputorder=edgesfirst, size="16,9", ratio=compress,
+    fontname="Noto Sans CJK SC",
+    fontsize=26, fontcolor="#142338",
+    labelloc=t, label="SE / AEC / TSE / SS / SSL 公共 post-mix 仿真流程"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
+    fontsize=13, color="#365875", fontcolor="#142338",
+    penwidth=1.5, margin="0.15,0.10"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC", fontsize=11, color="#526E86",
+    fontcolor="#405A75", penwidth=1.7, arrowsize=0.75
+  ];
+
+  input [label="输入资产\nclean / noise / RIR\nAEC farend-echo pair\nSSL typed scene / noise pool", fillcolor="#EAF2FA"];
+  a [label="Layer A\nclean 预处理\nsplice · speed · EQ", fillcolor="#E7F5EC", color="#388B57"];
+  b [label="Layer B\none-branch / source draw\nTSE/SS/SSL relative timeline", fillcolor="#E7F5EC", color="#388B57"];
+  c [label="Layer C\n声学与场景混合\nRIR · gain · noise · wind\nAEC C-aec echo chain", fillcolor="#E7F5EC", color="#388B57"];
+  scene [label="scene bundle\nobservation + target\n+ synchronized stems", fillcolor="#EEF3F7"];
+
+  pre_finite [label="pre-finite\npost-mix 有限值检查", fillcolor="#F5F8FA", color="#6E8191"];
+  d [shape=plain, label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="8" COLOR="#C78300">
+      <TR><TD COLSPAN="3" BGCOLOR="#FFF3D1"><FONT COLOR="#6C4600"><B>Layer D｜post-mix amplitude conditioning</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="normalize" BGCOLOR="#F5EDFC"><B>D-normalize</B><BR/>峰值归一化（可选）<BR/>scene-consistent scale</TD>
+        <TD BORDER="0" BGCOLOR="white"><FONT POINT-SIZE="18" COLOR="#526E86">→</FONT></TD>
+        <TD PORT="guard" BGCOLOR="#FFF3D1"><B>D-guard</B><BR/>Deterministic peak guard<BR/>确定性线性安全缩放<BR/>不执行 hard clip</TD>
+      </TR>
+    </TABLE>
+  >];
+  e [label="Layer E\nChannel degradation\n保留 channel clipping\n带宽 · codec · 丢包", fillcolor="#FFE8D8", color="#C85D24", penwidth=2.0];
+  f [label="Layer F\nObservation / device clipping\npre-drive → fixed_rail\n设备削波权威位置", fillcolor="#FDE3E8", color="#B33A55", penwidth=2.2];
+  task [label="task-post-EF\n任务后处理 / AEC mic extra noise", fillcolor="#EDF2F6"];
+  final [label="final-guard\n确定性最终安全网", fillcolor="#FFF3D1", color="#C78300", penwidth=2.0];
+  post_finite [label="post-finite\n交付前有限值检查", fillcolor="#F5F8FA", color="#6E8191"];
+  output [label="sample → collate / batch\nSE / AEC / TSE / SS / SSL", fillcolor="#EAF2FA", color="#2E6EB5", penwidth=2.0];
+  frontend [label="AECDeploymentFrontend\nAEC 模型输入 / 部署链路\nTrainer / Inference：STFT 前\n不属于 Dataset 仿真", fillcolor="#FDE8EE", color="#D84A73", penwidth=2.0];
+
+  target [label="target / supervision 旁路\n不进入 E channel degradation\n不进入 F observation clipping", fillcolor="#F5F8FA", color="#6E8191", style="rounded,filled,dashed"];
+
+  { rank=same; input; a; b; c; scene; pre_finite; }
+  { rank=same; e; f; task; final; post_finite; output; frontend; }
+
+  input -> a -> b -> c -> scene -> pre_finite -> d:normalize:n;
+  d:guard:s -> e -> f -> task -> final -> post_finite -> output;
+  output -> frontend [style=dashed, color="#D84A73", label="AEC only：collate 后"];
+  scene -> target [style=dashed, color="#6E8191", constraint=false];
+  target -> output [style=dashed, color="#6E8191"];
+}

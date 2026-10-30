@@ -1,0 +1,75 @@
+digraph audio_filter_v3_overview {
+  graph [
+    bgcolor="#071426",
+    pad="0.35",
+    nodesep="0.42",
+    ranksep="0.72 equally",
+    splines=ortho,
+    fontname="Noto Sans CJK SC",
+    fontcolor="#F4F8FF",
+    label="Audio Filter Pipeline v3\n不可变 artifact DAG 与目标步骤闭包",
+    labelloc=t,
+    fontsize=24
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontcolor="#F4F8FF",
+    fontsize=13,
+    color="#35B8FF",
+    fillcolor="#102C4A",
+    penwidth=1.8,
+    margin="0.18,0.12"
+  ];
+  edge [
+    color="#6ED6FF",
+    penwidth=2.2,
+    arrowsize=0.8,
+    fontname="Noto Sans CJK SC",
+    fontcolor="#CDEEFF",
+    fontsize=11
+  ];
+
+  step0 [label="Step0  输入冻结\n扫描、header 门禁、SHA-256"];
+  step1 [label="Step1  分析\nTEN VAD、带宽、稳定静音"];
+  step2 [label="Step2  分段\n连续且安全的 segments"];
+  step3 [label="Step3  动态 MOS 打分\nexact-source route · tuple 分组 · ordinal 合并\n按配置加载所选模型 · 未选模型不 preflight", color="#B66CFF", fillcolor="#35215B"];
+
+  step4 [label="Step4  动态 K/N MOS 筛选\nK/N 由配置决定 · 默认 SCOREQ + DNSMOS 严格 2/2", color="#FFC84A", fillcolor="#4B3513", fontcolor="#FFF2C7"];
+  se [label="SE clean 发布\nFLAC / PCM_24", color="#FFC84A", fillcolor="#302711", fontcolor="#FFF2C7"];
+
+  step5 [label="Step5  透明转发 MOS tuple\nspk_filter 默认启用 speaker consistency\n/REPLACE_ME 占位由 execution preflight fail-closed", style="rounded,filled,dashed", color="#FF9F43", fillcolor="#4A2C18", fontcolor="#FFF2D8"];
+  step6 [label="Step6  最终决策\n动态 K/N MOS + speaker", color="#41D6C3", fillcolor="#123E42"];
+  tse [label="TSE 发布\nmetadata + 可选音频导出", color="#41D6C3", fillcolor="#103135"];
+
+  step0 -> step1 -> step2 -> step3;
+  step3 -> step4 [color="#FFC84A"];
+  step4 -> se [color="#FFC84A"];
+  step3 -> step5;
+  step5 -> step6 [color="#41D6C3"];
+  step6 -> tse [color="#41D6C3"];
+
+  step4_closure [
+    shape=note,
+    label="Step4 闭包\nStep0 → Step1 → Step2 → Step3 → Step4",
+    color="#FFC84A",
+    fillcolor="#2C2412",
+    fontcolor="#FFF2C7",
+    fontsize=11
+  ];
+  step6_closure [
+    shape=note,
+    label="Step6 / all 闭包\nStep0 → Step1 → Step2 → Step3 → Step5 → Step6\n不执行 Step4",
+    color="#41D6C3",
+    fillcolor="#102F32",
+    fontsize=11
+  ];
+
+  { rank=same; step4; step5; }
+  { rank=same; se; step6; }
+  { rank=same; step4_closure; tse; step6_closure; }
+
+  se -> step4_closure [style=dashed, arrowhead=none, color="#A98B3F", constraint=false];
+  tse -> step6_closure [style=dashed, arrowhead=none, color="#2A978B", constraint=false];
+}

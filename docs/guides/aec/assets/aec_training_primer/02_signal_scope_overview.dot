@@ -1,0 +1,46 @@
+digraph aec_signal_scope {
+  graph [rankdir=TB, newrank=true, bgcolor="white", pad="0.20", nodesep="0.28", ranksep="0.42", splines=ortho, compound=true, fontname="Noto Sans CJK SC", label="AEC 信号作用域：Dataset A–F 与模型输入前端边界", labelloc=t, fontsize=22, fontcolor="#17324D"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=10.5, color="#416984", fontcolor="#17324D", penwidth=1.35, margin="0.13,0.08"];
+  edge [fontname="Noto Sans CJK SC", fontsize=9, color="#53758C", fontcolor="#35566D", penwidth=1.35, arrowsize=0.7];
+
+  subgraph cluster_dataset {
+    label="DynamicMixingDataset._run：六层仿真（A–F）"; color="#C86A19"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#9A4D0E";
+    clean [label="clean speech", fillcolor="#EEF5FB", color="#2469B3"];
+    a [label="Layer A\nclean 预处理", fillcolor="#FFF2E3", color="#C86A19"];
+    b [label="Layer B\n七分支互斥选择", fillcolor="#FFF2E3", color="#C86A19"];
+    c [label="Layer C\nRIR / noise / C-aec 混合", fillcolor="#FFF2E3", color="#C86A19"];
+    d [label="Layer D\nnormalize → guard", fillcolor="#FFF4D9", color="#C17A00"];
+    e [label="Layer E\nchannel degradation\n仅 mic observation", fillcolor="#FDECEF", color="#B64560"];
+    f [label="Layer F\npost-mix distortion\n仅 mic observation", fillcolor="#FDECF5", color="#A33B72"];
+    mic [label="最终 mic / noisy", fillcolor="#E9F7E9", color="#388B42"];
+    target [label="nearend / clean target\n经过 D；仅绕过 E / F", fillcolor="#FFFFFF", color="#7B8791", style="rounded,dashed,filled"];
+    pair [label="real_farend_echo_pair_json\nfarend + echo", fillcolor="#E8F7F6", color="#16837E"];
+    caec [label="C-aec\n磁盘 pair 预对齐 · EQ / SER / ERL\nclipping · echo delay / jitter", fillcolor="#E8F7F6", color="#16837E"];
+    echo [label="echo source stem\n混入 mic", fillcolor="#E8F7F6", color="#16837E"];
+    echo_audit [label="echo audit stem\n同步经过 D-normalize / D-guard\n绕过 E / F", fillcolor="#FFFFFF", color="#16837E", style="rounded,dashed,filled"];
+    far [label="farend reference\nD-normalize 同比；D-guard 独立", fillcolor="#E8F7F6", color="#16837E"];
+
+    {rank=same; clean; a; b; c; d;}
+    {rank=same; pair; caec; echo; far; target; echo_audit;}
+    {rank=same; e; f; mic;}
+
+    clean -> a -> b -> c -> d;
+    pair -> caec;
+    caec -> echo;
+    caec -> far;
+    echo -> c;
+    d -> target [style=dashed, color="#7B8791"];
+    d -> echo_audit [style=dashed, color="#16837E"];
+    d -> e -> f -> mic;
+  }
+
+  collate [label="_build_sample → 11/12 元组样本\naec_collate_fn → AECBatch", fillcolor="#EEF5FB", color="#2469B3"];
+  frontend [label="AECDeploymentFrontend（Dataset 外）\n可选 delay alignment → 可选 LinearAEC", fillcolor="#E6F7F5", color="#16837E"];
+  stft [label="trainer STFT\nmic / aligned farend / nearend / error\n→ model dict spectra", fillcolor="#F1ECFF", color="#6F4EB5"];
+
+  {rank=same; collate; frontend; stft;}
+  mic -> collate [ltail=cluster_dataset];
+  target -> collate [style=dashed, color="#7B8791"];
+  far -> collate [color="#16837E"];
+  collate -> frontend -> stft;
+}

@@ -1,0 +1,75 @@
+# ======================================================================
+# 推理配置：TSE_Modular + spatial（DOA 方向 cue），MC-LibriMix 4 通道
+# ======================================================================
+# Params 22.61M total（TSE_Modular backbone=bsrnn + spatial frontend，
+#   本机 smoke 训练日志实测值）；本文件是 inference_only 配置，不报告训练态
+#   trainable scope。MACs/FLOPs: not measured（未做本地算子统计，不编造数值）。
+# RTF: not measured（未做本地实时率测量）。
+# Trainer MOS boundary：Trainer 不负责 MOS；未做本地主观 MOS，DNSMOS 代理不等价于主观听测。
+# 本 infer 配置保持独立，不继承训练模板。
+# ----------------------------------------------------------------------
+# cue role：模型 IO 合同声明 canonical role spatial（结构化 npy，fields
+#   azimuth/elevation[/distance/sample_anchor]，弧度制，array-local 坐标系），
+#   adapter 按该 role 读取 FileInferenceItem.inputs 并绑定 artifact identity
+#   （tasks/tse/inference/adapter.py::_decode_spatial）。
+# 与训练配置 configs/tse/spatial/tse_modular_spatial_mclibrimix.yaml 的关系：
+#   训练时 n_channel/ref_channel/mic_positions_m/speed_of_sound_mps 由 entry 从
+#   dataset geometry 自动注入；推理路径无 dataset，本文件显式固化同一组值
+#   （ReSpeaker 4-mic 方阵 [±0.02285, ±0.02285, 0] m，声速 343.0 m/s），
+#   改动训练侧几何时必须同步本文件。
+# 文件推理入口：python inference.py -C configs/tse/inference/tse_modular_spatial_mclibrimix_infer.yaml
+#   --checkpoint <训练 ckpt> --tse-manifest <manifest.jsonl> --output_dir <dir>
+# 实现路径：tasks/tse/models/discriminative/tse_modular.py、
+#   tasks/tse/models/modules/spatial/、tasks/tse/inference/extractor.py、
+#   tasks/tse/inference/adapter.py。
+# ======================================================================
+
+# meta：本文件仅用于推理（inference_only）
+meta:
+  inference_only: true          # true = 跳过训练字段校验、只走推理路径；命名必须以 _infer.yaml 结尾（tests/test_configs.py:1462-1467）
+
+# stft：分析综合窗；win_length 必须等于 n_fft（BandSplit 子带表据此推导）
+stft:
+  n_fft: 512                    # FFT 点数（samples）；512 @16 kHz → F=257，与训练配置一致
+  hop_length: 128               # 帧移（samples）；128 @16 kHz = 8 ms
+  win_length: 512               # 分析窗长（samples）；必须等于 stft.n_fft
+  window: hann                  # 窗函数枚举：hann；center 未声明取 runtime 默认 True
+
+# model：TSE_Modular（backbone=bsrnn + spatial cue：IPD/CDF/SDF/ΔSTFT），几何显式固化
+model:
+  # 模型注册名；与训练配置同一组合解析（modular_spec.py）
+  type: TSE_Modular
+  # 模型构造参数；推理无 dataset 注入，geometry 在此显式声明且必须与训练侧一致
+  args:
+    backbone: bsrnn             # 分离主干；与训练配置一致
+    # bsrnn 主干参数；与训练配置一致
+    separator:
+      feature_dim: 128          # BandSplit 子带特征维（无量纲）
+      num_repeat: 6             # BSNet 重复次数（无量纲）
+      causal: false             # false = 非因果
+      rnn_norm_eps: 1.0e-5      # RNN norm epsilon（无量纲）
+    # cue 装配表；仅 spatial cue
+    cues:
+      # spatial cue：消费 4 通道 mixture 谱 + 句级静态 DOA（azimuth/elevation，弧度）
+      spatial:
+        frontend: spatial       # spatial frontend（谱域空间特征提取）
+        representation: static  # static | track；MC-LibriMix cue 为句级静态方向
+        # spatial cue 的特征开关表；pairs 省略 = n_channel=4 全组合 6 对麦克风
+        features:
+          ipd: {}               # 麦克风对相位差（fixed feature，无参数）
+          cdf: {}               # DOA 条件余弦距离特征（target-conditioned，需 geometry+声速）
+          sdf: {}               # DOA 条件转向距离特征（target-conditioned，需 geometry+声速）
+          delta_stft: {}        # 麦克风对 STFT 幅度差（fixed feature，无参数）
+    composition: {}             # 组合开关；空 = 用默认
+    sample_rate: 16000          # 采样率（Hz）；须与 data.sample_rate 一致
+    n_channel: 4                # mixture 麦克风数；ReSpeaker 4-mic，与训练 dataset geometry 一致
+    ref_channel: 0              # 参考麦克风索引；与训练配置 reference_channel 一致
+    # 阵列几何（m，[C,3]）；ReSpeaker 4-mic 方阵，与 simulation_config.yaml 一致
+    mic_positions_m: [[0.02285, 0.02285, 0.0], [-0.02285, 0.02285, 0.0], [-0.02285, -0.02285, 0.0], [0.02285, -0.02285, 0.0]]
+    # 场景声速（m/s）；CDF/SDF 计算所需，与训练侧 spatial_speed_of_sound_mps 一致
+    speed_of_sound_mps: 343.0
+
+# data：推理仅消费采样率合同，不构建 Dataset
+data:
+  mode: dynamic_tse             # 必填路由字段；推理只用该 mode 的采样率合同，不构建 Dataset
+  sample_rate: 16000            # 采样率（Hz）；必须与 model.args.sample_rate 一致

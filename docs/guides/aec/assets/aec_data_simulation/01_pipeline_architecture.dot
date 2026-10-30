@@ -1,0 +1,89 @@
+digraph AECSimulationPipeline {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.18", margin="0.04",
+    nodesep="0.24", ranksep="0.38", splines=ortho,
+    outputorder=edgesfirst, size="16,9", ratio=compress,
+    fontname="Noto Sans CJK SC",
+    fontsize=25, fontcolor="#142338",
+    labelloc=t, label="AEC post-mix 仿真：observation clipping 权威边界"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
+    fontsize=12, color="#365875", fontcolor="#142338",
+    penwidth=1.5, margin="0.14,0.09"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC", fontsize=10, color="#526E86",
+    fontcolor="#405A75", penwidth=1.7, arrowsize=0.72
+  ];
+
+  subgraph cluster_near {
+    label="近端与 noisy 主线";
+    fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#23589A";
+    color="#4E82C2"; penwidth=1.6; style="rounded";
+
+    clean [label="clean speech", fillcolor="#EAF2FA"];
+    a [label="Layer A\nsplice · speed · EQ", fillcolor="#E7F5EC", color="#388B57"];
+    b [label="Layer B\nAEC one-branch draw", fillcolor="#E7F5EC", color="#388B57"];
+    c0 [label="C-0 / C-0b\nRIR + target volume", fillcolor="#F5EDFC", color="#7651A8"];
+    cnoise [label="C-1 / C-2 / C-3\nnoise · wind · colored", fillcolor="#F5EDFC", color="#7651A8"];
+    target [label="nearend target\n监督 stem", fillcolor="#FFF5D9", color="#C58A00"];
+    { rank=same; clean; a; b; c0; target; }
+  }
+
+  subgraph cluster_echo {
+    label="AEC-only farend / echo 支路";
+    fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#0A726A";
+    color="#2C9187"; penwidth=1.6; style="rounded";
+
+    pair [label="farend / echo pair", fillcolor="#E5F4F2", color="#248277"];
+    caec [label="C-aec asset chain\nGCC align · EQ · SER / ERL\necho-domain clip · delay / jitter", fillcolor="#E5F4F2", color="#248277"];
+    farend [label="farend reference", fillcolor="#E5F4F2", color="#248277"];
+    echo [label="echo stem", fillcolor="#E5F4F2", color="#248277"];
+    { rank=same; pair; caec; farend; echo; }
+  }
+
+  mix [label="AEC scene bundle\nmic observation + nearend target\n+ farend / echo / noise stems", fillcolor="#EEF3F7", penwidth=2.0];
+  pre_finite [label="pre-finite\npost-mix 有限值检查", fillcolor="#F5F8FA", color="#6E8191"];
+  d [shape=plain, label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="8" COLOR="#C78300">
+      <TR><TD COLSPAN="3" BGCOLOR="#FFF3D1"><FONT COLOR="#6C4600"><B>Layer D｜post-mix amplitude conditioning</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="normalize" BGCOLOR="#F5EDFC"><B>D-normalize</B><BR/>joint peak normalization（可选）<BR/>mic-related stems 共同 scale</TD>
+        <TD BORDER="0" BGCOLOR="white"><FONT POINT-SIZE="18" COLOR="#526E86">→</FONT></TD>
+        <TD PORT="guard" BGCOLOR="#FFF3D1"><B>D-guard</B><BR/>Deterministic peak guard<BR/>mic-related stems 共同 scale<BR/>farend 独立 guard；不执行 hard clip</TD>
+      </TR>
+    </TABLE>
+  >];
+  e [label="Layer E\nChannel degradation\n保留 channel clipping\n直接作用于 mic", fillcolor="#FFE8D8", color="#C85D24", penwidth=2.0];
+  f [label="Layer F\nObservation / device clipping\npre-drive → fixed_rail\nmic clipping 权威位置", fillcolor="#FDE3E8", color="#B33A55", penwidth=2.2];
+  task [label="task-post-EF\n可选 mic extra noise", fillcolor="#EDF2F6"];
+  final [label="final-guard\n仅保护 observation / mic\n不同比缩放 nearend / echo / noise / farend", fillcolor="#FFF3D1", color="#C78300", penwidth=2.0];
+  post_finite [label="post-finite\n交付前有限值检查", fillcolor="#F5F8FA", color="#6E8191"];
+  frontend [label="AECDeploymentFrontend\nAEC 模型输入 / 部署链路\nTrainer / Inference：STFT 前\n不属于 Dataset 仿真", fillcolor="#FDE8EE", color="#D84A73", penwidth=2.0];
+  tuple [label="resample / align / finalize\nAEC tuple\nnearend · mic · farend · error · flags", fillcolor="#EAF2FA", color="#2E6EB5", penwidth=2.0];
+  bypass [label="target / supervision bypass\n不进入 Layer E\n不进入 Layer F fixed rail", fillcolor="#F5F8FA", color="#6E8191", style="rounded,filled,dashed"];
+
+  clean -> a -> b;
+  b -> c0;
+  b -> cnoise;
+  c0 -> target;
+  c0 -> mix;
+  cnoise -> mix;
+
+  pair -> caec;
+  caec -> farend;
+  caec -> echo;
+  echo -> mix;
+  farend -> mix;
+
+  { rank=same; mix; pre_finite; }
+  { rank=same; e; f; task; final; post_finite; tuple; frontend; }
+
+  mix -> pre_finite -> d:normalize:n;
+  d:guard:s -> e -> f -> task -> final -> post_finite -> tuple;
+  frontend -> tuple [style=dashed, color="#D84A73", label="AEC only"];
+  target -> d:normalize:n [color="#C58A00", constraint=false];
+  d:guard:s -> bypass [style=dashed, color="#6E8191", constraint=false];
+  bypass -> tuple [style=dashed, color="#6E8191"];
+}

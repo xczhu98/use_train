@@ -1,0 +1,163 @@
+# ============================================================
+# 模板配置：DeepVQE small + offline_aec（离线预仿真三元组）
+# 数据管线：offline_aec（AEC 离线模式）
+# Model: DeepVQE small（n_fft=320，align_delay=100）
+# Params: 452,615 total / 452,615 trainable
+# 1 秒 mic+farend MACs: 754,494,644（THOP partial/unverified；B=1，16 kHz，
+#   F=161，T=101；仅统计当前谱域前向，图外 STFT/iSTFT 不计）
+# FLOPs: 1.497G @ 1 s / 16 kHz（FlopCounterMode；B=1，F=161，T=101；仅模型前向，图外 STFT/iSTFT 不计）
+# RTF: not measured（无量纲 realtime factor；待在目标硬件、固定线程与部署路径实测）
+# Trainer MOS boundary: AECTrainer 在线验证不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等
+#   通过 evaluate/ 在 checkpoint 推理产物上离线评估。
+# ============================================================
+# 本文件是 copy-and-fill 模板：先复制为实验专用 YAML，再填写 SCP 路径；不要把
+# 占位模板本身当作可直接训练的配置。磁盘数据为 mic / farend / nearend 必需三轨，
+# error 为可选的 LAEC 时域残差轨；四轨均按 uid 配对，监督目标为 nearend。
+# 与 dynamic_aec 的区别是无在线仿真，数据由外部管线预生成（例如用相同仿真逻辑
+# 离线渲染）。所有 SCP 均使用 canonical 四列格式：uid fs length path。
+#
+# 数据准备：
+#   python tools/prepare_data_tools/scp/prepare_aec_offline.py \
+#       --mic_dir /path/to/mic --farend_dir /path/to/farend \
+#       --nearend_dir /path/to/nearend [--error_dir /path/to/error] \
+#       --output-dir data/aec_offline --val_ratio 0.05
+#   将下方 ~ 占位替换为生成的 SCP 路径；支持本机绝对路径或仓库根下的
+#   data/... 相对路径。只提交路径字面量，不提交数据产物本体。
+#
+# Train（使用复制并填写后的实验配置路径）：
+#   python train.py -C /path/to/copied_offline_aec.yaml
+# ============================================================
+
+meta:                    # 全局训练超参（随机种子、精度、cuDNN 行为）；逐键说明见下
+  seed: 42               # 全局随机种子；validation seed 由 Trainer 派生
+  use_amp: false         # 关闭 AMP，模板保持 FP32
+  use_ema: false         # 关闭 EMA 权重
+  deterministic: false   # 关闭 cuDNN 确定性，换取吞吐
+  cudnn_benchmark: true  # 允许 cuDNN 自动选最快算法
+  compile_model: false   # 关闭 torch.compile；需在目标硬件与部署路径实测后再开启
+  gradient_checkpointing: false   # 模型较小，激活重计算收益低，故关闭
+
+# ----------------------------------------------------------------------
+# stft：分析综合窗；本模板未声明 center，runtime 取默认 True（core/stft.py:294，含 10 ms lookahead）
+# ----------------------------------------------------------------------
+stft:
+  n_fft: 320         # FFT 长度（采样点），16 kHz 下 20 ms
+  hop_length: 160    # 帧移（采样点），16 kHz 下 10 ms
+  win_length: 320    # 窗长（采样点）
+  window: hann       # 分析窗类型
+
+# ----------------------------------------------------------------------
+# model：DeepVQE（tasks/aec/models/discriminative/deepvqe.py）；n_fft=320 为 16 kHz/20 ms 工程选择
+# ----------------------------------------------------------------------
+model:
+  type: DeepVQE          # 模型注册名；实现见 tasks/aec/models/discriminative/deepvqe.py
+  args:                  # 模型构造参数（strict：未知键 TypeError，见 core/models/build.py）
+    variant: small       # 规模档位；small = 论文 Small 配置
+    align_delay: 100     # ref 回看候选帧数（个）；每帧 10 ms，最大回看 (100-1)×10 ms=990 ms
+    compression: 0.3     # 谱压缩指数（无量纲）
+
+# ----------------------------------------------------------------------
+# aec_frontend：顶层 canonical 部署前端配置（Trainer/Inference 在 STFT 前消费）
+# ----------------------------------------------------------------------
+# 模板默认关闭外部 delay alignment，不配置 LinearAEC，模型输入固定为原始 mic + farend；
+# DeepVQE 只声明 mic_spectra / farend_spectra 输入能力，不消费 error_scp 生成的 error_spectra。
+aec_frontend:
+  delay_alignment:        # GCC-PHAT 延迟对齐子配置；enabled=false 时前端 no-op
+    enabled: false        # 关闭前端对齐
+  input_routing: mic_farend   # 模型输入 = 原始 mic + farend
+
+# ----------------------------------------------------------------------
+# data：mode=offline_aec → AECOfflineDataset（tasks/aec/data/offline_dataset.py）
+# ----------------------------------------------------------------------
+# mic_scp / farend_scp / nearend_scp 必填、error_scp 可选；各轨须为 canonical 四列
+# （uid fs length path）且 uid 集合完全一致，否则 fail-fast。输出 7 元组
+# (nearend, mic, farend, fs, length, error, error_mask)；各轨同起点裁切，不代表部署对齐。
+data:
+  mode: offline_aec   # 路由 AECOfflineDataset（tasks/aec/data/offline_dataset.py）
+  sample_rate: 16000  # 采样率（Hz）；须与 SCP 中 fs 列一致
+  task: joint         # "joint" = AEC+SE（默认）；"aec" = 仅回声消除
+  train:              # 训练 split；四轨按 uid 配对，需把下方 ~ 占位替换为实际 SCP 路径
+    mic_scp: ~        # 必填：麦克风信号 canonical 四列 SCP
+    farend_scp: ~     # 必填：远端参考 canonical 四列 SCP
+    nearend_scp: ~    # 必填：近端监督目标 canonical 四列 SCP
+    # error_scp: ~    # 可选：LAEC 时域残差 canonical 四列 SCP；DeepVQE 不消费
+    filter_min_duration: 2.0   # s；过滤短于该时长的样本（按 mic 元数据）
+    filter_max_duration: 30.0  # s；过滤长于该时长的样本
+    max_duration_seconds: 10.0 # s；单条上限；各轨同起点裁切，不代表部署对齐
+  validation:         # 验证 split；结构与 train 同源；未声明 filter_* 时取 runtime 默认值
+    mic_scp: ~        # 必填：canonical 四列 SCP
+    farend_scp: ~     # 必填：canonical 四列 SCP
+    nearend_scp: ~    # 必填：canonical 四列 SCP
+    max_duration_seconds: 10.0 # s；单条上限；各轨同起点裁切
+  dataloader:         # DataLoader 参数
+    batch_size: 16    # 每个 rank 的 batch size
+    num_workers: 4    # 每 rank worker 数
+    pin_memory: true  # 启用 CPU→GPU pinned-memory 传输
+
+# ----------------------------------------------------------------------
+# loss：GTCRN 压缩谱损失与 log-ratio 项显式组合；STFT 几何由顶层 stft 注入
+# ----------------------------------------------------------------------
+loss:
+  type: CompositeLoss   # 组合损失；顶层仅接受 type/components/strict/enable_ss_undesired_energy
+  components:           # 各分量按 weight 加权求和；顺序即构建顺序
+    - type: GTCRNCompressedSpectralLoss   # 压缩谱损失；n_fft/hop_length/win_length 由顶层 stft 注入
+      weight: 1.0       # 权重，无量纲
+      args:             # 分量参数；显式值优先于注入值
+        compress_factor: 0.3   # 压缩指数（无量纲）
+        lamda_ri: 30.0         # 压缩复谱项权重（无量纲）
+        lamda_mag: 70.0        # 幅度项权重（无量纲）
+    - type: GTCRNLogRatioLoss   # log-ratio 项；不是 -10*log10 的 dB SI-SNR，尺度不可与 SISNRLoss 直接比较
+      weight: 1.0       # 权重，无量纲
+
+# ----------------------------------------------------------------------
+# optimizer：优化器类型与超参
+# ----------------------------------------------------------------------
+optimizer:
+  type: AdamW           # 优化器类型
+  args:                 # 优化器构造参数
+    lr: 0.001           # 学习率（无量纲）
+    weight_decay: 0.01  # 权重衰减（L2 系数，无量纲）
+
+# ----------------------------------------------------------------------
+# scheduler：线性 warmup + 余弦退火；省略 warmup_steps / decay_until_step 时由 runtime 推导
+# ----------------------------------------------------------------------
+scheduler:
+  type: LinearWarmupCosineAnnealing   # 线性 warmup + 余弦退火
+  args:                 # 调度器参数
+    max_lr: 1.0e-3      # 峰值学习率；与 optimizer.args.lr 保持一致
+    min_lr: 1.0e-6      # 最低学习率（余弦末端）
+
+# ----------------------------------------------------------------------
+# trainer：训练规模、验证时机与在线指标；MOS 不在在线指标内（见文件头 Trainer MOS boundary）
+# ----------------------------------------------------------------------
+trainer:
+  type: AECTrainer      # train.py 按 data.mode=offline_aec 路由至 AECTrainingEntry
+  exp_path: exp/aec/offline_aec_template   # 实验根目录（checkpoint/日志/曲线）
+  epochs: 50            # 训练总轮数
+  gradient_clip_value: 1.0   # 梯度范数裁剪阈值（无量纲）
+  strict_checks: false  # 关闭严格校验；true 时验证空结果 fail-closed
+  accumulation_steps: 1 # 梯度累积步数；1 = 每 batch 更新一次
+  lr_schedule_per_step: true  # 每 optimizer step 推进调度器；false 用于 epoch 级衰减
+  log_interval: 100     # 每 N 个 step 打印一次训练日志
+  max_val_batches: 64   # 每次验证最多评估的 batch 数；0=不限制
+  validation_epoch_interval: 1  # 每 N 个 epoch 末验证；0=关闭
+  validation_steps_interval: 0  # 步级验证间隔；0=关闭
+  save_top_k: 3         # 保留 top-k 最优 checkpoint 数（按验证指标排序）
+  val_metrics:          # 在线客观指标（SI-SDR/ESTOI/ERLE）；不计算 MOS
+    enabled: true       # 是否在验证时计算客观指标
+    metrics: [SI-SDR, ESTOI, ERLE]  # 指标名单；AEC 要求 ERLE 显式列入才计算
+    interval: 1         # 每 N 次验证计算一次
+    max_utterances: 160 # 全局 quota（各 rank 精确均分）
+    # 显式声明：metrics 与 ERLE 各自独立 quota（省略时均回退 max_utterances）。
+    max_utterances_metrics: 160   # 侵入式指标独立 quota
+    max_utterances_erle: 160      # ERLE 独立 quota
+    metrics_workers: 8  # 指标计算进程数
+  save_checkpoint_interval: 1   # 每 N 个 epoch 写一次 checkpoint
+
+# ----------------------------------------------------------------------
+# distributed：DDP 后端与容错
+# ----------------------------------------------------------------------
+distributed:
+  backend: nccl         # 分布式后端
+  find_unused_parameters: false   # 是否让 DDP 追踪未参与 loss 的参数
+  nccl_timeout_minutes: 30   # NCCL 超时（min）

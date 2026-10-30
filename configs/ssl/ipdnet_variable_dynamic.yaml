@@ -1,0 +1,71 @@
+# ============================================================
+# IPDnet variable-array 官方最小复现配置（模板；未见阵列实验单独验收）
+# Params: not measured（官方 variable-array 接入完成后记录）
+# MACs: not measured（官方 variable-array 接入完成后记录）
+# FLOPs: not measured（官方 variable-array 接入完成后记录）
+# Trainer MOS boundary: not applicable（SSL 不计算波形 MOS）
+# ============================================================
+base_config: fixed_array_ipdnet_dynamic_moving.yaml
+
+meta:
+  task: ssl
+  ssl_profile: ipdnet_official
+  ssl_version: ipdnet_variable_contract_v1
+  inference_only: false
+
+model:
+  type: IPDNetVariable
+  # 模型超参：均为 IPDNetVariable.__init__ 的显式形参，未知键会抛 TypeError。
+  args:
+    # 官方 pair-batched 输入通道数 = 2 麦 × re/im = 4。
+    input_size: 4
+    # 官方 2 麦默认 FN 隐层宽度。
+    hidden_size: 128
+    # 官方 variable 结构硬编码 cnn_out_dim=4（2 source × 2 IPD），只支持 max_track=2。
+    max_track: 2
+    # 模型侧频点数口径 F=n_fft//2+1；与顶层 stft.n_fft 一致。
+    n_fft: 512
+    # 官方时间压缩 12 倍。
+    stride: 12
+    # 官方两变体共用 causal 卷积；区分点是 narrow-band LSTM 方向性。
+    causal: true
+    dropout: 0.2
+    cnn_hidden_dim: 128
+    reference_channel: 0
+    # pair 内 4 通道排布；官方无 runner，默认按论文逐麦交错，另一取值 real_block_then_imag_block。
+    pair_channel_order: per_mic_interleaved
+
+model_spec:
+  model_type: IPDNetVariable
+  feature_contract: multichannel_stft_real_imag
+  target_contract: dpipd_pair
+  # 模型内部按 pair-batched 语义前向（pair 维 mean-sharing），对外仍暴露 canonical reference-to-all pair 轴。
+  pair_layout: reference_to_all
+  geometry_mode: variable_array
+  field_mode: far_field
+  reduction: causal_conv_pool
+  causal: true
+  mapping: far_field_grid
+  target_layout: trailing_ri
+
+ssl:
+  input_representation: multichannel_stft_real_imag
+  target_representation: dpipd_far_field
+  mapping: far_field_grid
+  pair_layout: reference_to_all
+  time_stride: 12
+  exclude_dc: false
+  normalization: none
+  phase_sign: 1.0  # +1 与 projection 的 others*conj(ref) target 相位约定一致；-1 会落到镜像方位（round-trip 校准结论）
+  coordinate_frame: room_xyz_m
+  time_reduction: causal_conv_pool
+  source_distance_input: false
+  model_inputs: [multichannel_stft_real_imag]
+
+loss:
+  type: SSLDPIPDPITLoss
+  # 清除父配置中仅供 SSLSpatialMSELoss 使用的参数；PIT 容量与 DOA 权重采用构造器默认值。
+  args: null
+
+trainer:
+  exp_path: exp/ssl/ipdnet_variable_dynamic

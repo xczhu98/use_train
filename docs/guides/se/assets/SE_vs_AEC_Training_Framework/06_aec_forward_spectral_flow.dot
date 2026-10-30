@@ -1,0 +1,81 @@
+digraph aec_spectral_flow {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.38",
+    ranksep="0.55",
+    fontname="Noto Sans CJK SC",
+    label="AECTrainer._forward_aec_batch：canonical 谱流",
+    labelloc="t",
+    fontsize=22,
+    splines=polyline
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    margin="0.15,0.10",
+    penwidth=1.3
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    arrowsize=0.72,
+    penwidth=1.3
+  ];
+
+  subgraph cluster_waveforms {
+    label="AECBatch 波形 / frontend 输出";
+    color="#CBD5E1";
+    style="rounded";
+    fontname="Noto Sans CJK SC";
+    mic [label="model_mic\n必选观测", color="#2563EB", fillcolor="#EFF6FF"];
+    farend [label="aligned_farend\n必选远端参考", color="#2563EB", fillcolor="#EFF6FF"];
+    nearend [label="batch.nearend\n训练目标", color="#EA580C", fillcolor="#FFF7ED"];
+    error [label="error + error_mask\n仅 residual routing 有效时存在", color="#EA580C", fillcolor="#FFF7ED"];
+  }
+
+  stft [label="统一 stft_module", color="#475569", fillcolor="#F8FAFC"];
+
+  subgraph cluster_model_input {
+    label="传给 model(data) 的谱键";
+    color="#CBD5E1";
+    style="rounded";
+    fontname="Noto Sans CJK SC";
+    mic_spec [label="mic_spectra\n必选", color="#2563EB", fillcolor="#DBEAFE"];
+    far_spec [label="farend_spectra\n必选", color="#2563EB", fillcolor="#DBEAFE"];
+    near_spec [label="nearend_spectra\n可选：capability 声明", color="#D97706", fillcolor="#FEF3C7", style="rounded,filled,dashed"];
+    error_spec [label="error_spectra + error_mask\n可选：routing + capability", color="#D97706", fillcolor="#FEF3C7", style="rounded,filled,dashed"];
+  }
+
+  model [label="AEC model\nmodel(data)", color="#7C3AED", fillcolor="#F5F3FF", penwidth=1.8];
+  estimate_spec [label="nearend_estimate_spectra\ncanonical 输出", color="#7C3AED", fillcolor="#EDE9FE"];
+  inverse [label="stft.inverse(...,\nref_len=mic.shape[-1])", color="#15803D", fillcolor="#F0FDF4"];
+  estimate [label="nearend_estimate\n波形", color="#15803D", fillcolor="#DCFCE7"];
+  consumers [label="时域 loss / 指标 / ERLE", color="#15803D", fillcolor="#F0FDF4"];
+
+  mic -> stft [color="#2563EB"];
+  farend -> stft [color="#2563EB"];
+  nearend -> stft [color="#EA580C", style=dashed, label="若需要"];
+  error -> stft [color="#EA580C", style=dashed, label="若存在且需要"];
+
+  stft -> mic_spec [color="#2563EB"];
+  stft -> far_spec [color="#2563EB"];
+  stft -> near_spec [color="#D97706", style=dashed];
+  stft -> error_spec [color="#D97706", style=dashed];
+
+  mic_spec -> model [color="#2563EB"];
+  far_spec -> model [color="#2563EB"];
+  near_spec -> model [color="#D97706", style=dashed];
+  error_spec -> model [color="#D97706", style=dashed];
+  model -> estimate_spec [color="#7C3AED"];
+  estimate_spec -> inverse [color="#7C3AED"];
+  inverse -> estimate [color="#15803D"];
+  estimate -> consumers [color="#15803D"];
+
+  no_echo [shape=note, style="filled", color="#DC2626", fillcolor="#FEF2F2",
+           label="无 echo → model 边：\necho 仅属于 Dataset 合成/审计。"];
+  no_echo -> model [style=invis];
+}

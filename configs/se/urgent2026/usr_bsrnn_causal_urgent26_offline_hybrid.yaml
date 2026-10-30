@@ -1,0 +1,132 @@
+# ======================================================================
+# 实验配置：USR-BSRNN（因果，模型 B），离线预混，四列 SCP 多采样率支持
+# ======================================================================
+# 模型：USR-BSRNN 模型 B（41 子带，N=16，mask-only，因果 cLN）
+# Params：local 0.4750M total；paper/reference 0.35M（统计范围不同）
+# 1 秒输入 MACs：local 0.5290G @ 48 kHz（THOP，partial/unverified；通常不计 STFT/iSTFT）；paper/reference 0.52G（2–48 kHz 口径）
+# 独立 FLOPs：not measured（本地审计与论文均仅给 MACs，未运行独立 FLOPs profiler）
+# Trainer MOS boundary：Trainer 只计算侵入式客观指标；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文/参考：USR-BSRNN/SFI-BSRNN 模型 B；0.35M Params、约 0.52G MACs
+# 本地口径：当前 YAML 经 tools/model_tools/audit_metrics.py 按 1 秒 48 kHz 输入复核；多 SR 时算力随实际使用子带变化
+# 设定：1025 bins，41 子带，N=16，纯掩膜（use_residual: false）；STFT 2048 / hop 512 / Hann。
+# 与 URGENT baseline（模型 A）：A 使用 960/480、34 子带、N=196、mask+residual。
+# 数据管线：data.mode=offline，直接读预混 clean/noisy 对，不运行 Layer A–F 在线仿真（无 simulation_cfg）；
+#   四列 SCP 内嵌采样率与长度，GroupedBatchSampler 按 SR 分组。
+# 复杂度测量口径：B=1、1 s、48 kHz、幅度 [-1,1] waveform（F=1025、T=94 帧）；仅计模型前向，图外 STFT/iSTFT 不计。
+# RTF：not measured（未在本机测量实时因子）。
+# 实现路径：tasks/se/models/discriminative/bsrnn.py → tasks/se/models/modules/bsrnn_impl/bsrnn_core.py
+# 训练：python train.py -C configs/se/urgent2026/usr_bsrnn_causal_urgent26_offline_hybrid.yaml
+# ======================================================================
+
+# ---- meta：随机种子与运行模式 ----
+meta:
+  seed: 42   # 全局随机种子；固定后数据读取顺序与 GroupedBatchSampler 分桶序列可复现
+  use_amp: false   # 混合精度开关；false = FP32；改 true 时须同时设置 amp_dtype（推荐 bfloat16）
+  use_ema: false   # 是否维护 EMA 权重；false = 只用原始权重
+  # false = 保留 cudnn.benchmark 默认 true（按 shape 自动选最快 kernel，速度优先）；
+  # true = 强制 cudnn.benchmark=false 并启用确定性算法，牺牲吞吐换跨运行可复现
+  deterministic: false
+
+# ---- STFT：论文 2048-point window / 512-point hop / Hanning，41 子带 ----
+stft:
+  n_fft: 2048       # FFT 点数；48 kHz 下约 42.7 ms 窗，F = 1025
+  hop_length: 512   # 帧移，单位 sample；48 kHz 下约 10.7 ms/帧
+  win_length: 2048  # 窗长，单位 sample（与 n_fft 相同）
+  window: hann      # 分析窗类型；论文使用 Hanning
+
+# ---- Model：SFI-BSRNN，论文 N=16、causal、cLN；n_fft/hop_length/win_length 由顶层 stft 注入 ----
+model:
+  type: BSRNN       # 注册名；未知 type 由 registry 拒绝
+  args:             # 构造参数；未知 kwargs 由模型构造抛 TypeError
+    num_channel: 16        # RNN 隐层通道数（N）；论文 0.35M / 本实验 0.475M，MACs 0.52G @ 48 kHz
+    num_layer: 6           # 每侧 RNN 层数
+    target_fs: 48000       # 目标采样率，单位 Hz；BandSplit 按该值选择子带
+    causal: true           # true = 因果（流式可用）；因果分支要求 norm_type=cLN
+    norm_type: cLN         # 归一化类型，枚举：cLN（因果）| GN（非因果）；causal=true 时必须 cLN
+    use_residual: false    # false = 纯掩膜（mask-only，论文口径）；true = mask + residual
+
+# ---- Data：多采样率（不设 sample_rate，采样率由四列 SCP 提供）----
+data:
+  mode: offline      # 数据路由字段：offline = 读预混配对，不进入 Layer A–F 在线仿真
+  # 不设 data.sample_rate：保留四列 SCP 原始 SR；GroupedBatchSampler 按 SR 分组，每个 batch 使用相同 SR。
+  train:
+    # clean/noisy 两轨均使用完整四列 uid/fs/length/path。
+    clean_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # 训练 clean 语音四列 SCP
+    noisy_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_noisy_train.scp"  # 训练 noisy 四列 SCP（与 clean 逐条配对）
+    max_duration: 96000       # 单条样本最长长度，单位 sample（48 kHz × 2 s）；<=0 = 不限制
+    repeat_to_max_duration: false  # false = 短句不齐长，由 collate 按 batch 补零
+  # validation split：与 train 同一四列 SCP 格式；本 split 不设长度上限
+  validation:
+    clean_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # 验证 clean 语音四列 SCP
+    noisy_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_noisy_val.scp"  # 验证 noisy 四列 SCP
+  # 本 split 未声明 max_duration / repeat_to_max_duration：按 offline Dataset 默认，不设长度上限、短句由 collate 补零
+  dataloader:
+    batch_size: 32     # 单卡 batch 大小（按 SR 分组后每个 batch 同一采样率）
+    num_workers: 4     # 每 rank 的数据加载进程数
+    pin_memory: true   # 固定内存加速 H2D 拷贝
+
+# loss：显式 CompositeLoss；STFT 几何由顶层 stft 注入，与模型保持一致
+loss:
+  type: CompositeLoss          # 复合损失；顶层只接受 type/components/strict/enable_ss_undesired_energy
+  components:                  # 组件列表；每项只接受 type/weight/args/name/enable_ss_undesired_energy
+    - type: GTCRNCompressedSpectralLoss   # 压缩谱损失（实/虚部 + 幅度）
+      weight: 1.0              # 组件总权重（无量纲）
+      args:                    # 组件参数；未知键在 loss 构造前报错
+        compress_factor: 0.3   # 论文幅度压缩指数 c = 0.3（gtcrn-main）
+        lamda_ri: 30.0         # 实部/虚部损失权重：30 × (L_real + L_imag)
+        lamda_mag: 70.0        # 幅度损失权重：70 × L_mag
+    - type: GTCRNLogRatioLoss  # 压缩谱 log-ratio 损失（幅度域）
+      weight: 1.0              # 组件总权重（无量纲）
+
+# ---- Optimizer / Scheduler ----
+optimizer:
+  type: Adam                   # 优化器类型；未知类型在构造期 fail-fast
+  args:                        # 优化器参数；未知键在构造期报错
+    lr: 0.001                  # 学习率（无量纲）
+
+# ---- Scheduler：线性 warmup + 余弦退火 ----
+scheduler:
+  type: LinearWarmupCosineAnnealing   # 线性 warmup + 余弦退火；按 optimizer step 计步
+  args:                        # 调度器参数；未知键在构造期报错
+    warmup_steps: 10000        # 线性 warmup 步数，单位 optimizer step
+    decay_until_step: 200000   # 余弦退火终止步；应等于总优化步数
+    max_lr: 1.0e-3             # warmup 后峰值学习率
+    min_lr: 1.0e-6             # 退火终点学习率
+
+# ---- Trainer ----
+trainer:
+  # 类型与实验目标
+  type: SETrainer              # 训练器类型；由 entry 路由到 tasks/se/trainer/se_trainer.py
+  exp_path: exp/se/usr_bsrnn_causal_urgent26_offline_hybrid  # 日志/checkpoint 输出目录（相对仓库根）
+
+  # 训练规模与日志
+  epochs: 100                  # 训练总 epoch 数
+  gradient_clip_value: 5.0     # 梯度范数裁剪阈值（无量纲；0 = 不裁剪）
+  accumulation_steps: 1        # 梯度累积步数；DDP 中间步由 no_sync() 跳过 AllReduce
+  lr_schedule_per_step: true   # true = 调度器按 optimizer step 更新；false = 按 epoch
+  log_interval: 100            # 每 N 个 optimizer step 记录一次日志
+
+  # 验证（全局）
+  max_val_batches: 0          # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  # validation_epoch_interval 与 validation_steps_interval 的互斥语义见 core/trainer/base_trainer.py。
+  # 当 validation_steps_interval > 0、save_top_k > 0 且 validation_epoch_interval > 0 时，关闭 epoch 末验证。
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0
+  save_top_k: 3                  # 步级验证保留 val_loss 最低的 top-k checkpoint
+  # 客观指标（SI-SDR/PESQ/ESTOI）；interval 表示每 N 次 validation 计算一次。
+  val_metrics:
+    enabled: true              # true = 在线计算 val_metrics.metrics 列出的指标
+    metrics: [SI-SDR, PESQ, ESTOI]  # 指标集合；每项按固定顺序在所有 rank 聚合
+    interval: 1                # 每 N 次 validation 计算一次指标（1 = 每次）
+    max_utterances: 2167     # 原始 validation SCP 为 2200 条；本配置未过滤时，指标仅取全局前 2167 条（各 rank 均分）
+    max_utterances_metrics: 2167  # 显式声明：省略时回退 max_utterances
+    metrics_workers: 16        # 每个 rank 的侵入式指标进程池大小
+
+  # 存盘与曲线：save_checkpoint_interval 为 epoch 末写盘间隔；save_curve_interval（默认 1）、early_stop_patience（默认 0）省略即取默认值
+  save_checkpoint_interval: 5  # epoch 末写盘间隔
+
+# ---- Distributed：多采样率 BSRNN 必须 find_unused_parameters=true ----
+distributed:
+  backend: nccl                  # DDP 通信后端；单机 GPU 用 nccl
+  find_unused_parameters: true   # BSRNN 按 fs 选子带，部分参数在部分 batch 无梯度
+  nccl_timeout_minutes: 10       # nccl 集合通信超时，单位分钟；超时即中止训练

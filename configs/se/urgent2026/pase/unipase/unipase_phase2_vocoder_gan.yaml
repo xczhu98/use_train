@@ -1,0 +1,267 @@
+# ======================================================================
+# Model: UniPASE Stage 2（冻结 DeWavLM-Omni L1 encoder + 可训练 Vocos vocoder）。
+# Params: not measured（缺少 DeWavLM-Omni checkpoint）；既有参考值为 encoder 315.45M、
+#   vocoder 113.73M，未包含训练期 MPD+MBD。
+# MACs: not measured（缺少 DeWavLM-Omni checkpoint，未执行当前配置 profile）。
+# 1 秒复杂度输入/范围：B=1、16 kHz、[1, 16000] float waveform，标称幅度 [-1, 1]。
+# FLOPs: not measured；论文 vocoder 参考值为 5.69 GMAC/s，不是本配置端到端实测。
+# THOP: not measured（未运行）。
+# Trainer MOS boundary: PASEGANTrainer 输出重建波形但 val_metrics=false；不在线计算 MOS，
+#   需对 vocoder artifact 离线评估重建音频，不能当完整增强 MOS。
+# Frozen: DeWavLM-Omni L1 encoder；Trainable: Vocos vocoder；
+# Discriminator: MPD+MBD，仅训练期参与，不属于推理 artifact。
+# Artifact: Vocoder_DWO-L1.pt；完整 inference chain: DeWavLM-Omni -> Adapter ->
+#   Vocoder -> optional PostNet，本阶段 artifact 单独不是完整增强系统。
+# Stage 边界：冻结 DeWavLM-Omni encoder（output_layer=1、mask=False），只训练 Vocos vocoder；
+#   以 MPD+MBD GAN 训练无条件 clean-to-clean autoencoder（官方使用 loaders/dataloader_clean.py）。
+#
+# Source: unipase/configs/cfg_train_vocoder.yaml + train/train_vocoder.py
+#   (encoder ckpt = DeWavLM-Omni.pt, output_layer=1 — 见 cfg:1-3；
+#    mask=False 见 train_vocoder.py:268)
+#
+# Train:
+#   python train.py -C configs/se/urgent2026/pase/unipase/unipase_phase2_vocoder_gan.yaml
+# ======================================================================
+
+# ---- meta：随机性 / 精度 / 确定性开关（core/trainer/entry.py、core/trainer/base_trainer.py）----
+meta:
+  seed: 43                        # source train_vocoder.py:44 seed；各 rank 模型初始化同种子，数据打乱按 rank 偏移
+  allow_no_stft: true             # 模型自带谱前端与 iSTFT，全程 waveform-native，不使用框架 STFT
+  use_amp: false                  # 官方训练脚本为 fp32（无 autocast）；amp_dtype 仅保留作参考
+  amp_dtype: bfloat16   # fp16 会命中 ISTFTHead FFT 算子的 PyTorch 实验性 ComplexHalf 路径
+  deterministic: false  # false=保留 cuDNN benchmark 自动选算法（默认）；true 关闭 benchmark 并置 cudnn.deterministic
+
+# ---- model：GAN 生成器 + 判别器（推理 artifact 只含 generator）----
+model:
+  # GAN 生成器：可训练主体，推理 artifact 的唯一来源
+  generator:
+    type: UniPASEVocoderGenerator  # 注册名 → tasks/se/models/pase_family/unipase/gan_wrappers.py
+    # 生成器结构参数（显式形参；未知键在构造期 TypeError）
+    args:
+      # Stage 1 产物（默认指向官方发布权重，自训时替换为
+      # exp/se/unipase_phase1_dewavlm_omni/checkpoints/ 下的 student 权重）
+      encoder_ckpt_path: "tasks/se/models/pase_family/unipase/open_model_checkpoint/DeWavLM-Omni.pt"  # 冻结 L1 encoder；仓库内官方权重，缺失时构造期报错
+      generator_ckpt_path: "tasks/se/models/pase_family/unipase/open_model_checkpoint/Vocoder_WavLM-L24.pt"  # 官方 train_vocoder.py:95-99 的 warm start；用 released L24 vocoder 初始化 generator（D/optimizer 仍随机）
+      sr_in: 16000                  # Hz；输入 waveform 采样率，须与 data.sample_rate 一致
+      input_channels: 1024        # source decoder_config (cfg_train_vocoder.yaml:5-11)；WavLM-Large 特征维度
+      dim: 1024                   # Vocos backbone 隐层维度
+      intermediate_dim: 3072      # ConvNeXt block 中间维度
+      num_layers: 12              # ConvNeXt block 层数
+      n_fft: 1280                 # ISTFTHead FFT 窗长，单位 samples（16 kHz 下 80 ms）
+      hop_length: 320             # ISTFTHead 帧移，单位 samples（20 ms）
+  # GAN 判别器：仅训练期参与，不进入推理 artifact
+  discriminator:
+    type: PASEDiscriminator         # 多周期 + 多频带组合判别器；仅训练期参与，不进入推理 artifact
+    # 判别器结构参数（显式形参；未知键在构造期 TypeError）
+    args:
+      mpd_reshapes: [2, 3, 5, 7, 11]      # source discriminator_config.mpd；各子判别器波形重采样周期，单位 samples
+      mbd_fft_sizes: [2048, 1024, 512]    # source discriminator_config.mbd；各子判别器 FFT 窗长，单位 samples
+
+# ---- data：SE dynamic 数据管线（train/validation 资源 + Layer A–F 仿真）----
+data:
+  mode: dynamic                    # 枚举：dynamic（SE 在线混合）；offline 变体用 offline
+  sample_rate: 16000               # Hz；训练/验证采样率，同时是仿真 target_sr
+
+  # 训练 split 声明：clean/noise/wind/RIR 清单路径、时长过滤、固定画布与分层仿真配置
+  train:
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # clean 语音清单；target-only 分支的唯一声源
+    # 官方只保留原生 fs >= default_fs 的源语音（loaders/dataloader.py:71）。
+    speech_min_sample_rate: 16000  # Hz；低于该原生采样率的 source 在 Dataset 构造期被过滤
+    # target-only (prob_target_only: 1.0) 不采样 noise/wind；RIR 按
+    # reverberation_prob 抽样，manifest 仍会初始化解析
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"  # 加性噪声清单；prob_target_only=1.0 时不采样，仅初始化解析
+    # Layer C-3 背景音乐清单（本 split 级键，不属于 simulation_cfg）；本配方未启用。
+    # music_scp: data/ss/background/music/train.scp
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪清单；sidechain 概率 0.05，target-only 分支 observation=clean，不混入背景
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp"   # 16 kHz 静态 gpuRIR 清单；reverberation_prob 命中时抽取
+    filter_min_duration: 1.0        # s；源语音最短时长过滤阈值（1 s 切片配方放宽到 1.0）
+    filter_max_duration: 30.0       # s；源语音最长时长过滤阈值
+    num_per_epoch: 80000          # source train_dataset.num_per_epoch；每 epoch 无放回抽样上限
+    # Dataset lifecycle: fixed canvas/repeat belongs to this split, not simulation_cfg.
+    max_duration_seconds: 1       # s；固定画布长度；source wav_len: 1
+    repeat_to_max_duration: false  # 短源零填充到固定画布；对齐 official 零填充，不做 tile
+    # 分层在线仿真配置（Layer A–F）；unknown 键在配置边界 fail-fast
+    simulation_cfg:
+      # ---- Layer B：场景分支（scene 三路互斥概率）----
+      # scene 三路为互斥 multinomial：逐样本单次 uniform 抽样按 CDF 顺序命中（core/data/simulation/scenario_sampler.py），
+      # 最后一项 prob_target_noise 为兜底；三者之和必须严格 = 1（abs_tol=1e-8），
+      # 且 prob_target_only + prob_noise_only <= 1，违反时 tasks/se/data/dynamic_dataset.py:279-291 在 Dataset 构造期报错。
+      # 概率是 nominal 目标比例，realized 计数受 num_per_epoch 有限抽样影响。
+      # 未声明的仿真概率字段取 runtime 默认 0.0（core/data/simulation_configs.py:147-294）：
+      # prob_timeline、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter、prob_speed_perturb 等。
+      # Layer B timeline：多源相对窗口；SE/AEC 单路默认关闭，Layer A gap/留白仍生效。
+      # prob_timeline: 0.0            # Layer B 多源相对窗口概率；未声明=0.0
+      # overlap_ratio_range: [0.1, 0.5]  # 多源窗口重叠比例范围，无量纲；未声明时取默认
+      speech:
+        random_start: true        # 对齐 official train_dataset.random_start=True；长句随机起点裁剪
+        # Layer A-4 高通预处理（约 70 Hz 的 filtfilt）
+        high_pass:
+          enabled: false            # Layer A-4 ~70 Hz 高通 filtfilt；对齐官方 clean dataloader 关闭
+      # Layer B 场景分支：三路互斥概率，和必须为 1
+      scene:
+        prob_target_only: 1.0       # unconditional target-only autoencoder，不混入 noise
+        prob_noise_only: 0.0       # Layer B 纯背景概率；0 表示不采样纯噪声场景
+        prob_target_noise: 0.0      # Layer B 目标+噪声概率；三路之和必须为 1（本配置由前两项独占）
+      # ------------------------------------------------------------------
+      # Layer C-0：RIR backend / room geometry / static-moving policy
+      # ------------------------------------------------------------------
+      # rir_backend: offline  # offline | online；在线时同组 source 共用 room/mic
+      # gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # [length, width, height]
+      # gpurir_rt60_range_sec: [0.1, 1.0]
+      # gpurir_source_distance_range_m: [0.2, 3.0]
+      # gpurir_source_height_range_m: [1.1, 1.8]
+      # gpurir_mic_height_range_m: [1.0, 1.8]
+      # gpurir_enrollment_distance_range_m: [0.05, 0.2]  # 仅 TSE enrollment 近场
+      # 稳定服务默认值（source budget/device/omni/timeout/cache）由 core 提供，不在 YAML 重复。
+      acoustic:
+        # Layer C-0 RIR/混响：卷积概率、moving 策略与监督 target 口径
+        rir:
+          target_type: dry          # 枚举 early/dry/rts；target-only UniPASE vocoder 使用 dry target
+          reverberation_prob: 0.5 # [0, 1]；Layer C-0 RIR 卷积采样概率；0=全部 dry
+          moving_prob: 0.0  # [0, 1]；在线 moving RIR 概率；0=全静态（本配方保持关闭，非框架限制）
+          # segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定。
+          normalize: false         # D-05：RIR 样本保留 official raw RIR gain（封闭复现例外）
+        # Layer C-1/C-2 加性噪声与风噪 side-chain
+        background:
+          # 官方 simulation_train 仍采样 5% wind；target-only 分支最终 observation=clean，
+          # 因此该路径不改变 clean target，仅保留与官方一致的采样语义。
+          prob_wind_noise_sidechain: 0.05  # [0, 1]；非加性风噪 sidechain 概率
+      # Layer D：post-mix amplitude conditioning（normalize → guard）
+      post_mix:
+        # Layer D post-mix 幅度归一化（公共枚举仅 off/joint）
+        normalization:
+          mode: "off"                 # 公共枚举仅 off/joint；UniPASE 的独立归一化见 se.pase_preprocess
+      # Layer E：URGENT2026 信道退化（仅作用于 noisy）
+      channel:
+        enabled: false              # Layer E 总开关关闭；对齐官方 clean dataloader
+      # Layer F：observation/device 退化（总开关关闭时整层跳过）
+      device:
+        enabled: false                            # Layer F 总开关关闭；不控制 Layer D/E
+      # UniPASE 专属预处理（不进入公共 SimulationConfigs）：target-only 时只归一 clean。
+      se:
+        # UniPASE 专属幅度预处理参数（不进入公共 SimulationConfigs）
+        pase_preprocess:
+          peak_normalization_mode: single # 枚举 separate/single；single=仅归一 clean 至 U(0.5, 0.95) 峰值
+
+  # data.validation：验证 split；inherit_simulation=true 时复用 train.simulation_cfg，仅覆盖下列资源键
+  validation:
+    mode: dynamic                   # 枚举：dynamic
+    inherit_simulation: true        # 继承 data.train.simulation_cfg（同一配置内的仿真继承，非文件级配置继承）
+    # 官方 validation random_start=False；train 为 true，必须显式覆盖。
+    simulation_cfg:
+      speech:
+        random_start: false       # 官方 validation random_start=False；长句固定起点裁剪
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # 验证 clean 语音清单
+    # 官方只保留原生 fs >= default_fs 的源语音（loaders/dataloader.py:71）；validation 与 train 同口径。
+    speech_min_sample_rate: 16000  # Hz；低于该原生采样率的 source 在 Dataset 构造期被过滤
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp"   # 验证 RIR 清单
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"          # 验证噪声清单（本配置不采样）
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp" # 验证风噪清单；target-only 分支 observation=clean，不混入背景
+    max_duration_seconds: 4       # s；官方 validation wav_len=4；train 为 1/2 s，必须显式覆盖
+    num_per_epoch: 1000           # source validation_dataset.num_per_epoch；validation 无放回抽样上限
+
+  # data.dataloader：train/val loader 共享参数（验证侧默认沿用，可用 val_num_workers/val_persistent_workers 覆盖）
+  dataloader:
+    batch_size: 40                # source train_dataloader.batch_size (per-GPU)；1 s 切片显存小，可放大 batch
+    val_batch_size: 1             # 官方 validation dataloader.batch_size=1；验证 loader 独立 batch，不沿用 train
+    num_workers: 4                # train loader worker 数；验证 loader 默认沿用（0 时强制 persistent_workers=false）
+    pin_memory: true              # 锁页内存，加速 host→device 拷贝
+
+# ---- loss：多尺度 mel 重建损失 ----
+loss:
+  type: PaseMultiScaleMelLoss       # 注册名 → core/losses/pase_family.py::PaseMultiScaleMelLoss
+  # loss 构造参数（单位与来源见各键注释）
+  args:
+    sampling_rate: 16000          # Hz；mel 滤波器组采样率
+    n_mels: [5, 10, 20, 40, 80, 160, 320]                # 每尺度 mel 通道数（7 个尺度）
+    window_lengths: [32, 64, 128, 256, 512, 1024, 2048]  # 每尺度窗长，单位 samples；须与 n_mels 等长
+    mag_weight: 0.0                 # 线性幅度谱项权重，无量纲；0=关闭
+    log_weight: 1.0                 # 对数幅度谱项权重，无量纲
+    pow: 1.0                        # 谱模指数：1.0=幅度、2.0=功率
+    weight: 15.0                  # source coeff.recons；该项在 trainer 内的总权重
+    window_type: hann               # STFT 窗类型
+
+# ---- optimizer：生成器 / 判别器各一个 AdamW ----
+optimizer:
+  # 生成器优化器
+  generator:
+    type: AdamW                     # 生成器优化器
+    # 生成器 AdamW 超参数
+    args:
+      lr: 2.0e-6                  # 官方 optimizer.lr 初始值；scheduler.max_lr 后续接管
+      betas: [0.8, 0.99]            # Adam β1/β2（source 值，非默认 0.9/0.999）
+      weight_decay: 0.01            # 权重衰减系数，无量纲
+  # 判别器优化器
+  discriminator:
+    type: AdamW                     # 判别器优化器
+    # 判别器 AdamW 超参数
+    args:
+      lr: 2.0e-6                    # 官方 optimizer.lr 初始值；scheduler.max_lr 后续接管
+      betas: [0.8, 0.99]            # Adam β1/β2
+      weight_decay: 0.01            # 权重衰减系数，无量纲
+
+# ---- scheduler：线性 warmup + 余弦退火，按 optimizer step 推进 ----
+scheduler:
+  # 生成器学习率调度
+  generator:
+    type: LinearWarmupCosineAnnealing  # 线性 warmup 后余弦退火
+    # 生成器调度参数（单位 optimizer steps）
+    args:
+      warmup_steps: 20000         # source scheduler.warmup_steps；单位 optimizer steps
+      decay_until_step: 220000    # source scheduler.decay_until_step；单位 optimizer steps
+      max_lr: 2.0e-4                # 峰值学习率
+      min_lr: 1.0e-6                # 退火下界学习率
+      zero_based_warmup: true  # 官方 LinearWarmupCosineAnnealingLR：step 0 lr=0
+  # 判别器学习率调度
+  discriminator:
+    type: LinearWarmupCosineAnnealing  # 与生成器同口径
+    # 判别器调度参数（单位 optimizer steps）
+    args:
+      warmup_steps: 20000           # 单位 optimizer steps
+      decay_until_step: 220000      # 单位 optimizer steps
+      max_lr: 2.0e-4                # 峰值学习率
+      min_lr: 1.0e-6                # 退火下界学习率
+      zero_based_warmup: true  # 官方 LinearWarmupCosineAnnealingLR：step 0 lr=0
+
+# ---- trainer：GAN 交替训练（PASEGANTrainer）----
+trainer:
+  type: tasks.se.trainer.pase_gan_trainer.PASEGANTrainer   # 全限定路径：不在 entry.py 短名查找表内
+  exp_path: exp/se/unipase_phase2_vocoder_gan               # 输出目录；取配置文件名去 .yaml
+  # 官方 train_vocoder.py:95-99 的完整 warm start（model/discriminator/optimizer_g/optimizer_d）。
+  # 官方 model_350.tar 未随仓库发布；提供该文件时填路径即可恢复 G/D/两个 optimizer 的 Adam 状态。
+  official_warm_start_ckpt: null    # null=仅 generator 使用 released Vocoder_WavLM-L24.pt 初始化
+
+  epochs: 400                       # source trainer.epochs
+  gradient_clip_value: 3.0          # source clip_grad_norm_value；梯度 L2 范数裁剪阈值
+  lr_schedule_per_step: true        # true=每个 optimizer step 推进 scheduler（非每 epoch）
+  log_interval: 50                  # 每多少 optimizer steps 打印一次日志
+
+  adversarial_weight: 1.0           # 必须保持 1.0；对抗项实际权重见 lamda_adv
+  lamda_adv: 0.5                    # source coeff.adv；对抗损失权重（UniPASE 用 0.5）
+  lamda_feat: 0.5                   # source coeff.feat；特征匹配损失权重
+  discriminator_steps: 1            # 每个 generator step 对应的判别器 step 数；当前仅允许 1
+  generator_steps: 1                # 每个 accumulation boundary 的生成器 step 数；当前仅允许 1
+
+  validation_epoch_interval: 1      # 每多少个 epoch 跑一次 validation；官方逐 epoch 验证
+  output_clamp: false               # 关闭 [-1,1] clamp，严格对齐官方 PASE 家族训练；仅保留非有限值清零
+  max_val_batches: 0                # 0=不限制 validation batch 数
+  # 在线客观指标配置（enabled=false 时整段不生效）
+  val_metrics:
+    enabled: false                  # 本阶段只做重建预训练；有意关闭在线指标，需离线评估重建音频
+
+  # 官方验证音频（train_vocoder.py:365-378）：rank 0 且 (epoch < start_epoch+10 或 epoch%10==0) 且 step<=5；
+  # 写 {step}_true.wav / {step}_esti_epoch{NNN}.wav，16 kHz。
+  val_audio:
+    enabled: true                   # true=按官方条件保存验证音频；false=整段零开销
+    save_initial_epochs: 10         # 官方 epoch < start_epoch + 10
+    save_every_n_epochs: 10         # 官方 epoch % 10 == 0
+    initial_epoch_reference: start_epoch  # 枚举 start_epoch/zero；本阶段用 start_epoch
+    max_batches: 5                  # 官方 step <= 5
+
+  save_checkpoint_interval: 10      # 每多少 epoch 存一次 checkpoint
+
+# ---- distributed：DDP 后端与 reducer 选项 ----
+distributed:
+  backend: nccl                     # DDP 通信后端；GPU 训练固定 nccl
+  find_unused_parameters: true      # 必须 true：交替冻结使每个 backward 都有一侧 DDP 包装未被使用；entry 显式设为 false 会报错

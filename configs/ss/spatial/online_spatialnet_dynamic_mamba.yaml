@@ -1,0 +1,474 @@
+# ============================================================
+# OnlineSpatialNet（mamba 分支）SS 论文对齐训练配方（K=2 固定源）
+# ------------------------------------------------------------
+# 任务：ss（Speech Separation，固定 K 路源分离）；数据管线 mode：dynamic_ss
+# 模型：OnlineSpatialNet，attention='mamba(16,4)'（= oSpatialNet-Mamba）
+# 采样率 / 帧移：8 kHz；n_fft=256 / hop_length=128 / win_length=256（hann），即 32 ms 窗、16 ms 帧移
+# 输入阵列：6 通道 CHiME-3 拓扑（3×2 矩形，x 间距 0.1 m、y 间距 0.19 m）
+# 本文件是 standalone 完整配置：8 kHz / CHiME-3 阵列的数据、仿真、STFT、loss、ss 与 trainer
+#   段全部在本文件内声明，不依赖其它配置的继承。与同目录 mhsa 基准的差异只在窄带时序模块：
+#   用 selective SSM 取代窄带 MHSA 与 T-ConvFFN（对应论文 oSpatialNet-Mamba），优化器按论文
+#   改为 AdamW + weight_decay=0.001。
+# 论文：Changsheng Quan, Xiaofei Li. "SpatialNet: Extensively Learning Spatial Information
+#   for Multichannel Joint Speech Separation, Denoising and Reverberation", TASLP 2024 与
+#   "Multichannel Long-Term Streaming Neural Speech Enhancement for Static and Moving
+#   Speakers", IEEE SPL 2024（官方仓库 NBSS）。
+# 依赖：mamba_ssm（可选依赖，缺失时构造报错）；该分支依赖 selective scan 内核，不提供 ONNX 导出。
+# 仍与论文不同的部分：SS 目标使用本仓 PITLoss + PairwiseNegSISDRLoss；数据来源与仿真协议
+#   使用本仓在线 gpuRIR + 本地 SCP。
+# Params: 1346996（1.347 M；与上游 NBSS mamba(16,4) 的 SS 变体逐位一致，论文 1.4 M 为四舍五入）
+# MACs: 9.18G @1s/8kHz（THOP，partial/unverified；测量口径 B=1、时长 1 s、采样率 8 kHz；
+#   仅模型前向，不计 STFT/iSTFT 与 SDPA 注意力）
+# FLOPs: 19.23 G/s（4 s/8 kHz/6 ch 逐帧流式纯 PyTorch 参考 step 口径；论文 oSpatialNet-Mamba
+#   报告 18.4 G/s，偏差 +4.5%）
+# RTF: not measured（本机未做实时率测量）
+# Trainer MOS boundary: Trainer 只计算侵入式客观指标（本配置已关闭）；DNSMOS/NISQA/UTMOS/SCOREQ
+#   等须经 evaluate/ 离线计算。
+# 推荐入口：python train.py -C configs/ss/spatial/online_spatialnet_dynamic_mamba.yaml
+# 实现路径：模型 tasks/ss/models/online_spatialnet.py；数据集 core/data（dynamic SS）+ tasks/ss/data；
+#   entry tasks/ss/trainer/entry.py
+# 枚举键取值参考（本文件所用键的合法集合；括号内为本文件当前取值）：
+#   data.mode：dynamic / offline / dynamic_aec / offline_aec / dynamic_tse / offline_tse /
+#     dynamic_ss / offline_ss / dynamic_ssl（dynamic_ss）
+#   model.type：任务模型注册名，见 tasks/ss/models/__init__.py（OnlineSpatialNet）
+#   model.args.attention：mhsa(win) / ret(scales[,share_qk]) / mamba(d_state,d_conv)（mamba(16,4)）
+#   stft.window：hann / hamming（hann）
+#   loss.type：任务 loss 注册名（PITLoss）；loss.args.pairwise_loss：PairwiseNegSISDRLoss 等
+#   loss.args.assignment：exhaustive（PITLoss 当前仅支持该值）
+#   loss.args.reduction：mean（PITLoss 当前仅支持该值）
+#   optimizer.type：torch.optim 类名（Adam / AdamW / SGD 等），另可回退 adamp 同名类（AdamW）
+#   scheduler.type：LinearWarmupCosineAnnealing / CosineAnnealingWarmupRestarts /
+#     ExponentialDecrease / ExponentialLR / StepLR / CosineAnnealingLR / ReduceLROnPlateau
+#     （ReduceLROnPlateau）
+#   acoustic.rir.target_type：early / dry（rts 仅属于 SE spatial 合同）（early）
+# ============================================================
+# 运行元信息：复现种子、AMP/EMA 开关。
+meta:
+  # 复现种子；驱动数据仿真与 DataLoader worker 的 epoch 状态。
+  seed: 42
+  # 混合精度开关；false = 全程 fp32（论文对齐复现优先）。
+  use_amp: false
+  # 权重指数滑动平均开关；false = 不做 EMA。
+  use_ema: false
+  # true 时启用确定性算法（base_trainer 会同时关闭 cudnn.benchmark）；本配置保持 false 换取速度。
+  deterministic: false
+# STFT 参数：Dataset/模型共享的频谱口径（F=n_fft//2+1=129）。
+stft:
+  # 分析窗长，单位 samples；F = 129，须与 model.args.num_freqs 一致。
+  n_fft: 256
+  # 帧移，单位 samples；8 kHz 下等于 16 ms。
+  hop_length: 128
+  # 窗长，单位 samples；等于 n_fft，即 32 ms。
+  win_length: 256
+  # 窗函数；hann。
+  window: hann
+# 模型段：type 为注册表名，args 为模型 __init__ 的显式形参。
+model:
+  # 注册表模型名；OnlineSpatialNet（因果逐帧流式空间分离网络）。
+  type: OnlineSpatialNet
+  # 模型超参：均为 OnlineSpatialNet.__init__ 的显式形参，未知键会抛 TypeError。
+  args:
+    # 频点数 F = n_fft//2+1 = 129。
+    num_freqs: 129
+    # 麦克风通道数 C；须与 spatial.geometry 解析出的通道数一致（此处 CHiME-3 6 通道）。
+    n_channel: 6
+    # 参考通道下标；0 = 第一支麦克风。
+    ref_channel: 0
+    # 时序模块层数。
+    num_layers: 8
+    # 隐层通道宽度。
+    dim_hidden: 96
+    # FFN 中间维度。
+    dim_ffn: 192
+    # squeeze-excitation 压缩维度。
+    dim_squeeze: 8
+    # 多头注意力的头数（mamba 分支不使用，保留同构形参）。
+    num_heads: 4
+    # 窄带时序模块类型；mamba(16,4) = selective SSM（d_state=16、d_conv=4）取代窄带 MHSA 与 T-ConvFFN。
+    attention: mamba(16,4)
+    # 卷积核尺寸列表 [时间, 频率]。
+    kernel_size:
+    # 时间维卷积核。
+    - 5
+    # 频率维卷积核。
+    - 3
+    # 分组卷积的组数列表 [时间, 频率]。
+    conv_groups:
+    # 时间维分组数。
+    - 8
+    # 频率维分组数。
+    - 8
+    # 层间参数共享开关；0 = 各层独立参数。
+    full_share: 0
+# 数据段：mode 为路由字段，train/validation 各自独立声明 split 与仿真配置。
+data:
+  # 数据管线模式；dynamic_ss 路由到 SSTrainingEntry。
+  mode: dynamic_ss
+  # 目标采样率，单位 Hz；本地 16 kHz 清单由 Dataset 重采样到该值（8 kHz），
+  # 因此 *_16k_*.scp 的清单名与 sample_rate 不一致属预期。
+  sample_rate: 8000
+  # 训练 split：清单路径、画布长度与 Layer A–F 仿真配置在此声明。
+  train:
+    # 训练语音清单（4 列 SCP）；本机为 URGENT 16 kHz clean 清单，运行时重采样到 8 kHz。
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_train.scp
+    # 训练噪声清单；data/shared/noise 过滤后的噪声源清单。
+    noise_scp: data/shared/noise/filter/v2/train_noise_sources.scp
+    # 训练片段时长，单位 s；论文口径 4 s。
+    segment_seconds: 4.0
+    # 是否按音频时长过滤清单项；true = 丢弃超出 [filter_min_duration, filter_max_duration] 的条目。
+    filter_by_duration: true
+    # 时长过滤下限，单位 s。
+    filter_min_duration: 0.5
+    # 时长过滤上限，单位 s。
+    filter_max_duration: 30.0
+    # Layer A–F 共享仿真合同；未显式声明的键取 canonical 默认值。
+    simulation_cfg:
+      # 语音源处理：splice / high_pass / silence。
+      speech:
+        # 多句拼接；关闭时每路只放单条语音。
+        splice:
+          # 是否启用跨文件拼接；false = 不拼接。
+          enabled: false
+        # 高通滤波（约 70 Hz filtfilt）。
+        high_pass:
+          # 是否启用高通；true = 启用。
+          enabled: true
+        # 静音填充。
+        silence:
+          # 静音填充概率；逐样本伯努利门，0.3 = 30% 样本在单句画布中留静音。
+          prob: 0.3
+          # 静音位置；random = 随机放在画布内。
+          position: random
+      # Layer B：SS 三路场景概率（canonical scene ID）；未声明的 prob_timeline 取默认 0.0。
+      scene:
+        # 纯目标分支概率；逐样本抽样，与另外两路构成互斥分组。
+        prob_target_only: 0.75
+        # 目标+噪声分支概率。
+        prob_target_noise: 0.2
+        # 纯噪声分支概率；三者之和必须为 1（runtime 在 core/data/simulation/ss_scenarios.py:26-38
+        # 的 validate_ss_scenarios fail-fast，容差 1e-8），抽样方式为按 SS_SCENARIOS 顺序累计 CDF。
+        prob_noise_only: 0.05
+      # 声学混合 Layer C：RIR/reverb、target 电平与背景 SNR。
+      acoustic:
+        # RIR/reverb 配置。
+        rir:
+          # RIR 生成后端；online = 在线 gpuRIR（moving 的必要条件）。
+          backend: online
+          # 混响概率；1.0 = 全部样本加混响（论文口径强制 reverb）。
+          reverberation_prob: 1.0
+          # 在线 moving RIR 概率（canonical 名 prob_moving_rir）；独立逐样本伯努利门，0.5 = 一半样本移动。
+          moving_prob: 0.5
+          # 监督目标口径；SS spatial 当前使用 early/dry，target_type=rts 仅属于 SE spatial 合同。
+          target_type: early
+          # 早反射窗口长度，单位 s；target 只取 RIR 前该长度卷积。
+          early_window_sec: 0.05
+        # 目标电平归一化。
+        target:
+          # 目标音量控制。
+          volume:
+            # 是否启用目标音量随机化；true = 启用。
+            enabled: true
+            # 目标 dBFS 范围。
+            db_range:
+            # 下限，单位 dBFS。
+            - -40
+            # 上限，单位 dBFS。
+            - -12
+            # 电平度量方式；true = 用 RMS（否则用 peak）。
+            use_rms: true
+            # 区间内抽样分布；beta = 用 Beta(beta_a, beta_b) 映射到区间。
+            distribution: beta
+            # Beta 分布 α 参数。
+            beta_a: 1.5
+            # Beta 分布 β 参数。
+            beta_b: 1.5
+        # 加性背景：SNR 参考与范围。
+        background:
+          # 背景 SNR 参考（primary | all_speech）；当前相对所有 full-RIR 语音之和。
+          snr_reference: all_speech
+          # 背景 SNR 下限，单位 dB；未声明的 music_ratio 取默认 0.0。
+          snr_low: -5
+          # 背景 SNR 上限，单位 dB。
+          snr_high: 20
+      # Layer D：post-mix 幅度条件化。
+      post_mix:
+        # 幅度归一化子配置。
+        normalization:
+          # Layer D 归一化模式；SS 只允许 off/joint，D-guard 始终执行。
+          mode: 'off'
+      # Layer E：channel clipping 层。
+      channel:
+        # Layer E 总开关；false = 关闭，仅改变 mixture。
+        enabled: false
+      # Layer F：observation/device degradation 层。
+      device:
+        # Layer F 总开关；false = 整层跳过，不控制 D/E。
+        enabled: false
+      # 空间多通道 observation：阵列几何与背景概率。
+      spatial:
+        # 空间 observation 总开关；论文多通道配方要求 true。
+        enabled: true
+        # 阵列几何；custom = 显式给出坐标（与 profile 二选一）。
+        geometry:
+          # 自定义几何的坐标系数；cartesian_xyz_m = 笛卡尔米制。
+          custom:
+            # 坐标系标识；必须为 cartesian_xyz_m。
+            coordinate_system: cartesian_xyz_m
+            # 6 支麦克风坐标，单位 m，[C,3] = 3×2 矩形阵：x 取 {-0.10, 0.0, 0.10}、
+            # y 取 {+0.095, -0.095}、z 全 0（共面），x 间距 0.1 m、y 间距 0.19 m。
+            positions_m:
+            # 第 1 支：[x, y, z]（m）。
+            - - -0.1
+              - 0.095
+              - 0.0
+            # 第 2 支。
+            - - 0.0
+              - 0.095
+              - 0.0
+            # 第 3 支。
+            - - 0.1
+              - 0.095
+              - 0.0
+            # 第 4 支。
+            - - -0.1
+              - -0.095
+              - 0.0
+            # 第 5 支。
+            - - 0.0
+              - -0.095
+              - 0.0
+            # 第 6 支。
+            - - 0.1
+              - -0.095
+              - 0.0
+          # 参考麦克风下标；0 = 第一支。
+          reference_mic: 0
+        # 空间背景概率；未声明的 prob_array_rotation / prob_microphone_position_jitter 取默认 0.0。
+        background:
+          # 同 room 点源背景升级概率（canonical 名 prob_point_source_background）；独立逐样本
+          # 伯努利门，要求 spatial.enabled=true 且 backend=online；与 wind 门可共现，非互斥。
+          point_source_prob: 0.3
+          # wind 加性背景概率（canonical 名 prob_wind_noise_background）；独立门，0.0 = 关闭；
+          # 开启时必须有非空 windnoise_scp（core/data/dynamic_dataset_base.py:1238 fail-fast）。
+          wind_background_prob: 0.0
+  # 验证 split：结构同 train，独立声明以避免隐式继承。
+  validation:
+    # 验证语音清单；16 kHz 验证切片，运行时重采样到 8 kHz。
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_val.scp
+    # 验证噪声清单。
+    noise_scp: data/shared/noise/filter/v2/val_noise_sources.scp
+    # 验证片段时长，单位 s；与 train 一致（4 s）。
+    segment_seconds: 4.0
+    # 是否按时长过滤；与 train 一致。
+    filter_by_duration: true
+    # 时长过滤下限，单位 s。
+    filter_min_duration: 0.5
+    # 时长过滤上限，单位 s。
+    filter_max_duration: 30.0
+    # validation 仿真配置：与 train 同结构、独立写出。
+    simulation_cfg:
+      # 语音源处理。
+      speech:
+        # 多句拼接。
+        splice:
+          # false = 不拼接。
+          enabled: false
+        # 高通滤波。
+        high_pass:
+          # true = 启用。
+          enabled: true
+        # 静音填充。
+        silence:
+          # 验证集不做静音填充；train 的 data.train.simulation_cfg.speech.silence.prob=0.3。
+          prob: 0.0
+      # Layer B：验证集固定纯 target 分支。
+      scene:
+        # 1.0/0.0/0.0 之和为 1，满足 validate_ss_scenarios 的和=1 校验（容差 1e-8）。
+        prob_target_only: 1.0
+        # 关闭目标+噪声分支。
+        prob_target_noise: 0.0
+        # 关闭纯噪声分支。
+        prob_noise_only: 0.0
+      # 声学混合 Layer C。
+      acoustic:
+        # RIR/reverb 配置。
+        rir:
+          # 同 train：在线 gpuRIR。
+          backend: online
+          # 同 train：全部样本加混响。
+          reverberation_prob: 1.0
+          # 同 train：一半样本移动。
+          moving_prob: 0.5
+          # 同 train：early 目标。
+          target_type: early
+          # 同 train：早反射窗口，单位 s。
+          early_window_sec: 0.05
+        # 目标电平归一化。
+        target:
+          # 目标音量控制。
+          volume:
+            # 同 train：启用。
+            enabled: true
+            # 同 train：dBFS 范围。
+            db_range:
+            # 下限，单位 dBFS。
+            - -40
+            # 上限，单位 dBFS。
+            - -12
+            # 同 train：RMS 度量。
+            use_rms: true
+            # 同 train：beta 分布。
+            distribution: beta
+            # 同 train：α。
+            beta_a: 1.5
+            # 同 train：β。
+            beta_b: 1.5
+        # 加性背景。
+        background:
+          # 同 train：相对所有 full-RIR 语音之和。
+          snr_reference: all_speech
+          # 同 train，单位 dB。
+          snr_low: -5
+          # 同 train，单位 dB。
+          snr_high: 20
+      # Layer D。
+      post_mix:
+        # 幅度归一化。
+        normalization:
+          # 同 train：off。
+          mode: 'off'
+      # Layer E。
+      channel:
+        # 同 train：关闭。
+        enabled: false
+      # Layer F。
+      device:
+        # 同 train：关闭。
+        enabled: false
+      # 空间 observation；验证集不声明 spatial.background，point_source_prob/wind_background_prob
+      # 因此取默认 0。
+      spatial:
+        # 同 train：启用。
+        enabled: true
+        # 阵列几何。
+        geometry:
+          # 自定义几何。
+          custom:
+            # 同 train：笛卡尔米制。
+            coordinate_system: cartesian_xyz_m
+            # 同 train 的 6 通道 CHiME-3 坐标，单位 m。
+            positions_m:
+            # 第 1 支：[x, y, z]（m）。
+            - - -0.1
+              - 0.095
+              - 0.0
+            # 第 2 支。
+            - - 0.0
+              - 0.095
+              - 0.0
+            # 第 3 支。
+            - - 0.1
+              - 0.095
+              - 0.0
+            # 第 4 支。
+            - - -0.1
+              - -0.095
+              - 0.0
+            # 第 5 支。
+            - - 0.0
+              - -0.095
+              - 0.0
+            # 第 6 支。
+            - - 0.1
+              - -0.095
+              - 0.0
+          # 同 train：参考通道 0。
+          reference_mic: 0
+  # DataLoader 参数。
+  dataloader:
+    # 每批样本数；论文口径 4。
+    batch_size: 4
+    # 训练 loader worker 数。
+    num_workers: 4
+    # 是否锁页内存；true 可加速 GPU 拷贝。
+    pin_memory: true
+    # 是否保持 worker 存活跨 epoch；true 复用进程（worker 为 0 时强制 false）。
+    persistent_workers: true
+# SS 任务专属段：固定 K 路源合同。
+ss:
+  # 固定 K 路源数；同时约束 Dataset、模型与 PIT 分配。
+  num_sources: 2
+  # 后续源相对第一路的 SIR 范围，单位 dB。
+  sir_range:
+  # 下限，单位 dB。
+  - -5
+  # 上限，单位 dB。
+  - 5
+# 损失段：type 与 args。
+loss:
+  # loss 类型；PITLoss（置换不变训练损失）。
+  type: PITLoss
+  # loss 构造参数。
+  args:
+    # 成对损失类型；PairwiseNegSISDRLoss = 负 SI-SDR。
+    pairwise_loss: PairwiseNegSISDRLoss
+    # 排列分配方式；exhaustive = 穷举全部 K! 排列取最优。
+    assignment: exhaustive
+    # 归约方式；mean = 对 batch 取均值。
+    reduction: mean
+# 优化器段：type 与 args。
+optimizer:
+  # 优化器类型；AdamW（论文 oSpatialNet-Mamba 口径）。
+  type: AdamW
+  # 优化器参数。
+  args:
+    # 学习率，无量纲；论文口径 1e-3。
+    lr: 0.001
+    # 权重衰减系数，无量纲；论文 oSpatialNet-Mamba 口径 0.001。
+    weight_decay: 0.001
+# 学习率调度段：type 与 args。
+scheduler:
+  # 调度器类型；ReduceLROnPlateau（验证指标停滞时衰减）。
+  type: ReduceLROnPlateau
+  # 调度器参数。
+  args:
+    # 监控方向；min = 指标越小越好。
+    mode: min
+    # 每次触发的衰减因子，无量纲。
+    factor: 0.5
+    # 无改善容忍 epoch 数。
+    patience: 15
+# 训练控制段。
+trainer:
+  # Trainer 类名；对应 tasks/ss/trainer/。
+  type: SSTrainer
+  # 实验输出目录（checkpoint / 日志 / TensorBoard）。
+  exp_path: exp/ss/online_spatialnet_dynamic_mamba
+  # 训练总 epoch 数；论文口径 100。
+  epochs: 100
+  # 梯度裁剪范数上限，无量纲。
+  gradient_clip_value: 5.0
+  # 梯度累积步数；1 = 不累积。
+  accumulation_steps: 1
+  # 学习率调度按 epoch 还是按 step；false = 每 epoch 调用一次（配合 ReduceLROnPlateau）。
+  lr_schedule_per_step: false
+  # 日志打印间隔，单位 optimizer step。
+  log_interval: 50
+  # 每次验证最多跑多少 batch；0 = 不限制。
+  max_val_batches: 0
+  # 每多少 epoch 做一次验证。
+  validation_epoch_interval: 1
+  # 每多少 step 做一次验证；0 = 关闭按 step 验证。
+  validation_steps_interval: 0
+  # 保留最优 checkpoint 数。
+  save_top_k: 3
+  # 在线验证指标配置。
+  val_metrics:
+    # 关闭在线指标：动态空间配方不做侵入式指标；如需 SI-SDR 等由 evaluate/ 离线计算。
+    enabled: false
+  # checkpoint 保存间隔，单位 epoch。
+  save_checkpoint_interval: 1
+# 分布式段：多卡训练后端。
+distributed:
+  # 分布式后端；单卡与多卡统一 nccl；其余分布式键（如 find_unused_parameters）取 runtime 默认。
+  backend: nccl

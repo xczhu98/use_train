@@ -1,0 +1,31 @@
+MeanSE 第三方来源与项目适配边界
+
+官方 MeanSE
+
+- 论文：Jiahe Wang et al., “MeanSE: Efficient Generative Speech Enhancement with Mean Flows”, arXiv:2509.21214
+- 仓库：https://github.com/Twinkzzzzz/MeanSE
+- 固定 commit：a4ced60cf3aa365c481319632e8ea762d178922b
+- 参考内容：双时间嵌入、线性融合、observation-centered Gaussian path、MeanFlow JVP target、flow-field mix-up、time-interval curriculum 与均匀多步采样
+- 许可证：未确认。固定 commit 的 GitHub repository metadata 中 license 为 null，仓库文件树中也未发现 LICENSE/COPYING 文件。
+- checkpoint：官方仓库未公开可核验 checkpoint，本实现不声明官方 checkpoint 兼容。
+
+相关 NCSN++ 来源链
+
+- 官方 MeanSE 的 ncsnpp.py 注明改自 SGMSE 与 score_sde_pytorch，并保留 Google Research Apache License 2.0 文件头。
+- 本目录不复制该文件，也不依赖 ESPnet 的 ncsnpp_utils；只复用本仓 tasks.se.models.generative.meanflowse 中已经按标准 PyTorch 层重写的基础残差块、注意力块和 Gaussian Fourier embedding。
+
+与本仓 MeanFlowSE 的区别
+
+- MeanSE 对应 Wang et al., arXiv:2509.21214，官方仓库为 Twinkzzzzz/MeanSE。
+- 本仓已有 MeanFlowSE 对应 Li et al., arXiv:2509.14858，官方仓库为 liduojia1/MeanFlowSE。
+- 两者不是同一篇论文、同一官方仓库或同一实现；本目录保持独立 registry 名称、objective、配置和测试。
+
+项目适配边界
+
+- 使用本仓顶层 STFT/iSTFT，模型只消费和返回 (B,F,T,2) complex-STFT real-pair；不复制官方 ESPnet STFT encoder/decoder。
+- 使用标准 PyTorch 层实现 NCSN++ 风格 backbone，不复制上游 Lightning、EMA、dataset、数据模拟、推理 CLI 或 checkpoint loader，也不新增第三方依赖。
+- flow-field mix-up 保持官方 batch-level Bernoulli 语义；max_interval 作为单阶段参数暴露。论文的 0.2→0.4→0.6→0.8→1 多阶段训练须由多个实验配置/checkpoint 串联完成，模型不会静默模拟缺失的前置阶段。
+- 配置沿用官方 train_meanflow.sh 的 40000-sample 训练上限；复用的 MeanFlowSETrainer 会把短样本对称零补齐到固定画布并按 noisy peak 联合归一化。这是接入本仓既有生成式 Trainer 的项目适配，不等同于官方按 batch 最长样本右补零的 collate。
+- 推理 prior 使用 inference_seed 创建设备匹配的本地 torch.Generator，使同一输入/shape 的结果不受调用历史影响；分布仍为 observation-centered Gaussian。
+- NFE 由 sampling_steps 控制并使用均匀时间子区间。统一推理入口没有本模型专用 --nfe 覆盖，配置值会进入 artifact fingerprint。
+- 当前没有官方 checkpoint、完整训练或论文指标复现证据；本实现仅声明公式/API 级项目适配。

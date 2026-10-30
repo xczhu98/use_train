@@ -1,0 +1,15 @@
+# ======================================================================
+# 配置：PASE 自训练产物推理（Phase-2 DeWavLM + Phase-3 Vocoder_Dual）。
+# 其余与 pase_infer.yaml 一致（base_config 继承），仅替换两个 artifact 路径。
+# Params: 382.14M（encoder 315.45M + decoder 66.69M，与 pase_infer.yaml 相同结构）。
+# MACs: 21.42 GMAC/s（论文参考值，本配置未实测）。
+# FLOPs: not measured。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS/UTMOS/DNSMOS 只能对加载后的输出
+#   音频离线评估，不得由本配置推断。
+# ======================================================================
+base_config: pase_infer.yaml
+
+model:
+  args:
+    wavlm_ckpt_path: "exp/se/phase2_dewavlm_distill/checkpoints/DeWavLM.pt"        # 自训练 Phase-2 student
+    vocoder_ckpt_path: "exp/se/phase3_vocoder_dual_gan/checkpoints/Vocoder_Dual.pt"  # 自训练 Phase-3 dual-stream decoder

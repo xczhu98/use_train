@@ -1,0 +1,38 @@
+digraph training_skeleton {
+  graph [rankdir=TB, bgcolor="white", pad="0.20", nodesep="0.28", ranksep="0.42", splines=ortho, compound=true, fontname="Noto Sans CJK SC", label="SE 与 AEC：统一 train.py 入口与任务训练骨架", labelloc=t, fontsize=22, fontcolor="#17324D"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=10.5, color="#416984", fontcolor="#17324D", penwidth=1.35, margin="0.13,0.08"];
+  edge [fontname="Noto Sans CJK SC", fontsize=8.5, color="#53758C", fontcolor="#35566D", penwidth=1.35, arrowsize=0.7];
+
+  train [label="python train.py -C <config>\nload_merged_config → detect_task", fillcolor="#E9F2FF", color="#2469B3"];
+  seentry [label="SETrainingEntry.run()", fillcolor="#E9F7E9", color="#388B42"];
+  aecentry [label="AECTrainingEntry.run()", fillcolor="#E6F7F5", color="#16837E"];
+  train -> seentry [xlabel="task=se"];
+  train -> aecentry [xlabel="task=aec"];
+
+  subgraph cluster_se {
+    label="SE 主线"; color="#388B42"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#27632E";
+    sedata [label="dynamic / offline Dataset\n→ collate_fn", fillcolor="#E9F7E9", color="#388B42"];
+    sebatch [label="SEBatch\nclean · noisy · sr · lengths", fillcolor="#F4FAF4", color="#388B42"];
+    seforward [label="SETrainer 前向\nSTFT → model → iSTFT", fillcolor="#F4FAF4", color="#388B42"];
+    seloss [label="CompositeLoss\n(enhanced, clean, lengths, …)", fillcolor="#F4FAF4", color="#388B42"];
+    sedata -> sebatch -> seforward -> seloss;
+  }
+
+  subgraph cluster_aec {
+    label="AEC dynamic_aec 主线"; color="#16837E"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#0F615D";
+    aecdata [label="DynamicMixingDataset\nLayer A–F + C-aec", fillcolor="#E6F7F5", color="#16837E"];
+    aeccollate [label="sample tuple → aec_collate_fn\n→ AECBatch", fillcolor="#E6F7F5", color="#16837E"];
+    frontend [label="AECDeploymentFrontend（波形域）\n可选 delay alignment / LinearAEC", fillcolor="#DDF4F1", color="#16837E"];
+    aecstft [label="trainer STFT\nmic / aligned farend / nearend / error", fillcolor="#F1ECFF", color="#6F4EB5"];
+    aecmodel [label="model(data) dict 谱前向\n→ nearend_estimate_spectra", fillcolor="#E6F7F5", color="#16837E"];
+    aecistft [label="trainer iSTFT\n→ nearend_estimate", fillcolor="#F1ECFF", color="#6F4EB5"];
+    aecloss [label="CompositeLoss / build_loss\n(estimate, nearend, lengths, …)", fillcolor="#E6F7F5", color="#16837E"];
+    aecdata -> aeccollate -> frontend -> aecstft -> aecmodel -> aecistft -> aecloss;
+  }
+
+  shared [label="共享训练底座\nepoch · AMP · accumulation · DDP\nvalidation · checkpoint · log", fillcolor="#FFF4D9", color="#C17A00"];
+  seentry -> sedata [lhead=cluster_se];
+  aecentry -> aecdata [lhead=cluster_aec];
+  seloss -> shared [ltail=cluster_se];
+  aecloss -> shared [ltail=cluster_aec];
+}

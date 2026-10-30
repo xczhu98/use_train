@@ -1,0 +1,78 @@
+# ======================================================================
+# 推理配置：REAL-TSE 官方 baseline spk_emb_100
+# ======================================================================
+# 已复核复杂度；输入是标准化合成 benchmark（B=1，16kHz，1 秒 mixture +
+#   3 秒明确 enrollment），不是实际训练 batch，也不代表训练时长分布或吞吐。
+#   Params 27.617800M total；本文件是 inference_only 配置，不报告训练态
+#   trainable scope。官方主 checkpoint 内含完整 ECAPA。
+#   本地 THOP 0.1.1 MACs 49.316640G，是 backend-specific partial module-hook count；
+#   除 STFT/iSTFT 外，functional matmul、softmax、complex/fused attention 等无 hook
+#   路径也可能漏计，不代表完整端到端运算量。
+#   独立 PyTorch profiler FLOPs 下界 6.563611G（CPU，Python 3.10.19，PyTorch
+#   2.4.0+cu121，with_flops=True）；仅覆盖受支持算子，RNN/复数等路径不完整，
+#   不是由 MACs 倍算。统一入口支持 1 秒 mixture + 3 秒 enrollment 的 TSE
+#   cue-aware dict 多输入：mixture/enrollment 是两路语义，按 cue/joint 模式映射为
+#   mix_spectra、enroll_spectra、enroll_wav、可选 spk_embedding 等字段；入口可输出
+#   partial THOP MACs，但不输出独立 FLOPs。推理必须同时提供对应官方主 checkpoint，
+#   命令与复核边界见架构文档 §1。
+#   Trainer MOS boundary：Trainer 不负责 MOS；未做本地主观 MOS，DNSMOS 代理不等价于主观听测。
+#   本 infer 配置保持独立，不继承训练模板。
+# ======================================================================
+# 官方 ckpt：本文件把官方比赛平铺 config 翻译为 use_train 布局；avg_model.pt 的
+#   {"models": [state_dict], ...} 已完整包含 separator 与 ECAPA，因此不加载独立 speaker
+#   checkpoint，主 checkpoint 在复制前执行完整 key/shape/dtype gate。
+# 超参数对齐：BSRNN win512/stride128/feature_dim128/num_repeat6/非因果；spkemb cue
+#   （句级 ECAPA-TDNN embedding，fusion=multiply）；encoder=ECAPA_TDNN_GLOB_c512（embed_dim=192，ASTP）。
+# RTF: not measured（未做本地实时率测量）。
+# ----------------------------------------------------------------------
+# cue role：模型 IO 合同声明 canonical role speaker_waveform（enrollment 音频文件），
+#   adapter 按该 role 读取 FileInferenceItem.inputs 并绑定 artifact identity
+#   （tasks/tse/inference/adapter.py:244-303）；旧 enrollment/enroll 别名与双输入入口已移除。
+# 文件推理入口：python -m evaluate.eval_pipeline_tse --meta <*_meta.csv> --audio_root <REAL-T 根>
+#   --model <官方主 ckpt 或 model_dir> ...（tasks/tse/README.md「评测」）；端到端加载复核用
+#   python tools/verify/verify_tse_official_ckpts.py --device cpu。
+# 实现路径：tasks/tse/models/discriminative/tse_bsrnn_spk.py、tasks/tse/inference/extractor.py、
+#   tasks/tse/inference/adapter.py。
+# ======================================================================
+
+# meta：本文件仅用于推理（inference_only）
+meta:
+  inference_only: true          # true = 跳过训练字段校验、只走推理路径；命名必须以 _infer.yaml 结尾（tests/test_configs.py:1462-1467）
+
+# stft：分析综合窗；win_length 必须等于 n_fft（BandSplit 子带表据此推导）
+stft:
+  n_fft: 512                    # FFT 点数（samples）；512 @16 kHz → F=257，与比赛 baseline 内部 STFT 一致
+  hop_length: 128               # 帧移（samples）；128 @16 kHz = 8 ms
+  win_length: 512               # 分析窗长（samples）；必须等于 stft.n_fft，否则模型构造期 ValueError（tse_bsrnn_spk.py:178-183）
+  window: hann                  # 窗函数；模型构造期硬约束 window=='hann'（tse_bsrnn_spk.py:184-188）；本段未声明 center，runtime 默认 center=true，模型同样硬约束 center=True（tse_bsrnn_spk.py:189-193）
+
+# model：TSE_BSRNN_SPK（spkemb cue，非因果），与官方 spk_emb_100 同结构
+model:
+  type: TSE_BSRNN_SPK           # 注册名；tasks/tse/models/discriminative/tse_bsrnn_spk.py
+  args:                         # 模型构造参数；未声明的 speaker_encoder.spk_args 由 runtime 默认填充（见下）
+    sr: 16000                   # 采样率（Hz）
+    feature_dim: 128            # BandSplit 子带特征维（无量纲）
+    num_repeat: 6               # BSNet 重复次数（无量纲）
+    causal: false               # false = 非因果（官方 baseline 口径）
+    joint_training: true        # true = 模型内含 vendored ECAPA-TDNN，从 enroll_wav 提 embedding
+    # features：cue 开关表；本配置启用 spkemb（fusion=multiply）
+    features:
+      spkemb:                   # 句级说话人 embedding cue 分组
+        enabled: true           # true = 启用 spkemb cue（官方 spk_emb_100 口径）
+        fusion: multiply        # 融合方式（枚举 concat | additive | multiply | FiLM）
+    speaker_model:              # 内置 speaker 前端；spk_args 未声明 → runtime 默认 embed_dim=192 / feat_dim=80 / pooling_func=ASTP（tse_bsrnn_spk.py:242）
+      fbank:                    # Kaldi 风格 fbank 前端参数
+        num_mel_bins: 80        # Mel 滤波器组数（无量纲）
+        frame_shift: 10         # 帧移（ms）
+        frame_length: 25        # 帧长（ms）
+        dither: 1.0             # 抖动幅度（无量纲）；仅训练态生效（tasks/tse/models/speaker/fbank.py:143 的 self.training 门），此处保留仅为与官方 recipe 逐值对齐，推理态无实际作用
+        sample_rate: 16000      # fbank 采样率（Hz）
+      speaker_encoder:          # ECAPA-TDNN 说话人编码器配置
+        model: ECAPA_TDNN_GLOB_c512  # 变体名；c=512 通道、GLOB 全局池化，embed_dim=192（tse_bsrnn_spk.py:242 默认 spk_args）
+        pretrained: ~           # ~ = 不做独立预加载；官方主 checkpoint 已内含完整 ECAPA
+        freeze: ~               # ~ = 有预训练则冻结；本文件无独立预加载，不触发冻结
+
+# data：推理仅消费 dynamic_tse 的采样率合同
+data:
+  mode: dynamic_tse             # 必填路由字段；推理只用该 mode 的采样率合同，不构建 Dataset
+  sample_rate: 16000            # 采样率（Hz）；必须与模型 sr 一致

@@ -1,0 +1,367 @@
+# ============================================================================
+# 统一音频源库构建平台配置
+# ============================================================================
+# 用法:
+#   PYTHONPATH=tools python -m noise_filter_pipeline.cli --stage A --config tools/noise_filter_pipeline/config/pipeline.yaml
+#   PYTHONPATH=tools python -m noise_filter_pipeline.cli --stage A,B --config ...
+# ============================================================================
+
+output_root: "/data_nvme0n1/data/noise_filter/"
+registry_path: "tools/noise_filter_pipeline/config/noise.yaml"
+pipeline_version: "4.1.0"
+seed: null
+
+# 启用的阶段：A/B/C/D
+stages:
+  - A
+  - B
+  - C
+  - D
+
+# ----------------------------------------------------------------------------
+# Stage A: 数据源接入
+# ----------------------------------------------------------------------------
+# 默认读取 registry 中 enabled=true 的数据集；--dataset 会将 A/B/C/D 都限制到指定 ID。
+# Stage A 对不存在或未启用的 --dataset ID fail-fast；allow_missing_datasets 尚未提供。
+stage_a:
+  # 并行读取音频元信息的线程数；I/O 密集型，可适当调高
+  num_workers: 16
+
+# ----------------------------------------------------------------------------
+# Stage B: 源音频纯化（噪声筛选）
+# 默认启用 unified 单文件 in-memory 流水线：
+#   B1 分片 → B2 静音过滤 → B3 VAD → B4 策略过滤
+# 说明：旧 B1 带宽检测/重采样与旧 B5 AED 分类已移除；Stage C 改用 AudioTag 标签。
+# 注意：当前 stage_d.skip_d1=true，D1 Apollo 超分整体被跳过（下方 D1 配置不参与运行）；
+# 若启用 D1，仅 dry_run / subprocess_daemon 模式可用；Apollo 对低于 44.1kHz 的音频做带宽扩展，
+# d1.output_sr 当前为 32000。
+# 将 unified 设为 false 可回退到原来的分阶段 Processor 链路。
+# ----------------------------------------------------------------------------
+stage_b:
+  unified: true
+
+  # B1: 统一分片
+  b1:
+    mode: "adaptive"        # adaptive | hive | none
+    chunk_duration: 10.0
+    min_chunk_duration: 2.0
+    # hive 模式参数
+    hive_window_sec: 10.0
+    hive_step_sec: 5.0
+    # 注意量纲：MSE（mean(x²)）；B2 的 silent_energy_threshold 是 RMS 量纲（默认 0.005），
+    # 两者不可直接比较（0.005 RMS ≈ 2.5e-5 MSE）
+    hive_energy_threshold: 0.0005
+    hive_min_tail_sec: 5.0
+    hive_output_label_key: "hive_chunk_source"
+
+  # B2: 静音过滤
+  b2:
+    enable: true
+    max_silence_ratio: 0.9
+    min_chunk_duration_filter: 0.5
+    shorten_long_silences: true
+    max_silence_duration: 2.0
+    target_silence_duration: 1.0
+    target_silence_min: 0.5
+    target_silence_max: 1.5
+    use_random_silence_duration: true
+    # DC offset 上限（|mean|）：超过即判为解码/格式伪影并拒绝（与 D2 质检同口径，
+    # 提前到 B2 拦截，省下游 VAD/LLM 算力）；设为 null 关闭检查
+    dc_offset_threshold: 0.5
+
+  # B3: VAD 语音检测
+  b3:
+    enable: true
+    use_multi_vad: true
+    # 多模型投票：请在安装好依赖的 conda 环境 noise_filter_pipeline 中运行。
+    # 该环境已包含 funasr / fireredvad / silero 所需依赖；
+    # 若在当前环境运行且缺少对应包，会 fallback 到 energy VAD，降低准确性。
+    vad_types:
+      - "silero"
+      - "funasr"
+      - "firered"
+    vad_type: "silero"
+    # 各 VAD 模型目录独立配置（目录结构互不兼容，不要共用一个路径）；
+    # 缺省回退到 vad_model_dir，再缺省时各 VAD 走自身自动解析/下载逻辑
+    vad_model_dir: null
+    # FunASR FSMN-VAD 本地目录（modelscope 缓存）；null 时由 FunASR 自动解析/下载，
+    # 不绑定用户 home 路径，也可在部署配置中显式覆盖。
+    funasr_model_dir: null
+    # FireRedVAD 权重根目录（其下含 VAD/）；null 时自动在 third_party_scripts/ 与
+    # ~/.cache/use_train/FireRedVAD 中查找，找不到则自动下载
+    firered_model_dir: null
+    nemo_onnx_path: null
+    use_gpu: true
+    # strict_vad_models: true 时，任一指定 VAD 模型缺失/失败即拒绝该样本，不 fallback 到 energy VAD
+    strict_vad_models: true
+    speech_threshold: 0.6
+    # 保留单路疑似样本交给 Stage C；仅多路 VAD 共同命中时在 B4 拒绝
+    vad_speech_ratio_threshold: 0.005
+    reject_on_any_speech: false
+    batch_size: 32
+    # VAD 批量检测进程池大小：>1 时用 spawn 子进程并行，绕过 GIL 加速 FunASR
+    # 帧级 Python 循环（该循环是 Stage B 的主要瓶颈）。每个子进程独立加载一套
+    # VAD 模型；use_gpu=true 时各 worker 按序号 round-robin 绑定到不同物理
+    # GPU（CUDA_VISIBLE_DEVICES），不会全部挤在 cuda:0。取值主要受限于：
+    # 每 worker 一份模型加载内存/CUDA context 与 CPU 核数（超过核数会被钳制
+    # 并告警）。当前 16 适用于多 GPU + 高核数机器；GPU 紧张或单卡时建议调小。
+    # smoke 实测（2000 文件、8×A800、B2 向量化+FunASR 后处理优化后）：
+    # 16→24→32 端到端 67.7s→69.4s→72.8s，无增益反降——瓶颈已转移到
+    # 文件侧流水线与 flush/IPC 串行段，不要继续上调。
+    num_workers: 16
+    # Silero lockstep 真实 GPU batch：每个 VAD worker 一次前向承载的音频条数
+    # （仅 Silero 有状态模型支持 batch=并行序列；FunASR/FireRedVAD 因第三方
+    # API 限制仍逐条推理）。实测（8 worker、6000×10s、8×A800 全 3 模型）：
+    # 16→64 端到端 55.4→60.6 files/s（+9%），GPU 平均利用率不变（7~9%），
+    # 显存峰值 1.05→2.5GB/卡（远低于 80GB）；128 未见额外收益且结果零漂移。
+    # 仅影响调度/吞吐、不改变处理语义，已从 Stage B checkpoint 指纹中剔除，
+    # 调整不失效旧断点；GPU 紧张或想保守可回退 16。
+    silero_group_size: 64
+    # 临时 wav 目录：新版 FunASR/FireRedVAD 在 unified array 路径直接接收
+    # 内存输入，不再写临时 wav；仅旧版本 capability 回退或文件路径模式使用。
+    # 默认系统临时目录，可配到高速 SSD。
+    temp_dir: null
+    # keep_frame_probs: true 时把逐帧语音概率写进 manifest 的 stages.B3.extra
+    # （调试用；frame_probs 占单条记录体积 ~95%，默认剥离不写盘。
+    #  B4 仅在阈值重算时读取 frame_probs，而 b4.vad_speech_ratio_threshold 要求与
+    #  b3 一致、不会重算，因此剥离是安全的）
+    keep_frame_probs: false
+
+  # B4: 策略过滤（仅基于 VAD 结果；人声/音乐/babble 标签过滤已移至当前 Stage C3）
+  b4:
+    keep_noise: true
+    # 单路 VAD 命中归为 suspected 并保留，交给 Stage C 的
+    # C1 Qwen + C2 AudioTag + C3 准入链完成内容级裁决；多路命中才在 B4 拒绝。
+    keep_suspected: true
+    keep_rejected: false
+    # 必须与 b3.vad_speech_ratio_threshold 保持一致：B4 会用该阈值从原始
+    # speech_ratio 重算 fail_count，阈值不一致会让 B3 的严格判定失效
+    vad_speech_ratio_threshold: 0.005
+    speech_threshold: 0.6
+    delete_rejected_audio: false
+
+  # 文件级并行 workers（Stage B unified / B1 / B2 使用）；unified 模式下也用于
+  # 最终 FLAC 编码/写出，避免落盘在 flush 线程中逐文件串行。
+  num_workers: 8
+  # Stage B unified 临时目录：默认在 output_dir 下；可配置到高速 SSD（不要配 /dev/shm，
+  # 大规模数据会耗尽内存）。留空/null 则使用 output_dir。
+  temp_dir: null
+  # Stage B unified 每累积多少条 eligible chunk 就 flush 一次（VAD → 策略 → 落盘）。
+  # 注意：这是外层内存/flush 窗口，不是 GPU batch；真实 Silero batch 由
+  # b3.silero_group_size 控制，调大本值不提高 GPU 利用率，只会增加在途内存
+  # （16kHz float32 10s ≈ 0.64MB/chunk）并进入 checkpoint 指纹（改动会令旧
+  # checkpoint 失效）。代码默认值 2000，此处显式配置为 1000：在显存/内存和
+  # flush 粒度之间取平衡，同时避免全局进度条长时间不刷新。
+  vad_batch_chunks: 1000
+  # Stage B unified 最终输出音频格式；默认 flac 以节省磁盘空间。
+  output_format: "flac"
+  # 最终输出音频按文件名 hash 前 2 位分桶（audio/<shard2>/<file>），
+  # 避免单目录百万级文件（重构设计文档第 2 步）；存量库为平铺布局，
+  # 下游一律从 manifest 读路径，分桶对下游透明
+  output_shard: true
+  # 是否保存中间临时 chunk 音频；默认 false，因为 VAD 与最终落盘都走内存数组，
+  # 写临时 wav 会引入数百万次无意义 I/O。仅在调试或 fallback 需要时打开。
+  save_temp_chunks: false
+  # checkpoint / resume：kill 后从断点继续，避免几十万源文件从头重跑。
+  enable_checkpoint: true
+  checkpoint_path: null  # null 时自动写到 output_dir/checkpoint.json
+  # checkpoint 保存间隔：百万级文件场景下，interval 过小会导致频繁写大 JSON，
+  # 严重拖慢处理速度。建议按总数据量估算，例如 100 万文件设为 5000~10000。
+  checkpoint_save_interval: 5000
+  manifest_write_batch_size: 1000
+  # Stage B 读取音频时允许的峰值上限；MP3 解码等场景可能产生略大于 1.0 的峰值，
+  # 默认 1.2 比 tools.shared.audio_io.load_audio 的 1.05 更宽松，避免误杀正常文件。
+  max_peak: 1.2
+
+# ----------------------------------------------------------------------------
+# Stage C: 单事件挖掘
+# 当前固定执行 C1 → C2 → C3，C3 是最终准入；旧 C4/C/D 契约不读取、不转换、不双写。
+# ----------------------------------------------------------------------------
+stage_c:
+  # fingerprint 分层：C1 绑定 Qwen model/prompt；C2 绑定 AudioTag checkpoint、
+  # canonical label CSV 与事实契约；C3 绑定 policy 和 C1/C2 identity（无阈值、
+  # 无 calibration，approved 门禁已删除，链路直接可发布）。
+
+  # C1: Qwen 人声/可懂度分类（purity-first：口鼻喉/声带发出的声音都不是普通噪声）
+  # 优先级 Speech > Babble > Noise：
+  #   - Speech：任何可识别的口鼻喉/声带人声，包括说话、歌唱、笑、哭、喊、
+  #     咳嗽、清嗓、喷嚏、口哨、哈欠等非言语发声 → 必须拒绝
+  #   - Babble：仅纯不可懂的背景群体 murmur（无个体可识别的词/短语/嗓音）→
+  #     背景群体人声候选，由 C3 的 top-5 Speech veto 复核
+  #   - Noise：完全无人声活动 → 普通噪声候选，由 C3 的 top-5 Speech veto 复核
+  #   - 不确定时倾向 Speech/Babble 而非 Noise（宁错杀不放过）
+  # C1=Speech 是终态拒绝且不进入 C2；Noise/Babble 才由 C3 结合 C2 事实裁决。
+  # C1 缺失、失败或字段非法时 fail-closed。
+  c1:
+    # 生产默认使用 processors/qwen_single_event.py 中的 DEFAULT_PROMPT，避免配置副本
+    # 与代码语义漂移；仅在隔离实验中临时配置 prompt 覆盖，并以 prompt 指纹区分结果。
+    model_path: "third_party_scripts/Qwen2.5-Omni-7B"
+    # 每卡 batch：smoke 实测（8×A800、≤10s chunk、max_new_tokens=8）
+    # 32→17.5 files/s（峰值 ~41GiB/卡）；64 反而降到 14.2 files/s——
+    # 部分 worker 触发 OOM 折半重试（峰值 ~61GiB），重复 prefill 抵销收益；
+    # 个别数据分布下 batch 32 已观测到 ~78GiB 尖峰，不要再上调。
+    batch_size: 32
+    device_map: "auto"
+    torch_dtype: "auto"
+    cache_dir: null
+    max_retries: 3
+    # Qwen thinker 最大生成 token 数；C1 只需输出一个标签，默认 8 足够保守。
+    # smoke 实测仅此项即让 C1 提速 +33%（13.2→17.5 files/s，1024 条标签零漂移），
+    # 只截断异常长尾，不改变分类语义，但会进入 C1 processor/checkpoint fingerprint、
+    # Qwen model cache key 与 LLM cache key；修改后不得复用旧 C1 结果。
+    max_new_tokens: 8
+    dry_run: false
+    # dry_run 时三类输出分布（noise / babble / speech）
+    dry_run_distribution: {"noise": 0.6, "babble": 0.3, "speech": 0.1}
+    # 多 GPU 数据并行：num_workers 为 1 时单卡推理，>1 时为每个 GPU 启动一个 worker 进程
+    num_workers: 8
+    gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]  # 8×A800：每卡一个 Qwen worker
+    # 百万级清单减少 checkpoint 和 manifest 写盘频率；异常时最多重算约 10000 条。
+    checkpoint_save_interval: 10000
+    manifest_write_batch_size: 10000
+
+  # C2: AudioTag 纯事实层（默认打开）
+  # 对 canonical 527 个 AudioSet 类做内部 sigmoid 排序后输出固定 `audioset_top5`
+  # （恰好 5 项，prob 降序 + index 升序，index/mid/label 与 canonical CSV 一致）；
+  # 不再持久化 audioset_scores 完整 527 数组。
+  # C2 不加载 policy，仅产出上述事实字段。
+  # 当前配置 mode=subprocess_daemon（长驻模式，模型只加载一次，生产推荐），
+  # 在独立 conda 环境 icefall_audiotaq 中运行；代码缺省 mode=dry_run。
+  c2:
+    enable: true
+    mode: "subprocess_daemon"  # dry_run | subprocess_daemon；daemon 模型只加载一次，适合大数据量
+    checkpoint: "third_party_scripts/icefall_audiotaq/exp/pretrained.pt"
+    label_dict: "third_party_scripts/icefall_audiotaq/data/class_labels_indices.csv"
+    sample_rate: 16000
+    batch_size: 128  # 10s chunk 下特征/激活很小，显存充裕；大批次摊薄固定开销
+    # 重采样已移到 GPU 主线程（按 source rate 缓存实例），解码与 GPU 推理双缓冲
+    # 重叠；CPU 只剩解码一段重活。cpu_threads 保持 1 避免 8 daemon 过度订阅。
+    cpu_threads: 1
+    interop_threads: 1
+    audio_workers: 8  # 每 daemon 并行解码路数；CPU 核数紧张时降回 4
+    # 每个 daemon 请求包含 batch_size × request_batches 条记录（daemon 内部按
+    # batch_size 分多个 sub-batch）：>1 时批间双缓冲（解码与 GPU 推理重叠）才生效，
+    # 同时减少 JSON 文件往返；1 则退回"一请求一 batch"的旧行为。
+    request_batches: 4
+    timing_log_interval: 20
+    startup_timeout: 600
+    # 仅用于定位 daemon 脚本所在目录（实际 daemon 脚本由 daemon_script_path 指定）
+    script_path: "third_party_scripts/icefall_audiotaq/04_audioset_label_audiotag.py"
+    # 独立 AudioTag 环境的解释器；由 pipeline_config 展开环境变量。
+    # 部署前必须设置 NOISE_FILTER_AUDIOTAG_PYTHON，避免提交机器绝对路径。
+    python_path: "${NOISE_FILTER_AUDIOTAG_PYTHON}"
+    dry_run_labels:
+      - "Male speech, man speaking"
+    # 输出字段与数量由代码固定为 audioset_top5 / 5，不提供可变 top-k 配置。
+    # checkpoint/resume
+    enable_checkpoint: true
+    checkpoint_path: null  # null 时自动写到 output_dir/checkpoint.json
+    # 百万级清单减少 checkpoint 和 manifest 写盘频率；异常时最多重算约 10000 条。
+    checkpoint_save_interval: 10000
+    manifest_write_batch_size: 10000
+    # 多卡支持（subprocess_daemon 模式）
+    num_gpus: 8
+    # 8×A800，每卡 2 个 daemon（重复 id）：实测单 daemon GPU 利用率 p50≈67%，
+    # 双实例可打满 100%，聚合吞吐 ~1.27×（8s flac chunk 实测 407 vs 320 files/s/卡）；
+    # 峰值显存 ~14.5GiB/卡，远低于 80GiB。daemon 日志文件名带启动序号
+    # （c2_daemon_gpu_<id>_<seq>.log），多实例互不覆盖。CPU 紧张时可降回每卡单实例。
+    gpu_ids: [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]
+
+  # C3: purity-first 最终噪声准入（无阈值 top-5 语义）
+  # 决策只依赖 C2 固定 top-5：S5（top-5 中 speech MID）非空即否决；
+  # C1 分支不可改写：noise 只能 accept_noise/reject，babble 只能
+  # accept_babble/reject；B（babble MID）不参与 veto。
+  # policy 是 C3 单一事实源，C2 不读取它；无 calibration/approved 门禁，
+  # 链路直接可发布。所有非准入结果统一 reject，不存在 quarantine。
+  c3:
+    # 纯规则最终防线必须保持开启；关闭时所有候选 fail-closed reject。
+    enable: true
+    policy_path: "tools/noise_filter_pipeline/config/ontology/audiotag_voice_policy.json"
+
+# ----------------------------------------------------------------------------
+# Stage D: 质量增强
+# ----------------------------------------------------------------------------
+stage_d:
+  # 跳过 D1 Apollo 超分，直接用 D2 处理 Stage C 输出。
+  # 适用于数据源已满足带宽需求、只想做响度归一化/质检/格式统一的场景。
+  # 当前默认开启；如需启用 Apollo 频带扩展，请设为 false。
+  skip_d1: true
+  # 仅控制 validated snapshot 构建与源文件重新校验的并行度，不影响 D2 音频处理。
+  snapshot_num_workers: 4
+  # D1/D2 writer lock 的最长等待秒数；避免并发 writer 无限阻塞。
+  writer_lock_timeout: 30.0
+
+  # D1: Apollo 超分
+  d1:
+    # subprocess_daemon：每 GPU 一个长驻 daemon，模型只加载一次（生产推荐）
+    mode: "subprocess_daemon"  # dry_run | subprocess_daemon
+    config_path: "third_party_scripts/Apollo/config_apollo_uni.yaml"
+    checkpoint: "third_party_scripts/Apollo/apollo_model_uni.ckpt"
+    script_path: "third_party_scripts/Apollo/inference_apollo.py"
+    # Apollo 独立环境的解释器；由 pipeline_config 展开环境变量。
+    # 部署前必须设置 NOISE_FILTER_APOLLO_PYTHON，避免提交机器绝对路径。
+    python_path: "${NOISE_FILTER_APOLLO_PYTHON}"
+    batch_size: 8  # 实测峰值 ~24GiB/卡（10s@44.1k chunk，模型常驻 0.14GiB）
+    target_sr: 44100
+    # 输出音频采样率；默认与 target_sr 一致。设为 null 则 Apollo 处理过的样本用 target_sr，
+    # 跳过的样本保留原始采样率。
+    output_sr: 32000
+    # 输出音频格式，默认 flac 以节省存储空间
+    output_format: "flac"
+    chunk_sec: 10
+    overlap_sec: 2  # 相邻 chunk 重叠秒数（旧 "overlap" 仍兼容，但语义改为秒）
+    # 仅对采样率低于 target_sr 的样本启用 Apollo 频带扩展；≥target_sr 的音频直接跳过模型
+    # D1+D2 合并：Apollo 输出后直接做响度归一化/质检，减少一次全量 I/O
+    post_normalize:
+      # target_rms: 归一化目标 RMS；0.1 ≈ -20 dBFS RMS（常用目标电平，无标准强制）
+      target_rms: 0.1
+      max_peak: 0.95
+      min_duration: 2.0
+      max_duration: 30.0
+    # checkpoint/resume
+    enable_checkpoint: true
+    checkpoint_path: null
+    # checkpoint / manifest 批量写入，降低百万级文件 I/O；生产大数据量建议 500~1000
+    checkpoint_save_interval: 500
+    manifest_write_batch_size: 500
+    # 多卡支持（subprocess_daemon 模式）；空列表由 daemon pool 按 num_gpus 自动展开为 0..7
+    num_gpus: 8
+    gpu_ids: []  # 启用 D1 时每卡一个 Apollo daemon
+
+  # D2: 响度归一化与质检
+  # 注：当前 skip_d1=true，D1 被跳过；D2 直接处理 Stage C 输出。
+  d2:
+    # D2 是 CPU 解码/归一化/FLAC 写盘线程（soundfile 在 native 层释放 GIL，
+    # 线程并发有效），不使用 GPU；smoke 实测 8→32 线程端到端 13.2s→10.3s
+    # （1466 条，含快照/发布固定开销；纯 D2 处理 ~385 files/s @w32）。
+    # 48 线程收益饱和并回落；输入输出同盘时以存储带宽为限。
+    num_workers: 32
+    # target_rms: 归一化目标 RMS；0.1 ≈ -20 dBFS RMS（常用目标电平，无标准强制）
+    target_rms: 0.1
+    max_peak: 0.95
+    min_duration: 2.0
+    max_duration: 30.0
+    # 最终输出音频采样率；设为 null 时保留每个文件的原始采样率（不重采样），
+    # 需要统一采样率时再设为具体值（如 32000）
+    output_sr: null
+    # 输出音频目录布局：dataset_label（正式配置，
+    # audio/<dataset_id>/<C3 balance_category>/shard_<5位>/<4位>.flac；文件名按
+    # dataset 内输入顺序分配 0-based ordinal，category 不重置；每 10000 条切换 shard，
+    # rejected/failed 记录仍消耗 ordinal，因此 shard 内允许出现空洞）|
+    # sr_label_dataset（audio/sr_16k/<audioset 标签>/<dataset_id>/<shard2>/）|
+    # sr_dataset_label（存量库布局，audio/sr_16k/<dataset_id>/<audioset 标签>/）|
+    # sr_dataset（代码默认值）| flat（全部平铺到 audio/）
+    # 注意：存量库（2026-08-01 运行）保持旧布局不动（重构设计文档第 5/6 步已废弃，
+    # 噪声库后续整体重新筛选生成）；新运行直接按 dataset_label 产出。
+    # dataset_label 正式分片大小：每个 dataset 每 10000 条切换 shard。
+    output_layout: "dataset_label"
+    dataset_label_shard_size: 10000
+    # 最终输出音频格式，默认 flac 以节省存储空间
+    output_format: "flac"
+    # checkpoint / resume：kill 后从断点继续，避免重跑全部音频
+    enable_checkpoint: true
+    checkpoint_path: null  # null 时自动写到 output_dir/checkpoint.json
+    # checkpoint 每次保存是全量 JSON 重写（非增量追加），且保存前强制 flush
+    # manifest；百万级数据下 500 会产生数千次大文件重写。5000 与 C1/C2 同档。
+    checkpoint_save_interval: 5000
+    manifest_write_batch_size: 2000

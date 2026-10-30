@@ -1,0 +1,227 @@
+# ======================================================================
+# TSE 训练配置：TSE_Modular + spatial（DOA 方向 cue）
+# 数据管线：offline_tse（MC-LibriMix 预生成 WeSep v0.1 manifest，无在线仿真随机性）
+# 模型采样率 16 kHz，STFT 512/128 → 帧移 8 ms。
+# ======================================================================
+# Params: not measured；MACs: not measured；FLOPs: not measured（本配置尚未做算子统计）。
+# 复杂度口径：如需测量应显式声明 B/时长/采样率/F/T，且仅统计模型前向，
+#   图外 STFT/iSTFT 不计；此处不编造数值。
+# RTF: not measured（本机未做端到端实时率测量）。
+# Trainer MOS boundary: Trainer 不负责 MOS；本配置不包含主观听测，DNSMOS 代理
+#   也不等价于主观评估；离线代理指标统一在 evaluate/ 流水线运行。
+# 与其他变体的关键区别：唯一使用 spatial cue（句级静态 DOA 条件）的配置，
+#   消费 4 通道 mixture，不需要 enrollment 音频索引；
+#   speaker cue 变体见 configs/tse/offline/tse_modular_speaker_tfmap_emb_*.yaml，
+#   textual cue 变体见 configs/tse/textual/tse_modular_textual_keywords.yaml。
+# 推荐入口：python train.py -C configs/tse/spatial/tse_modular_spatial_mclibrimix.yaml
+# 实现路径：模型 tasks/tse/models/discriminative/tse_modular.py + 组合解析
+#   tasks/tse/models/modular_spec.py + spatial frontend
+#   tasks/tse/models/modules/spatial/；数据 tasks/tse/data/offline_dataset.py；
+#   Trainer tasks/tse/trainer/tse_trainer.py。
+# ======================================================================
+# 数据：本机已仿真的 MC-LibriMix（gpuRIR，4 通道 16 kHz，几何为 ReSpeaker 4-mic
+#   方阵，坐标 [±0.02285, ±0.02285, 0] m，与 simulation_config.yaml 一致）。
+#   wesep_index/reverb_early/ 表示 mix 取 reverb、target 取 early；
+#   spatial cue 为结构化 NPY（azimuth/elevation/distance，弧度制，array-local
+#   坐标系），目标监督由 reference_channel=0 把 4 通道 target 归约为单通道。
+#
+# 模型：TSE_Modular（backbone=bsrnn + spatial cue）。
+#   spatial frontend 消费 runtime STFT 的 4 通道 mixture 谱与句级静态 DOA cue，
+#   计算 IPD/CDF/SDF/ΔSTFT 谱特征拼入 separator 输入；STFT/iSTFT 由 runtime 统一管理。
+#   n_channel/ref_channel/mic_positions_m/speed_of_sound_mps 不在此重复声明，
+#   由 tasks/tse/trainer/entry.py 从 dataset geometry 自动注入（冲突显式报错）。
+# ======================================================================
+
+# meta：复现性与精度开关；与 tse offline 兄弟配置对齐（未声明的 amp_dtype/cudnn_benchmark 取 runtime 默认 float16/true）
+meta:
+  # 全局随机种子（int，无量纲）；固定 42 保证数据顺序与初始化可复现
+  seed: 42
+  # 是否强制 cudnn 确定性算法（bool）；false = 允许 autotune 选最快 kernel
+  deterministic: false
+  # 是否启用 AMP 自动混合精度（bool）；false = 全 fp32
+  use_amp: false
+  # 是否维护 EMA 影子权重（bool）；false = 只保存原始权重
+  use_ema: false
+
+# stft：分析综合窗；win_length 必须等于 n_fft（BandSplit 子带表据此推导）
+stft:
+  # FFT 点数（samples，正整数偶数）；决定 F=n_fft/2+1=257
+  n_fft: 512
+  hop_length: 128             # 帧移（采样点）；128 @16 kHz = 8 ms
+  # 分析窗长（samples）；必须等于 stft.n_fft（BandSplit 子带表据此推导）
+  win_length: 512
+  # 窗函数枚举：hann；center 未声明取 runtime 默认 True
+  window: hann
+
+# model：TSE_Modular（backbone=bsrnn + spatial cue：IPD/CDF/SDF/ΔSTFT）
+model:
+  # 模型注册名；TSE_Modular 由 modular_spec 解析组合，未实现组合在构造期抛 NotImplementedError
+  type: TSE_Modular
+  # 模型构造参数；只接受 backbone / separator / cues / sample_rate 等显式形参
+  args:
+    backbone: bsrnn          # 分离主干；当前仅 bsrnn 组合实现
+    # bsrnn 主干参数；未知键被 _SEPARATOR_KEYS['bsrnn'] 拒绝（modular_spec.py:105）
+    separator:
+      feature_dim: 128       # BandSplit 子带特征维（无量纲）
+      num_repeat: 6          # BSNet 重复次数（无量纲）
+      causal: false          # false = 非因果；true = 因果（时间 LSTM 单向）
+      rnn_norm_eps: 1.0e-5   # RNN norm epsilon（无量纲），与既有 BSRNN 数值 parity
+    # cue 装配表；key 为 frontend 名（speaker/spatial/visual/textual），未列出的 cue 不装配
+    cues:
+      # spatial cue：消费 4 通道 mixture 谱 + 句级静态 DOA（azimuth/elevation，弧度）
+      spatial:
+        frontend: spatial    # spatial frontend（谱域空间特征提取）
+        representation: static  # static | track；MC-LibriMix cue 为句级静态方向
+        # spatial cue 的特征开关表；pairs 省略 = n_channel=4 全组合 6 对麦克风
+        features:
+          ipd: {}            # 麦克风对相位差（fixed feature，无参数）
+          cdf: {}            # DOA 条件余弦距离特征（target-conditioned，需 geometry+声速）
+          sdf: {}            # DOA 条件转向距离特征（target-conditioned，需 geometry+声速）
+          delta_stft: {}     # 麦克风对 STFT 幅度差（fixed feature，无参数）
+    composition: {}            # 组合开关（usef_mode / allow_all_missing）；空 = 用默认
+    sample_rate: 16000         # 采样率（Hz）；须与 data.sample_rate 一致
+
+# data：offline_tse 读取 MC-LibriMix manifest（spatial cue，不需要 enrollment 音频索引）
+data:
+  # 数据模式路由键（必填）；offline_tse → TSEOfflineDataset
+  mode: offline_tse
+  # 数据采样率（Hz）；须与 model.args.sample_rate 一致
+  sample_rate: 16000
+  # 训练 split 的 manifest 与 cue 合同键（offline_tse 导入合同各项必填；spatial cue 无 enroll_policy）
+  train:
+    samples_jsonl: "data/tse/spk/wesep/datasets/MC-LibriMix/wesep_index/reverb_early/train-100/samples.jsonl"  # 训练样本清单
+    cues_yaml: "data/tse/spk/wesep/datasets/MC-LibriMix/wesep_index/reverb_early/train-100/cues.yaml"  # spatial cue 定义（npy/fields）
+    manifest_format: jsonl        # jsonl | path_list；runtime 不按后缀猜格式
+    path_base: manifest_relative  # manifest_relative | recipe_root：清单内路径的解析基准
+    target_selection: first       # all | first | 样本→说话人映射；本配置监督首个目标
+    mix_variant: default          # 取 manifest mix 段中的变体名
+    cue_schema: wesep_v0_1        # none | realtse_raw | wesep_v0_1
+    enabled_cues: [spatial]       # 启用的 cue：spatial（句级静态 DOA 条件）
+    max_duration_seconds: 4.0     # 片段长度上限（s）；MC-LibriMix 样本最长约 6.2 s，截断到 4 s
+    # 是否按时长过滤样本（bool）；false = 信任 manifest 已裁剪
+    filter_by_duration: false
+    # 空间读取开关（bool）；true = mixture 按 [C,T] 多通道读取并启用 geometry
+    spatial_enabled: true
+    # 自定义阵列几何（m，[C,3]）；ReSpeaker 4-mic 方阵，与 simulation_config.yaml 一致
+    custom_geometry: [[0.02285, 0.02285, 0.0], [-0.02285, 0.02285, 0.0], [-0.02285, -0.02285, 0.0], [0.02285, -0.02285, 0.0]]
+    reference_channel: 0          # 参考麦克风索引；同时决定多通道 target 的监督归约通道
+    channel_order: [0, 1, 2, 3]   # 显式通道顺序；collate 不重排，按此顺序消费
+    # spatial cue 表示枚举：static | track；须与模型 cues.spatial.representation 一致
+    spatial_representation: static
+    # DOA 角度单位枚举：radian；MC-LibriMix NPY 为弧度制
+    spatial_angle_unit: radian
+    # DOA 坐标系枚举；array-local，方位/俯仰由 xy 平面定义
+    spatial_coordinate_frame: array_local_azimuth_elevation_from_xy
+    # 场景声速（m/s）；与仿真声速一致，进入模型 CDF/SDF 计算
+    spatial_speed_of_sound_mps: 343.0
+  # 验证 split：合同键与 train 相同，仅资源清单不同
+  validation:
+    samples_jsonl: "data/tse/spk/wesep/datasets/MC-LibriMix/wesep_index/reverb_early/dev/samples.jsonl"  # dev split 样本清单
+    # spatial cue 定义清单（dev）
+    cues_yaml: "data/tse/spk/wesep/datasets/MC-LibriMix/wesep_index/reverb_early/dev/cues.yaml"
+    # manifest 解析格式（jsonl | path_list）
+    manifest_format: jsonl
+    # 清单内路径解析基准（manifest_relative | recipe_root）
+    path_base: manifest_relative
+    # 目标选择策略（all | first）；与 train 一致
+    target_selection: first
+    # 取 manifest mix 段中的变体名
+    mix_variant: default
+    # cue schema 枚举（none | realtse_raw | wesep_v0_1）
+    cue_schema: wesep_v0_1
+    # 启用的 cue 列表；dev 同样只启用 spatial
+    enabled_cues: [spatial]
+    # 片段长度上限（s）；与 train 一致
+    max_duration_seconds: 4.0
+    # 是否按时长过滤（bool）；false = 与 train 同语义
+    filter_by_duration: false
+    # 空间读取开关（bool）；与 train 一致
+    spatial_enabled: true
+    # 自定义阵列几何（m，[C,3]）；与 train 同一阵列
+    custom_geometry: [[0.02285, 0.02285, 0.0], [-0.02285, 0.02285, 0.0], [-0.02285, -0.02285, 0.0], [0.02285, -0.02285, 0.0]]
+    # 参考麦克风索引；与 train 一致
+    reference_channel: 0
+    # 显式通道顺序；与 train 一致
+    channel_order: [0, 1, 2, 3]
+    # spatial cue 表示枚举（static | track）；与 train 一致
+    spatial_representation: static
+    # DOA 角度单位枚举；与 train 一致
+    spatial_angle_unit: radian
+    # DOA 坐标系枚举；与 train 一致
+    spatial_coordinate_frame: array_local_azimuth_elevation_from_xy
+    # 场景声速（m/s）；与 train 一致
+    spatial_speed_of_sound_mps: 343.0
+  # DataLoader 配置；DDP 下每个 rank 各建一份 train/val loader
+  dataloader:
+    # 训练 batch 大小（样本数）；4 通道 + spatial 特征显存占用更高故取 8
+    batch_size: 8
+    # 训练 loader worker 数（进程数）
+    num_workers: 4
+    # 是否 pin 到页锁定内存（bool）
+    pin_memory: true
+
+# loss：SI-SNR 监督（weight 1.0）
+loss:
+  # 复合损失注册名；CompositeLoss 顶层只接受 type / components / strict
+  type: CompositeLoss
+  # 是否把指标缺失当致命错误（bool）；false = 容错继续
+  strict: false
+  # 损失分量列表；每项只接受 type / weight / args / name / enable_ss_undesired_energy
+  components:
+    # 尺度不变信噪比；本配置只有这一个分量
+    - type: SISNRLoss
+      # 分量权重（无量纲，>0）
+      weight: 1.0
+      # 日志与 history 中显示的分量名
+      name: SI-SNR
+
+# optimizer：Adam，lr 1e-3 / weight_decay 1e-4
+optimizer:
+  # 优化器注册名；Adam 顶层只接受 type / args
+  type: Adam
+  # 优化器超参；lr/weight_decay 均无量纲
+  args:
+    # 学习率（无量纲）
+    lr: 0.001
+    # 权重衰减系数（无量纲）
+    weight_decay: 0.0001
+
+# scheduler：逐 optimizer-step ExponentialDecrease，1e-3 → 2.5e-5
+scheduler:
+  # 调度器注册名；ExponentialDecrease 按 epoch 指数衰减（trainer.lr_schedule_per_step=false）
+  type: ExponentialDecrease
+  # 调度器超参；学习率单位无量纲
+  args:
+    # 初始学习率（无量纲）；应与 optimizer.args.lr 一致
+    initial_lr: 0.001
+    # 终止学习率（无量纲）
+    final_lr: 0.000025
+    total_steps: auto             # auto = 按总 optimizer step 数推导
+
+# trainer：150 epochs，保留 top-10 checkpoint；有意关闭在线指标——未声明 trainer.val_metrics（不做 SI-SDR/ESTOI 在线计算），指标与 MOS 走 evaluate/ 离线流水线
+trainer:
+  # Trainer 注册名；TSETrainer 由 tasks/tse/trainer/entry.py 路由
+  type: TSETrainer
+  exp_path: exp/tse/spatial/tse_modular_spatial_mclibrimix  # 实验输出目录
+  epochs: 150                     # 训练总 epoch 数
+  # 梯度裁剪阈值（无量纲 L2 范数）
+  gradient_clip_value: 5.0
+  # 梯度累积步数（无量纲，>=1）；1 = 每 batch 一次 optimizer step（与 runtime 默认一致，显式写出）
+  accumulation_steps: 1
+  # 调度器推进粒度（bool）；false = 按 epoch 推进 ExponentialDecrease，非 optimizer step
+  lr_schedule_per_step: false
+  # 训练日志打印间隔（optimizer step 数）
+  log_interval: 100
+  # 单次 val 最大 forward batch 数（每 rank）；0 = 不限制
+  max_val_batches: 0
+  validation_epoch_interval: 1    # 每 N 个 epoch 末验证；0 = 关闭
+  # 步级验证间隔（optimizer step）；0 = 关闭步级验证
+  validation_steps_interval: 0
+  save_top_k: 10                  # 保留的最优 checkpoint 数量
+  save_checkpoint_interval: 10    # 每 N 个 epoch 存一次 checkpoint
+
+# distributed：DDP 后端
+distributed:
+  # 通信后端枚举：nccl | gloo；nccl 要求 CUDA 可用
+  backend: nccl
+  find_unused_parameters: false   # TSETrainer 按 cue 配置自动推导，显式配置优先

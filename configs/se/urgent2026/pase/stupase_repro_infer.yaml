@@ -1,0 +1,18 @@
+# ======================================================================
+# 配置：StuPASE 自训练产物推理（Phase-0 DeWavLM-R + Phase-2 CFM + Phase-1 Mel vocoder）。
+# 其余与 stupase_infer.yaml 一致（base_config 继承），仅替换三个 artifact 路径。
+# Params: not measured（本机未逐项 profile，与 stupase_infer.yaml 相同结构）。
+# MACs: not measured；论文 8-step 推理链约 104 GMAC/s 仅作 reference。
+# FLOPs: not measured（未运行独立 profile）。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS/UTMOS/DNSMOS 只能对加载后的
+#   输出音频离线评估，不得由本配置推断。
+# Frozen: encoder/CFM/vocoder 全部冻结；Trainable: N/A；Discriminator: N/A。
+# Artifact: 三个自训练 checkpoint 当前均不存在（占位路径）；缺失时构造期报错。
+# ======================================================================
+base_config: stupase_infer.yaml
+
+model:
+  args:
+    dewavlm_ckpt_path: "exp/se/stupase_phase0_dewavlm_r_distill/checkpoints/DeWavLM-R.pt"  # 自训练 Phase-0 encoder
+    cfm_ckpt_path: "exp/se/stupase_phase2_flow/checkpoints/CFM.pt"                          # 自训练 Phase-2 CFM/DiT
+    vocoder_ckpt_path: "exp/se/stupase_phase1_melvocoder_gan/checkpoints/Vocoder_Mel-16k.pt"  # 自训练 Phase-1 Mel vocoder

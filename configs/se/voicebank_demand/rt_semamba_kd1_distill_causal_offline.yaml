@@ -1,0 +1,126 @@
+# ======================================================================
+# 实验配置：RT-SEMamba KD1 progressive distillation，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：RT_SEMambaDistill（冻结 8-block teacher → 1-block student）
+# Params：student paper/reference 1.05M；local not measured
+# MACs：student paper/reference 20.56G/s；local not measured
+# FLOPs：not measured（不以 2×MACs 冒充独立测量）
+# Trainer MOS boundary：本 trainer 只聚合 scalar validation loss，不生成增强波形或 MOS
+# 上游：RoyChao19477/RT-SEMamba @ 0c9e8c7c42caadd7badb6cc145c8af93f760863c
+# 前端差异：官方使用 center=False + Hann；共享 torch.istft 会因 NOLA 拒绝该组合，
+# 因此本配置使用同为 400/100/400、center=False 的 Hamming 窗，不声称前端数值精确复现。
+# teacher_checkpoint 必须先由 tools/model_tools/convert_rt_semamba_checkpoint.py 严格转换或验证。
+# 当前该路径不可用：~/use_train_checkpoints/rt_semamba/KD8.pth 尚未生成（需先完成 KD8 训练并转换），
+# 本文件只保留目标路径字面量，未就绪时 RT_SEMambaDistill 构造期即 fail-fast。
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/rt_semamba_kd1_distill_causal_offline.yaml
+# 模型实现：tasks/se/models/discriminative/rt_semamba.py（RT_SEMambaDistill 类）
+# Trainer 实现：tasks/se/trainer/rt_semamba_distill_trainer.py（DualInputLossTrainer 子类）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  use_amp: false         # 关闭 AMP：蒸馏同时跑 teacher/student 双前向，BF16 下 SSM 扫描未验证，保持 FP32
+  use_ema: false         # 关闭 EMA 权重：蒸馏口径以 student 权重为准，避免 EMA 影子权重干扰 KD 对齐
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；谱进谱出模型只消费本段几何 ----
+stft:
+  n_fft: 400             # FFT 长度（采样点），16 kHz 下 25 ms；决定频率轴 F = n_fft//2+1 = 201
+  hop_length: 100        # 帧移（采样点），16 kHz 下 6.25 ms；官方 100-sample 帧移
+  win_length: 400        # 窗长（采样点），16 kHz 下 25 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hamming        # 分析窗类型；官方为 Hann，但 center=False 下 Hann 触发 torch.istft 的 NOLA 拒绝，故用 Hamming
+  center: false          # 关闭居中补齐（官方口径）；无 lookahead；与 window=hamming 组合可通过 NOLA 校验
+  normalized: false      # 关闭正交归一化（torch.stft normalized=false）：保持官方谱幅度口径，teacher/student 共用同一标度
+
+# ---- model：RT_SEMambaDistill（双输入/loss-returning 显式例外，由蒸馏 Trainer 驱动）----
+model:
+  type: RT_SEMambaDistill  # registry 名称（@MODEL_REGISTRY.register("RT_SEMambaDistill")）
+  # n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入；args 只放模型自身超参
+  args:
+    teacher_checkpoint: "~/use_train_checkpoints/rt_semamba/KD8.pth"  # 冻结 teacher 权重路径（本机绝对路径展开）；当前未生成，缺失即构造期报错
+    teacher_layers: 8    # teacher 的 cTF-Mamba block 数；必须与 teacher_checkpoint 的 KD8 结构一致，否则严格加载报 shape/missing 错
+    student_layers: 1    # student 的 cTF-Mamba block 数（KD1 = 1）；官方 KD1 目标结构
+    initialize_student_from_teacher: true  # 用 teacher 中同名同 shape 张量初始化 student；无任何匹配张量则报错（禁止随机初始化 student）
+    # 11,572 条训练样本、batch=2、1200 epochs 的单卡近似总步数约 6.94M；取前 10%。
+    # DDP、数据条数或 batch 改动后，应按实际 optimizer-step 预算同步调整。
+    ramp_steps: 694320   # KD 权重 ramp 步数（optimizer step 数）；gamma = min(step/ramp_steps, 1.0)，0 表示立即满权重
+    lambda_out: 0.5      # 输出级 KD 总权重（无量纲）；乘在 kd_output 上，与 lambda_feat 并列
+    lambda_feat: 0.1     # 特征级 KD 权重（无量纲）；student 末 block 特征对齐 teacher 各 block 归一化均值
+    kd_mag_weight: 1.0   # KD 幅度分量权重（无量纲）；MSE(student_mag, teacher_mag)
+    kd_phase_weight: 0.3 # KD 相位分量权重（无量纲）；MSE(student_phase, teacher_phase)
+    kd_complex_weight: 0.5  # KD 复谱分量权重（无量纲）；MSE(student_complex, teacher_complex)
+    task_mag_weight: 0.9    # task 幅度分量权重（无量纲）；MSE(student_mag, clean_mag)
+    task_phase_weight: 0.3  # task 相位分量权重（无量纲）；反包裹相位差损失
+    task_complex_weight: 0.1  # task 复谱分量权重（无量纲）；MSE 后乘 2.0 的实虚合并项
+    hid_feature: 64      # teacher/student 共用的 Mamba 隐藏维度（正整数）
+    d_state: 16          # SSM 状态维度（正整数）；teacher/student 必须一致，否则特征 KD 维度不匹配
+    d_conv: 4            # SSM 内部深度卷积核（正整数）
+    expand: 4            # SSM 内部通道扩展倍率（正整数）
+    compress_factor: 0.3 # 幅度压缩指数（0 < c <= 1，无量纲）；teacher/student 共用，保证 KD 在压缩域对齐
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；RT_SEMamba 系列仅支持 fs=16000，不一致时模型侧直接报错
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条（与 ramp_steps 估算同源）
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    max_duration: 40000               # 40000 样本，即 2.5 s @ 16 kHz；与 KD8 teacher 训练画布一致
+    repeat_to_max_duration: true      # 短样本 tile/repeat 到 max_duration（不是 collate pad），批内等长
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile；本 trainer 只聚合 scalar loss，不做波形指标
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 2        # 单卡 batch（假设：未做显存扫描；teacher(8 block)+student 双前向显存翻倍下取 2）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：wrapper 自行返回 task + progressive KD scalar loss；此对象仅满足配置构建契约 ----
+loss:
+  type: ScalarPassthroughLoss  # 直接透传模型返回的 scalar（core/losses/scalar_passthrough.py）；不额外计算 loss
+  args: {}               # 无参数；真实目标函数全部由 RT_SEMambaDistill.forward 计算
+
+# ---- optimizer：AdamW ----
+optimizer:
+  type: AdamW            # build_single_optimizer；归一化层参数自动进入 no-decay 组；teacher 参数 requires_grad=False 不进入 optimizer
+  args:                  # 透传给 torch.optim.AdamW
+    lr: 0.0005           # 初始学习率（无量纲，假设：未在上游仓库逐条核对）；沿用 KD8 配方，便于 student 继承 teacher 权重后微调
+    betas: [0.8, 0.99]   # 一阶/二阶动量系数（无量纲）；未设 weight_decay 即 0.0
+
+# ---- scheduler：每 epoch 指数衰减（core/optim/scheduler.py 的 _Exp）----
+scheduler:
+  type: ExponentialLR    # torch 原生 ExponentialLR；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.ExponentialLR
+    gamma: 0.99          # 每个 epoch lr 乘 0.99（无量纲）；与 KD8 配置保持一致，便于蒸馏前后对比
+
+# ---- trainer：RTSEMambaDistillTrainer（DualInputLossTrainer 子类，单优化器）----
+trainer:
+  type: tasks.se.trainer.rt_semamba_distill_trainer.RTSEMambaDistillTrainer  # 点路径；本模型是 BaseSEModel 的双输入/loss-returning 例外
+  exp_path: exp/se/rt_semamba_kd1_distill_causal_offline   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 1200           # 训练轮数；与 KD8 一致，便于对比蒸馏收敛；未声明 max_steps，故按 epoch 跑满
+  gradient_clip_value: 5.0   # 梯度范数裁剪阈值（无量纲）；只作用于 student 可训练参数
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step；改动需同步重算 ramp_steps
+  lr_schedule_per_step: false  # 调度器按 epoch step 一次（与 ExponentialLR 配套）
+  log_interval: 50           # 每 N 个 optimizer step 打一条训练日志
+  max_val_batches: 0         # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证（0 = 关闭）
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0（互斥语义见 core/trainer/base_trainer.py）
+  save_top_k: 3                  # 保留 val_loss 最低的 top-k checkpoint（步级验证场景使用）
+  # 有意关闭在线指标：本 trainer 只聚合 scalar validation loss，不生成增强波形，无法计算 SI-SDR/PESQ/STOI
+  val_metrics:
+    enabled: false       # 关闭整段在线指标；metrics/interval/max_utterances/metrics_workers 仅为占位保留
+    metrics: []          # 空列表 = 不计算任何客观指标（与本 trainer 不产出波形的能力一致）
+    interval: 1          # 占位值：enabled=false 时不参与调度
+    max_utterances: 1    # 占位值：无波形指标时不做 utterance quota 分配
+    metrics_workers: 0   # 占位值 0 = 不启用侵入式指标进程池
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest 与 model_{epoch}.pth
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # teacher 参数 requires_grad=False 不进入 DDP reducer；student 单路径用全部可训练参数，故 false

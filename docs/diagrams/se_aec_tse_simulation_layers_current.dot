@@ -1,0 +1,76 @@
+digraph SimulationCanonical {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.10", margin="0.03",
+    nodesep="0.22", ranksep="0.28", splines=ortho,
+    outputorder=edgesfirst, size="17.0,9!", ratio=fill,
+    fontname="Noto Sans CJK SC", fontsize=28, fontcolor="#142338",
+    labelloc=t, label="SE / AEC / TSE / SS / SSL 训练仿真 Canonical 流程"
+  ];
+  node [shape=plain, fontname="Noto Sans CJK SC", fontsize=16];
+  edge [fontname="Noto Sans CJK SC", fontsize=13, color="#405A75",
+    fontcolor="#405A75", penwidth=2.0, arrowsize=0.82];
+
+  modes [label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#183B66" WIDTH="1120">
+      <TR><TD COLSPAN="2" BGCOLOR="#183B66"><FONT COLOR="white" POINT-SIZE="20"><B>01　输入模式｜九种 data.mode</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="dynamic" BGCOLOR="#EAF2FA" WIDTH="560"><B>Dynamic 分流</B><BR/>SE：dynamic　｜　AEC：dynamic_aec　｜　TSE：dynamic_tse<BR/>SS：dynamic_ss　｜　SSL：dynamic_ssl</TD>
+        <TD PORT="offline" BGCOLOR="#F4F7FA" WIDTH="560"><B>Offline 分流</B><BR/>SE：offline　｜　AEC：offline_aec　｜　TSE：offline_tse<BR/>SS：offline_ss　｜　SSL：无 offline mode</TD>
+      </TR>
+    </TABLE>
+  >];
+
+  dynamic_lane [label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#183B66" WIDTH="1120">
+      <TR><TD COLSPAN="3" BGCOLOR="#DCEAF7"><FONT COLOR="#183B66" POINT-SIZE="20"><B>02　Dynamic 共享主链与任务分支</B></FONT></TD></TR>
+      <TR>
+        <TD WIDTH="280" BGCOLOR="#EAF2FA" ALIGN="LEFT"><B>Shared skeleton</B><BR ALIGN="LEFT"/>Layer A：clean 预处理 + fixed CanvasSpec<BR ALIGN="LEFT"/>↓ Layer B：one-branch / source draw<BR ALIGN="LEFT"/>↓ SharedSimulationView.temporal<BR ALIGN="LEFT"/>relative timeline（TSE/SS/SSL）<BR ALIGN="LEFT"/>↓ Layer C：shared acoustics<BR ALIGN="LEFT"/>RIR · gain · noise · wind · colored</TD>
+        <TD PORT="tasks" WIDTH="430" BGCOLOR="#F8FBFD" ALIGN="LEFT"><FONT COLOR="#0C5D51"><B>SE Dynamic</B></FONT>　noisy + target<BR ALIGN="LEFT"/><FONT COLOR="#8C2347"><B>AEC Dynamic｜echo-involved</B></FONT><BR ALIGN="LEFT"/>C-aec：stereo pair / dual-file；ch0 echo / ch1 farend<BR ALIGN="LEFT"/>SER · delay · echo DSP；mic / farend / nearend / echo<BR ALIGN="LEFT"/><FONT COLOR="#4D2B73"><B>TSE Dynamic</B></FONT>　main-only interference + enrollment side input<BR ALIGN="LEFT"/><FONT COLOR="#2E6EB5"><B>SS Dynamic</B></FONT>　fixed K source tracks；<FONT COLOR="#8C5A12"><B>SSL Dynamic</B></FONT>　fixed K spatial tracks → feature/DOA/VAD<BR ALIGN="LEFT"/><B>输出</B>：SE 7｜AEC 11 / 12｜TSE multi-target dict｜SS SSBatch｜SSL SSLBatch</TD>
+        <TD PORT="postmix" WIDTH="410" BGCOLOR="#FFF4D6" ALIGN="LEFT"><FONT COLOR="#6C4600"><B>固定 post-mix｜Layer A–F · fail-closed</B></FONT><BR ALIGN="LEFT"/>pre-finite → <B>Layer D（D-normalize → D-guard）</B><BR ALIGN="LEFT"/>→ E channel degradation / clipping<BR ALIGN="LEFT"/>→ F pre-drive → fixed_rail observation clipping<BR ALIGN="LEFT"/>→ task-post-EF → final-guard<BR ALIGN="LEFT"/>→ post-finite</TD>
+      </TR>
+    </TABLE>
+  >];
+
+  offline_lane [label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#6A7F93" WIDTH="1120">
+      <TR><TD COLSPAN="3" BGCOLOR="#E9EEF3"><FONT COLOR="#29485E" POINT-SIZE="20"><B>03　Offline 旁路｜reader 直达交付，不重放 A–F</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="se" WIDTH="360" BGCOLOR="#F4F7FA"><B>SE Offline Dataset</B><BR/>clean / noisy → SE 4-tuple</TD>
+        <TD PORT="tse" WIDTH="400" BGCOLOR="#F4F7FA"><B>TSE / SS Offline Dataset</B><BR/>TSE：mixture / target / enroll<BR/>SS：source stems / optional spatial RIR → dict Batch</TD>
+        <TD PORT="aec" WIDTH="360" BGCOLOR="#FDE8EE"><B>AEC Offline Dataset</B><BR/>mic / nearend / farend / optional error → AEC 7-tuple</TD>
+      </TR>
+    </TABLE>
+  >];
+
+  delivery_lane [label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#D18A00" WIDTH="1120">
+      <TR><TD COLSPAN="3" BGCOLOR="#FFF0C2"><FONT COLOR="#6C4600" POINT-SIZE="20"><B>04　投影与 tuple｜全部 Dataset 变换完成后交给 collate</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="enroll" WIDTH="250" BGCOLOR="#F1E8FA"><FONT COLOR="#4D2B73"><B>TSE enrollment side input</B></FONT><BR/>off-timeline A-enroll + C-enroll<BR/>靠近 projection 汇入；不进 post-mix</TD>
+        <TD PORT="projection" WIDTH="500" BGCOLOR="#FFF4D6"><FONT COLOR="#6C4600"><B>Dataset 已完成 sample projection</B></FONT><BR/>Dynamic：target-SR · crop · tile · gap · canvas<BR/>Offline：各 reader 的同步裁补 / cap<BR/><B>Dynamic：SE 7｜AEC 11 / 12｜TSE dict｜SS dict｜SSL feature dict</B><BR/><B>Offline：SE 4｜AEC 7｜TSE / SS dict</B></TD>
+        <TD PORT="collate" WIDTH="370" BGCOLOR="#EAF2FA"><FONT COLOR="#183B66"><B>collate / batch 合约</B></FONT><BR/><B>SE 4 / 7｜AEC 11 / 12｜TSEBatch｜SSBatch｜SSLBatch</B><BR/>任务 batch 先校验再进入 runtime<BR/>AEC frontend 尚未执行；SSL 无 waveform root inference</TD>
+      </TR>
+    </TABLE>
+  >];
+
+  runtime_lane [label=<
+    <TABLE BORDER="2" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#D84A73" WIDTH="1120">
+      <TR><TD COLSPAN="2" BGCOLOR="#FDE8EE"><FONT COLOR="#8C2347" POINT-SIZE="20"><B>05　collate 后 runtime｜AEC frontend 只执行一次</B></FONT></TD></TR>
+      <TR>
+        <TD PORT="standard" WIDTH="430" BGCOLOR="#F4F7FA"><B>SE / TSE / SS / SSL</B><BR/>collated batch → shared STFT 或 feature model</TD>
+        <TD PORT="aec" WIDTH="690" BGCOLOR="#FDE8EE"><FONT COLOR="#8C2347"><B>AEC training / validation</B></FONT><BR/>collated batch → AECDeploymentFrontend → STFT → model<BR/><B>可选 Streaming GCC-PHAT → 可选 LinearAEC</B><BR/>Inference 在整文件 STFT 前复用同一前端；不属于 Dataset 仿真</TD>
+      </TR>
+    </TABLE>
+  >];
+
+  modes:dynamic:s -> dynamic_lane:n;
+  modes:offline:s -> offline_lane:n [style=dashed, constraint=false];
+  dynamic_lane:postmix:s -> delivery_lane:projection:n;
+  dynamic_lane:tasks:s -> delivery_lane:enroll:n [color="#7047A3", constraint=false];
+  offline_lane:se:s -> delivery_lane:projection:n [style=dashed, constraint=false];
+  offline_lane:tse:s -> delivery_lane:projection:n [style=dashed];
+  offline_lane:aec:s -> delivery_lane:projection:n [style=dashed, color="#D84A73", constraint=false];
+  delivery_lane:collate:s -> runtime_lane:n;
+
+  dynamic_lane -> offline_lane [style=invis, weight=30];
+}

@@ -1,0 +1,110 @@
+digraph PaseFamilyArtifacts {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.45",
+    ranksep="0.70",
+    splines=polyline,
+    fontname="Noto Sans CJK SC",
+    fontsize=18,
+    labelloc="t",
+    label="PASE / StuPASE artifact 依赖（按当前 YAML）"
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=12,
+    color="#334155",
+    fontcolor="#0f172a",
+    fillcolor="#f8fafc",
+    penwidth=1.4,
+    margin="0.14,0.10"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    color="#334155",
+    fontcolor="#334155",
+    penwidth=1.5,
+    arrowsize=0.75
+  ];
+
+  wavlm [
+    shape=note,
+    fillcolor="#fff7ed",
+    color="#ea580c",
+    label="Microsoft WavLM-Large.pt\n~/use_train_checkpoints/pase/WavLM-Large.pt"
+  ];
+
+  subgraph cluster_pase {
+    label="PASE";
+    color="#2563eb";
+    fontcolor="#1d4ed8";
+    fontname="Noto Sans CJK SC";
+    fontsize=16;
+    style="rounded,dashed";
+    penwidth=1.5;
+    margin=18;
+
+    p1 [fillcolor="#dbeafe", color="#2563eb", label="PASE Phase 1\nphase1_vocoder_single.yaml\n训练 single-stream decoder"];
+    p2 [fillcolor="#dbeafe", color="#2563eb", label="PASE Phase 2\nphase2_dewavlm_distill.yaml\n训练 DeWavLM student"];
+    p3 [fillcolor="#dbeafe", color="#2563eb", label="PASE Phase 3\nphase3_vocoder_dual_gan.yaml\n训练 dual-stream generator"];
+
+    p1_art [shape=note, fillcolor="#eff6ff", color="#2563eb", label="Vocoder_L24\n约定的兼容导出 artifact"];
+    dew_art [shape=note, fillcolor="#eff6ff", color="#2563eb", label="DeWavLM.pt\nexp/se/phase2_dewavlm_distill/\ncheckpoints/DeWavLM.pt"];
+    p3_art [shape=note, fillcolor="#eff6ff", color="#2563eb", label="完整 PASE generator checkpoint\nexp/se/phase3_vocoder_dual_gan/"];
+    p1_gap [shape=note, fillcolor="#fef2f2", color="#dc2626", fontcolor="#991b1b", label="Phase 3 未配置 vocoder_ckpt_path\n不会读取 Phase 1 artifact"];
+  }
+
+  subgraph cluster_stupase {
+    label="StuPASE";
+    color="#16a34a";
+    fontcolor="#15803d";
+    fontname="Noto Sans CJK SC";
+    fontsize=16;
+    style="rounded,dashed";
+    penwidth=1.5;
+    margin=18;
+
+    s0 [fillcolor="#dcfce7", color="#16a34a", label="StuPASE Phase 0\nstupase_phase0_dewavlm_r_distill.yaml\n训练 DeWavLM-R student"];
+    s1 [fillcolor="#dcfce7", color="#16a34a", label="StuPASE Phase 1\nstupase_phase1_melvocoder_gan.yaml\n训练 Mel vocoder（无 WavLM 输入）"];
+    s2 [fillcolor="#dcfce7", color="#16a34a", label="StuPASE Phase 2\nstupase_phase2_flow.yaml\n冻结 encoder，训练 CFM/DiT"];
+
+    dewr_art [shape=note, fillcolor="#f0fdf4", color="#16a34a", label="DeWavLM-R.pt\nexp/se/stupase_phase0_dewavlm_r_distill/\ncheckpoints/DeWavLM-R.pt"];
+    mel_art [shape=note, fillcolor="#f0fdf4", color="#16a34a", label="Vocoder_Mel-16k.pt\nPhase 1 兼容导出 artifact"];
+    cfm_art [shape=note, fillcolor="#f0fdf4", color="#16a34a", label="CFM.pt\nPhase 2 兼容导出 artifact"];
+    stu_full [fillcolor="#f5f3ff", color="#7c3aed", label="完整 StuPASE 推理链\nDeWavLM-R + CFM + Mel vocoder\n需手工组装"];
+  }
+
+  wavlm -> p1 [label="wavlm_ckpt_path"];
+  wavlm -> p2 [label="teacher_ckpt_path\nstudent_ckpt_path"];
+  p1 -> p1_art [style=dashed, color="#2563eb", fontcolor="#1d4ed8", label="训练 checkpoint → 手工导出"];
+  p1_art -> p1_gap [style=dotted, arrowhead=none, color="#dc2626"];
+  p1_gap -> p3 [style=dotted, arrowhead=none, color="#dc2626"];
+  p2 -> dew_art [style=dashed, color="#2563eb", fontcolor="#1d4ed8", label="手工导出到精确路径"];
+  dew_art -> p3 [label="wavlm_ckpt_path"];
+  p3 -> p3_art [style=dashed, color="#2563eb", fontcolor="#1d4ed8", label="Trainer checkpoint"];
+
+  wavlm -> s0 [label="teacher_ckpt_path"];
+  dew_art -> s0 [label="student_ckpt_path"];
+  s0 -> dewr_art [style=dashed, color="#16a34a", fontcolor="#15803d", label="手工导出到精确路径"];
+  dewr_art -> s2 [label="encoder_ckpt_path"];
+  s1 -> mel_art [style=dashed, color="#16a34a", fontcolor="#15803d", label="训练 checkpoint → 手工导出"];
+  s2 -> cfm_art [style=dashed, color="#16a34a", fontcolor="#15803d", label="训练 checkpoint → 手工导出"];
+
+  dewr_art -> stu_full [style=dotted, color="#7c3aed", fontcolor="#6d28d9", label="手工推理组装"];
+  mel_art -> stu_full [style=dotted, color="#7c3aed"];
+  cfm_art -> stu_full [style=dotted, color="#7c3aed"];
+
+  legend [
+    shape=plain,
+    label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="4" CELLPADDING="2">
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#334155">━━▶</FONT></TD><TD ALIGN="LEFT">YAML 直接读取的 checkpoint 路径</TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#2563eb">┄┄▶</FONT></TD><TD ALIGN="LEFT">训练产物需手工导出/放置</TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#7c3aed">···▶</FONT></TD><TD ALIGN="LEFT">训练 YAML 外的手工推理组装</TD></TR>
+    </TABLE>>
+  ];
+  { rank=sink; legend; }
+}

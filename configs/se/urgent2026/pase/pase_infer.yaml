@@ -1,0 +1,52 @@
+# ======================================================================
+# Model: PASE 16 kHz inference（DeWavLM L1+L24 -> dual-stream Vocos）。
+# 数据管线：仅推理；data.mode=dynamic 只用于 SE 任务路由，不构造训练/验证数据集。
+# 采样率/帧移：固定 16 kHz；waveform-native（meta.allow_no_stft=true），无框架 STFT，
+#   iSTFT 在 dual-stream decoder 的 ISTFTHead 内部执行（n_fft=1280 / hop_length=320）。
+# 实现路径：tasks/se/models/pase_family/pase/model.py（PASE）、
+#   tasks/se/models/pase_family/common/vocoder_backend.py（WavLMDec dual-stream + ISTFTHead）。
+# Params: 382.14M（encoder 315.45M + decoder 66.69M，论文完整推理链参考值；本机未逐项 profile）。
+# MACs: 21.42 GMAC/s（论文参考值，B=1、16 kHz、1 s waveform；本机未实测）。
+# FLOPs: not measured。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS/UTMOS/DNSMOS 只能对加载后的输出
+#   音频离线评估，不得由本配置推断。
+# Artifact: DeWavLM.pt + Vocoder_Dual.pt（HF cisco-ai/pase 官方发布版本）；
+#   两者必须实际存在并严格加载，缺任一文件在构造期报错。
+# Frozen: encoder/decoder 全部冻结；Trainable: N/A；Discriminator: N/A。
+# PASE 推理配置（官方开源权重，waveform-native，免传训练 --checkpoint）
+#
+# 本配置对应官方发布版 PASE（DeWavLM + Vocoder_Dual），不是论文原始版本的重新训练。
+# 官方短音频推理会对输出做“峰值归一到输入峰值”；SEInferenceAdapter 的短音频路径
+# 现在向 PASE.forward 传 normalize_output=True，已与官方 inference.py 对齐。
+#
+# 用法：
+#   PYTHONPATH=. python inference.py \
+#       -C configs/se/urgent2026/pase/pase_infer.yaml \
+#       --input_dir <noisy_dir> --output_dir <out_dir>
+# 长音频（> 20 s）可加 --chunk_seconds 8；该路径在拼接后统一做全局峰值归一，
+# 短音频逐样本复现不要启用。
+# ======================================================================
+
+# ---- meta：随机性 / 推理标记 ----
+meta:
+  seed: 42              # 全局随机种子；推理无训练随机性，仅为接口一致性保留
+  allow_no_stft: true   # waveform-native 模型：权重由 from_pretrained 注入，免 --checkpoint
+  inference_only: true  # 纯推理配置；无 train/validation/trainer/loss
+  deterministic: false  # false=不做确定性算法约束（默认）；inference-only 无 Trainer，此键不参与训练路径
+
+# ---- data：仅保留任务路由与固定采样率 ----
+data:
+  mode: dynamic         # 仅保留 SE 任务路由；不声明训练或验证数据
+  sample_rate: 16000    # Hz；PASE 固定 16 kHz 推理，非 16 kHz 输入由 inference.py 重采样
+
+# ---- model：DeWavLM + dual-stream Vocos 推理链 ----
+model:
+  type: PASE           # 注册名 → tasks/se/models/pase_family/pase/model.py::PASE
+  # 推理链 artifact 路径与运行参数（显式形参；未知键在构造期 TypeError）
+  args:
+    wavlm_ckpt_path: "~/use_train_checkpoints/pase/DeWavLM.pt"          # DeWavLM encoder artifact；缺失时构造期报错
+    vocoder_ckpt_path: "~/use_train_checkpoints/pase/Vocoder_Dual.pt"   # dual-stream Vocos decoder artifact；缺失时构造期报错
+    output_layer: [1, 24]   # [1]=acoustic 浅层，[24]=phonetic 高层；双流必须为 2 元素 list
+    use_dual_stream: true   # 双流 decoder；与 output_layer 的 2 元素 list 配套
+    frozen_encoder: true    # 推理期冻结 encoder（requires_grad=False 且 eval）
+    frozen_decoder: true    # 推理期冻结 decoder

@@ -1,0 +1,4 @@
+# 根目录的 data/ 规则用于隔离数据集；这里显式保留 SS 数据源码包。
+!data/
+data/**/__pycache__/
+data/**/*.py[cod]

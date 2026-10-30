@@ -1,0 +1,33 @@
+# ============================================================
+# Audio Filter Pipeline 依赖（MOS 质量过滤）
+# ============================================================
+# 安装: pip install -r requirements.txt
+#
+# 系统依赖 (需单独安装):
+#   ffmpeg — 用于音频格式转换。Windows: choco install ffmpeg; macOS: brew install ffmpeg; Linux: apt install ffmpeg
+#
+# MOS 模型 (DNSMOS/NISQA/UTMOS 等) 需放在 third_party_scripts/ 对应目录，
+# 见 pipeline 文档或 README。
+# ============================================================
+
+numpy>=1.21.0
+soundfile>=0.12.0
+pyyaml>=6.0
+torch>=2.0.0
+torchaudio>=2.0.0
+librosa>=0.10.0
+scipy>=1.10.0
+soxr>=0.3.2
+tqdm
+pandas>=1.5             # NISQA batch 打分路径必需（processors/mos.py lazy import）
+
+# DNSMOS 等 ONNX 模型推理
+onnxruntime>=1.15.0
+
+# 可选: 监控与统计
+psutil>=5.9
+
+# setuptools 82+ 在 spawn 子进程里曾出现 pkg_resources 导入失败；
+# 若同环境安装 espnet，其要求 setuptools<74，故保留上限。
+setuptools>=65.0.0,<74
+# ONNX 后端: pip install onnxruntime-gpu  # 或 onnxruntime（CPU）

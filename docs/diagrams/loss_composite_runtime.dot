@@ -1,0 +1,144 @@
+digraph LossCompositeRuntime {
+  graph [
+    rankdir=TB,
+    bgcolor="#ffffff",
+    pad="0.26",
+    nodesep="0.50",
+    ranksep="0.62",
+    splines=polyline,
+    fontname="Noto Sans CJK SC",
+    fontsize=20,
+    fontcolor="#152235",
+    label="Loss YAML 到 Trainer / Composite 运行时工作流",
+    labelloc=t,
+    labeljust=l
+  ];
+  node [
+    shape=rect,
+    style="rounded,filled",
+    color="#6B7B91",
+    penwidth=1.25,
+    margin="0.18,0.12",
+    fontname="Noto Sans CJK SC",
+    fontsize=13,
+    fontcolor="#152235"
+  ];
+  edge [
+    color="#52657A",
+    penwidth=1.35,
+    arrowsize=0.75,
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    fontcolor="#34465A"
+  ];
+
+  yaml [
+    fillcolor="#E7F0FF",
+    label=<<B>YAML 配置</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">loss · stft · data.sample_rate</FONT>>
+  ];
+  build [
+    fillcolor="#DCEBFF",
+    label=<<B>build_loss</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">结构校验、deep copy<BR/>STFT / SR 仅注入显式构造参数</FONT>>
+  ];
+  loss_fn [
+    fillcolor="#EAF7EF",
+    label=<<B>构造 loss_fn</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">Single：LOSS_REGISTRY.build<BR/>Composite：按 YAML 顺序构造 + 加权</FONT>>
+  ];
+  strict_wrapper [
+    fillcolor="#F2F6FA",
+    label=<<B>strict wrapper（可选）</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">标准输入契约 + 有限标量输出</FONT>>
+  ];
+
+  subgraph cluster_trainer {
+    label="任务 Trainer：仅为活动 component 组装运行时上下文";
+    color="#9CAFC5";
+    penwidth=1.2;
+    style="rounded,dashed";
+    fontname="Noto Sans CJK SC";
+    fontsize=14;
+    fontcolor="#40556C";
+
+    trainer [
+      fillcolor="#FFF3D8",
+      color="#C99B49",
+      label=<<B>SE / AEC / TSE Trainer</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">model forward → enhanced waveform<BR/>可用时保留原生预测谱</FONT>>
+    ];
+    capability [
+      fillcolor="#FFF8E7",
+      color="#C99B49",
+      label=<<B>capability kwargs</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">noisy · runtime sample_rate<BR/>SS residuals · pure / task metadata</FONT>>
+    ];
+    direct [
+      fillcolor="#FFF8E7",
+      color="#C99B49",
+      label=<<B>direct spectra（条件路径）</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">framework STFT 生成 target_spectra<BR/>几何匹配后成对注入</FONT>>
+    ];
+    trainer -> capability [label="活动 capability"];
+    trainer -> direct [label="原生预测谱可用"];
+  }
+
+  invoke [
+    fillcolor="#EAF7EF",
+    label=<<B>loss_fn(enhanced, clean, lengths, **kwargs)</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">Single 直接计算；Composite 进入分项运行时</FONT>>
+  ];
+
+  subgraph cluster_composite {
+    label="CompositeLoss 运行时（仅 Composite 分支）";
+    color="#B39BCE";
+    penwidth=1.2;
+    style="rounded,dashed";
+    fontname="Noto Sans CJK SC";
+    fontsize=14;
+    fontcolor="#684A91";
+
+    route [
+      fillcolor="#F3ECFF",
+      color="#9472BC",
+      label=<<B>component kwargs 路由</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">**kwargs：仅 forward 接受者<BR/>direct：仅 direct-capable component</FONT>>
+    ];
+    gate [
+      fillcolor="#F3ECFF",
+      color="#9472BC",
+      label=<<B>pure / valid gate 与 SS</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">speech-reference 子集与有效质量<BR/>SS：desired / undesired 双路</FONT>>
+    ];
+    ddp [
+      fillcolor="#FDECEC",
+      color="#C76A6A",
+      label=<<B>DDP reduction-mass</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">相关静态 component 固定 SUM<BR/>local mean 重标定为 global mean</FONT>>
+    ];
+    cache [
+      fillcolor="#E9F8F8",
+      color="#4C9A9A",
+      label=<<B>MR-STFT shared cache（条件路径）</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">构造期固定首个兼容 pair<BR/>仅 lengths=None、pair SS 关闭、strict 预检通过</FONT>>
+    ];
+    route -> gate;
+    gate -> ddp [label="speech-reference / global-mean"];
+    route -> cache [label="MR 兼容 pair"];
+  }
+
+  total [
+    fillcolor="#DDEEFF",
+    color="#477BB5",
+    label=<<B>标量总 Loss 与日志分项</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">Composite 在 float32 中 Σ weight × raw<BR/>稳定 key：yaml_{index}::type</FONT>>
+  ];
+
+  yaml -> build [label="cfg.loss + context"];
+  build -> loss_fn [label="Single / Composite 分流"];
+  build -> strict_wrapper [style=dashed, color="#8393A6", label="strict: true"];
+  strict_wrapper -> loss_fn [style=dashed, color="#8393A6", label="包装返回对象"];
+
+  trainer -> invoke [label="enhanced + clean + lengths"];
+  capability -> invoke [label="波形 / metadata"];
+  direct -> invoke [label="enhanced_spectra + target_spectra"];
+  loss_fn -> invoke [label="调用"];
+
+  invoke -> route [style=dashed, color="#9472BC", label="Composite"];
+  invoke -> total [style=dashed, color="#477BB5", label="Single"];
+  route -> total [label="raw × weight"];
+  ddp -> total [label="重标定后 scalar"];
+  cache -> total [label="等价 STFT 重用"];
+
+  { rank=same; loss_fn; strict_wrapper; }
+  { rank=same; capability; direct; }
+  { rank=same; gate; cache; }
+}

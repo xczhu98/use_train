@@ -1,0 +1,41 @@
+Fast-ULCNet 上游来源与适配声明
+================================
+
+本目录及 ``tasks/se/models/discriminative/fast_ulcnet.py`` 包含基于下列 MIT
+许可上游实现复制并适配的代码。对应 MIT 全文与原始版权声明保存在本目录的
+``LICENSE.Fast-ULCNet`` 和 ``LICENSE.CRM_pytorch``。
+
+Fast-ULCNet
+-----------
+
+- 仓库：https://github.com/narrietal/Fast-ULCNet
+- 固定版本：``f1dcfb48df4aed05812c590696d306fb221bd52a``
+- 许可证：MIT
+- 原始版权：Copyright (c) 2025 Nicolás Arrieta Larraza
+- 上游文件：
+  - ``fast_ulcnet_networks/pytorch_version/FastULCNet.py``
+  - ``packages/torch_version/src/comfi_fast_grnn_torch/ComfiFastGRNN.py``
+- 本仓库复制/适配范围：
+  - ``tasks/se/models/discriminative/fast_ulcnet.py``：网络拓扑、channel-wise feature
+    reorientation、depthwise separable convolution、功率律压缩/解压、两阶段掩码流程；
+    已适配为仓库统一的 spectrum-in/spectrum-out 接口，并移除上游模型内部 STFT。
+    功率律对非零值保持上游公式精确值；精确零值显式输出 0 且梯度为 0，避免
+    ``0**0.3`` 的奇异梯度，解压过程采用相同零值边界，不改变 forward 数值。
+  - ``tasks/se/models/modules/fast_ulcnet_impl/comfi_fast_grnn.py``：Comfi-FastGRNN
+    非线性、cell recurrence、低秩参数化、多层与双向 sequence wrapper；已适配类型标注、
+    命名与本仓库模块布局。
+
+CRM_pytorch
+-----------
+
+- 仓库：https://github.com/narrietal/CRM_pytorch
+- 固定版本：``21d457cb740dc50f72c5d1fdda68fa2cc332b77a``
+- 许可证：MIT
+- 上游 LICENSE 原始版权：Copyright (c) 2024 Your Name
+- 上游文件：``CRM_pytorch/crm_pytorch.py``
+- 本仓库复制/适配范围：
+  - ``tasks/se/models/modules/fast_ulcnet_impl/crm.py``：``E``、``C``、``R`` 三种
+    complex ratio mask 公式；已适配参数命名、模式规范化、错误消息、中文 docstring，
+    并固定返回 complex tensor。
+
+除上述范围外，本声明不主张仓库其他代码来自这两个上游项目。

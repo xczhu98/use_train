@@ -1,0 +1,13 @@
+# DCCRN 来源说明
+
+本目录的复数运算层与 DCCRN encoder–RNN–decoder 结构依据论文官方仓库重写：
+
+- 论文：Yanxin Hu, Yun Liu, Shubo Lv, Mengtao Xing, Shimin Zhang, Yihui Fu, Jian Wu, Bihong Zhang, Lei Xie，*DCCRN: Deep Complex Convolution Recurrent Network for Phase-Aware Speech Enhancement*，Interspeech 2020
+- 原始 DCCRN 权威归属为上述 Hu et al. 论文及官方仓库；任务描述中的 “Luo & Yu 风格”仅作为 complex-domain 标准基线的类型说明，不代表论文作者或代码来源
+- 官方仓库：<https://github.com/huyanxin/DeepComplexCRN>
+- 固定 commit：`2e20e122d4b752cd8299450dae5181ff2bd3c29d`
+- 上游文件：`dc_crn.py`、`complexnn.py`
+- 上游文件 SHA-256：`dc_crn.py` = `87f96f5dfebee0f712ec735aa2fddbd592841ee202bb37e5d1f02dfa036c5c8b`；`complexnn.py` = `050f31b29a7a14731f24ebb00062de1e605bd1090954265a5e1727d1a9e59cf0`
+- 许可证：Apache License 2.0；完整文本见同目录 `LICENSE`
+
+本项目没有原样复制上游文件，而是按本仓风格重写并增加类型标注、参数校验及单元测试。关键结构保留：复卷积/复转置卷积代数、可选复 BatchNorm、朴素复 LSTM、跳过 DC bin 的六层 encoder/decoder、complex skip 拼接和 E/C/R 掩码。上游内部 `ConvSTFT` / `ConviSTFT`、波形裁剪、loss、模型打印与脚本代码均未移植；本实现只接受并返回框架统一的 `(B,F,T,2)` 复谱，STFT/iSTFT 由顶层 `stft` 块管理。因此不能假定官方 checkpoint 与本仓框架 STFT 前端逐点兼容。

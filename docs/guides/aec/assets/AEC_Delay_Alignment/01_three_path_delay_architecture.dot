@@ -1,0 +1,40 @@
+digraph aec_delay_paths {
+  graph [rankdir=TB, bgcolor="white", pad="0.20", nodesep="0.24", ranksep="0.38", splines=ortho, compound=true, fontname="Noto Sans CJK SC", label="AEC 三路径延迟架构：训练、验证与推理", labelloc=t, fontsize=22, fontcolor="#17324D"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=10.5, color="#416984", fontcolor="#17324D", penwidth=1.35, margin="0.12,0.08"];
+  edge [fontname="Noto Sans CJK SC", fontsize=8.5, color="#53758C", fontcolor="#35566D", penwidth=1.35, arrowsize=0.7];
+
+  subgraph cluster_train {
+    label="1 训练路径"; color="#2469B3"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#174E89";
+    t0 [label="train.py → AECTrainingEntry", fillcolor="#E9F2FF", color="#2469B3"];
+    t1 [label="DynamicMixingDataset\nLayer A–F", fillcolor="#FFF2E3", color="#C86A19"];
+    t2 [label="C-aec 数据仿真\npair 预对齐 + SER / ERL\n随机 echo delay / jitter", fillcolor="#FFF2E3", color="#C86A19"];
+    t3 [label="sample tuple → collate\n→ AECBatch", fillcolor="#EEF5FB"];
+    t4 [label="AECDeploymentFrontend\n可选 Streaming GCC-PHAT\n→ 可选 LinearAEC", fillcolor="#E6F7F5", color="#16837E"];
+    t5 [label="STFT → model(dict) → iSTFT", fillcolor="#F1ECFF", color="#6F4EB5"];
+    t6 [label="loss + optimizer step", fillcolor="#E9F7E9", color="#388B42"];
+    t0 -> t1 -> t2 -> t3 -> t4 -> t5 -> t6;
+  }
+
+  subgraph cluster_val {
+    label="2 验证路径"; color="#2469B3"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#174E89";
+    v0 [label="validation DataLoader\nDataset A–F + collate", fillcolor="#FFF2E3", color="#C86A19"];
+    v1 [label="同一 AECTrainer 前向\nAECDeploymentFrontend", fillcolor="#E6F7F5", color="#16837E"];
+    v2 [label="STFT → model(dict) → iSTFT", fillcolor="#F1ECFF", color="#6F4EB5"];
+    v3 [label="loss + ERLE / 客观指标", fillcolor="#E9F7E9", color="#388B42"];
+    v0 -> v1 -> v2 -> v3;
+  }
+
+  subgraph cluster_infer {
+    label="3 推理路径：真实 mic + farend"; color="#2469B3"; penwidth=1.6; style="rounded"; fontname="Noto Sans CJK SC"; fontsize=15; fontcolor="#174E89";
+    i0 [label="mic / farend 文件配对\n重采样并裁齐", fillcolor="#EEF5FB"];
+    i1 [label="AECDeploymentFrontend\nCLI 覆盖或 YAML 配置\n可选 delay alignment → LinearAEC", fillcolor="#E6F7F5", color="#16837E"];
+    i2 [label="整文件 STFT\n→ 单次 model.forward\n→ iSTFT", fillcolor="#F1ECFF", color="#6F4EB5"];
+    i3 [label="增强 waveform", fillcolor="#E9F7E9", color="#388B42"];
+    i0 -> i1 -> i2 -> i3;
+  }
+
+  note [label="边界：C-aec 的 delay / jitter 属于 Dataset 数据仿真；\ncanonical AECDeploymentFrontend 属于模型输入/部署路径，始终位于 collate（或文件配对）之后、STFT 之前。", fillcolor="#FFFFFF", color="#7B8791", style="rounded,dashed,filled"];
+  t4 -> note [style=dashed, arrowhead=none, color="#7B8791", constraint=false];
+  v1 -> note [style=dashed, arrowhead=none, color="#7B8791", constraint=false];
+  i1 -> note [style=dashed, arrowhead=none, color="#7B8791", constraint=false];
+}

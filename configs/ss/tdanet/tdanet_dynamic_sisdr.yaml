@@ -1,0 +1,357 @@
+# ============================================================
+# TDANet（waveform-native）动态 SS 训练配方（K=2 固定源）
+# ------------------------------------------------------------
+# 任务：ss（Speech Separation，固定 K 路源分离）；数据管线 mode：dynamic_ss
+# 模型：TDANet（waveform-native，直接吃波形，不消费框架 STFT）
+# 采样率：16 kHz；帧移：N/A（waveform-native，无 STFT 帧）
+# 数据来源：共享 Layer A–F 仿真 seam，输入源为本机 URGENT clean SCP；
+#   本文件是 SS 的标准动态配方，configs/ss/spatial/ 三份 OnlineSpatialNet 配方沿用本文件的
+#   SS 数据/仿真/loss/ss/trainer 口径。
+# SCP 无身份元数据时只保证不同 source；严格不同说话人请替换为含 identity 的 JSONL。
+# Params: 2.339431M（PyTorch parameter count）
+# MACs: not measured（未测；不编造论文参考值）
+# FLOPs: not measured（未测）
+# RTF: not measured（本机未做实时率测量）
+# Trainer MOS boundary: Trainer 不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate/ 离线计算。
+# 推荐入口：python train.py -C configs/ss/tdanet/tdanet_dynamic_sisdr.yaml
+# 实现路径：模型 tasks/ss/models/tdanet.py；数据集 core/data（dynamic SS）+ tasks/ss/data；
+#   entry tasks/ss/trainer/entry.py
+# 枚举键取值参考（本文件所用键的合法集合；括号内为本文件当前取值）：
+#   data.mode：dynamic / offline / dynamic_aec / offline_aec / dynamic_tse / offline_tse /
+#     dynamic_ss / offline_ss / dynamic_ssl（dynamic_ss）
+#   model.type：任务模型注册名，见 tasks/ss/models/__init__.py（TDANet）
+#   loss.type：任务 loss 注册名（PITLoss）；loss.args.pairwise_loss：PairwiseNegSISDRLoss 等
+#   loss.args.assignment：exhaustive（PITLoss 当前仅支持该值）
+#   loss.args.reduction：mean（PITLoss 当前仅支持该值）
+#   optimizer.type：torch.optim 类名（Adam / AdamW / SGD 等），另可回退 adamp 同名类（Adam）
+#   scheduler.type：LinearWarmupCosineAnnealing / CosineAnnealingWarmupRestarts /
+#     ExponentialDecrease / ExponentialLR / StepLR / CosineAnnealingLR / ReduceLROnPlateau
+#     （ReduceLROnPlateau）
+#   acoustic.rir.backend：offline / online（offline）
+#   acoustic.rir.target_type：early / dry（rts 仅属于 SE spatial 合同）（early）
+# ============================================================
+# 运行元信息：复现种子、免 STFT 标记、AMP/EMA 开关。
+meta:
+  # 复现种子；驱动数据仿真与 DataLoader worker 的 epoch 状态。
+  seed: 42
+  # waveform-native 免 STFT 标记：TDANet 直接吃波形，不挂 STFT 前端；
+  # core/trainer/entry.py 在缺少 stft section 时要求该键为 true。
+  allow_no_stft: true
+  # 混合精度开关；false = 全程 fp32。
+  use_amp: false
+  # 权重指数滑动平均开关；false = 不做 EMA。
+  use_ema: false
+  # true 时启用确定性算法（base_trainer 会同时关闭 cudnn.benchmark）；本配置保持 false 换取速度。
+  deterministic: false
+# 模型段：type 为注册表名，args 为模型 __init__ 的显式形参。
+model:
+  # 注册表模型名；TDANet（top-down attention 波形分离网络）。
+  type: TDANet
+  # 模型超参：均为 TDANet.__init__ 的显式形参，未知键会抛 TypeError。
+  args:
+    # 输出通道数。
+    out_channels: 128
+    # 输入通道数（编码器输入维度）。
+    in_channels: 512
+    # 重复块层数。
+    num_blocks: 16
+    # 上采样深度。
+    upsampling_depth: 5
+    # 编码器卷积核大小。
+    enc_kernel_size: 2
+    # 模型内部声明的采样率，单位 Hz；须与 data.sample_rate 一致。
+    sample_rate: 16000
+# 数据段：mode 为路由字段，train/validation 各自独立声明 split 与仿真配置。
+data:
+  # 数据管线模式；dynamic_ss 路由到 SSTrainingEntry。
+  mode: dynamic_ss
+  # 目标采样率，单位 Hz；清单音频重采样到该值。
+  sample_rate: 16000
+  # 训练 split：清单路径、画布长度与 Layer A–F 仿真配置在此声明。
+  train:
+    # 训练语音清单（4 列 SCP）；本机 URGENT 16 kHz clean 清单。
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_train.scp
+    # 训练噪声清单；data/shared/noise 过滤后的噪声源清单。
+    noise_scp: data/shared/noise/filter/v2/train_noise_sources.scp
+    # 背景音乐池（split 级路径，不属于 simulation_cfg）；acoustic.background.music_ratio>0 时必需。
+    # music_scp: data/ss/background/music/train.scp
+    rir_scp: data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp  # 离线 RIR 池；acoustic.rir.backend=offline 时读取
+    # 训练片段时长，单位 s；每路先完成同长画布，Layer F 后不再随机裁切。
+    segment_seconds: 3.0  # 秒；每路先完成同长画布，F 后不再随机裁切
+    # 是否按音频时长过滤清单项；true = 丢弃超出 [filter_min_duration, filter_max_duration] 的条目。
+    filter_by_duration: true
+    # 时长过滤下限，单位 s。
+    filter_min_duration: 0.5
+    # 时长过滤上限，单位 s。
+    filter_max_duration: 30.0
+    # 可选 source pool 抽样策略；本配置留空（null）= 不启用，使用默认均匀抽样。
+    sampling:
+    # 可选；需使用含 dataset_id/speaker_id 的 JSONL source pool。
+    # speech:
+    #   speaker: {max_samples_per_epoch: 4000}
+    # noise:
+    #   balance_categories: true
+    # Dataset lifecycle：固定画布与 repeat 属 split 级参数，不属于 simulation_cfg。
+    repeat_to_max_duration: false
+    # 是否用静音补齐到 max_duration；false = 不补齐。
+    repeat_tile_silence_gap: false
+    # 补齐时静音间隔范围，单位 s。
+    repeat_tile_silence_gap_range: [0.02, 0.8]
+    # Layer A–F 共享仿真合同；未显式声明的键取 canonical 默认值。
+    simulation_cfg:
+      # 语音源处理：splice / silence / high_pass。
+      speech:
+        # 多句拼接。
+        splice:
+          # 是否启用跨文件拼接；false = 不拼接。
+          enabled: false
+          gap_range: [0.02, 0.8]            # 秒；仅 speech.splice.enabled=true 时使用
+        # 静音填充。
+        silence:
+          prob: 0.3          # 每路的单句固定画布概率；命中后短语音只放一次
+          # 静音位置；random = 随机放在画布内。
+          position: random
+        # 高通滤波（约 70 Hz filtfilt）。
+        high_pass:
+          # 是否启用高通；true = 启用。
+          enabled: true
+      # Layer A-2 语音增广占位：prob_speed_perturb / speed_rate_range / prob_pitch_shift /
+      # prob_eq_perturb 当前全部关闭（未声明即取 canonical 默认 0.0）。关闭原因：动态 SS 的
+      # 说话人身份由清单决定，语速/音高扰动会改变 SI-SDR 目标的物理含义；需要时在
+      # data.train.simulation_cfg.speech.speed.prob / speech.pitch.prob / speech.eq.prob 下显式开启。
+      # prob_speed_perturb: 0.2
+      # speed_rate_range: [0.9, 1.1]
+      # prob_pitch_shift: 0.0
+      # prob_eq_perturb: 0.2
+      # Layer B：scene 三个 branch 概率 prob_target_only / prob_target_noise / prob_noise_only 之和必须为 1。
+      scene:
+        # 纯目标分支概率；逐样本抽样，与另外两路构成互斥分组。
+        prob_target_only: 0.75
+        # 目标+噪声分支概率。
+        prob_target_noise: 0.20
+        # 纯噪声分支概率；三者之和必须为 1（runtime 在 core/data/simulation/ss_scenarios.py:26-38
+        # 的 validate_ss_scenarios fail-fast，容差 1e-8），抽样方式为按 SS_SCENARIOS 顺序累计 CDF。
+        prob_noise_only: 0.05
+        # 单人时间布局复用 SE/AEC Layer A，短源默认补零；无身份时不跨文件 splice。
+        timeline:
+          # 额外跨源窗口概率；0.0 = 关闭（仍保留 Layer A gap/留白）。未声明即取默认 0.0。
+          prob: 0.0       # 额外跨源窗口；关闭时仍保留 Layer A gap/留白
+          # 窗口/画布比例范围；命中 timeline.prob 后抽取，实测活动重叠另记 trace。
+          overlap_ratio_range: [0.1, 0.8] # 窗口/画布比例，实测活动重叠另记 trace
+      # ------------------------------------------------------------------
+      # Layer C-0 可选键（真键路径为 acoustic.rir.*；下面示例按 acoustic.rir 层级书写）：
+      #   backend: online                      # offline | online；在线时同组 source 共用 room/mic
+      #   gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # [length, width, height]，单位 m
+      #   gpurir_rt60_range_sec: [0.1, 1.0]    # 单位 s
+      #   gpurir_source_distance_range_m: [0.2, 3.0]      # 单位 m
+      #   gpurir_source_height_range_m: [1.1, 1.8]        # 单位 m
+      #   gpurir_mic_height_range_m: [1.0, 1.8]           # 单位 m
+      #   gpurir_enrollment_distance_range_m: [0.05, 0.2] # 仅 TSE enrollment 近场，SS 不使用
+      # 稳定服务默认值（source budget/device/omni/timeout/cache）由 core 提供，不在 YAML 重复。
+      # ------------------------------------------------------------------
+      # 声学混合 Layer C：RIR/reverb、target 电平与背景 SNR。
+      acoustic:
+        # RIR/reverb 配置。
+        rir:
+          backend: offline  # offline | online；每路独立 RIR，不保证同房间几何
+          # 混响概率；0.5 = 一半样本加混响。
+          reverberation_prob: 0.5
+          # 在线 moving RIR 概率（canonical 名 prob_moving_rir）；0.0 = 全静态。
+          moving_prob: 0.0  # 在线 moving RIR 概率；0=全静态
+          # 监督目标口径；early = early-RIR 卷积（rts 仅属于 SE spatial 合同）。
+          target_type: early
+          early_window_sec: 0.05 # 秒；target 使用早反射，mixture 使用 full-RIR image
+        # 目标电平归一化。
+        target:
+          # 目标音量控制。
+          volume:
+            # 是否启用目标音量随机化；true = 启用。
+            enabled: true
+            db_range: [-40, -12]          # dBFS 初标；后续 SIR/D 可进一步缩放
+            # 电平度量方式；true = 用 RMS（否则用 peak）。
+            use_rms: true
+            # 区间内抽样分布；beta = 用 Beta(beta_a, beta_b) 映射到区间。
+            distribution: beta
+            # Beta 分布 α 参数。
+            beta_a: 1.5
+            # Beta 分布 β 参数。
+            beta_b: 1.5
+        # 加性背景：SNR 参考与范围。
+        background:
+          snr_reference: all_speech # 背景 SNR 参考（primary | all_speech）；当前相对所有 full-RIR 语音之和
+          snr_low: -5 # dB；背景 active-power SNR 下限
+          snr_high: 20 # dB；背景 active-power SNR 上限
+          # 每次背景读取选音乐的概率；0.0 = 关闭。启用需 data.train.music_scp（validation 同名键）
+          # 或噪声清单内嵌 music role；未声明即取默认 0.0。
+          music_ratio: 0.0 # 每次背景读取选音乐的概率；启用需 data.train.music_scp（validation 同名键）或噪声清单内嵌 music role
+          # 非加性 wind sidechain 概率（canonical 名 prob_wind_noise_sidechain）；独立门，
+          # 0.0 = 关闭；SS 的 spatial sidechain 在真实训练 smoke 通过前一律拒绝。
+          prob_wind_noise_sidechain: 0.0
+      # Layer C-1b 彩色噪声占位：prob_colored_noise / colored_noise_snr_range 关闭（未声明取默认 0.0）。
+      # 需要时在 data.train.simulation_cfg.acoustic.background.colored_noise_prob /
+      # colored_noise_snr_range 下显式开启。
+      # prob_colored_noise: 0.1
+      # colored_noise_snr_range: [10, 30]
+      # Layer D：post-mix 幅度条件化。
+      post_mix:
+        # 幅度归一化子配置。
+        normalization:
+          mode: "off"                 # SS 只允许 off/joint；D-guard 始终执行
+      # Layer E：channel clipping 层。
+      channel:
+        enabled: false             # Layer E 总开关，仅改变 mixture
+      # Layer F：observation/device degradation 层。
+      device:
+        enabled: false                            # Layer F 总开关；不控制 D/E
+  # Layer E/F 增广占位：prob_clip / prob_post_eq / prob_drc 关闭（未声明取默认 0.0）；
+  # 需要时在 data.train.simulation_cfg.channel / device 下显式开启对应子项。
+  # prob_clip: 0.1
+  # prob_post_eq: 0.1
+  # prob_drc: 0.1
+  # 验证 split：结构同 train，独立声明以避免隐式继承。
+  validation:
+    # 验证语音清单；16 kHz 验证切片。
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_val.scp
+    # 验证噪声清单。
+    noise_scp: data/shared/noise/filter/v2/val_noise_sources.scp
+    # 验证 RIR 池；acoustic.rir.backend=offline 时读取。
+    rir_scp: data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp
+    # 验证片段时长，单位 s；每路先完成同长画布，Layer F 后不再随机裁切。
+    segment_seconds: 3.0  # 秒；每路先完成同长画布，F 后不再随机裁切
+    # 是否按时长过滤；与 train 一致。
+    filter_by_duration: true
+    # 时长过滤下限，单位 s。
+    filter_min_duration: 0.5
+    # 时长过滤上限，单位 s。
+    filter_max_duration: 30.0
+    # SS split 参数显式独立，不隐式继承 train；未写的 speech.high_pass.enabled=false、
+    # speech.silence.prob=0、scene.timeline.prob=0 使用 SS 默认。
+    simulation_cfg:
+      # Layer B：验证集固定场景分布；不继承 train 的随机配置。
+      scene:
+        # 1.0/0.0/0.0 之和为 1，满足 validate_ss_scenarios 的和=1 校验（容差 1e-8）。
+        prob_target_only: 1.0
+        # 关闭目标+噪声分支。
+        prob_target_noise: 0.0
+        # 关闭纯噪声分支。
+        prob_noise_only: 0.0
+      # 声学混合 Layer C。
+      acoustic:
+        # RIR/reverb 配置。
+        rir:
+          backend: offline  # offline | online；每路独立 RIR，不保证同房间几何
+          # 同 train：一半样本加混响。
+          reverberation_prob: 0.5
+          # 同 train：全静态。
+          moving_prob: 0.0  # 在线 moving RIR 概率；0=全静态
+          # 同 train：early 目标。
+          target_type: early
+          early_window_sec: 0.05 # 秒；target 使用早反射，mixture 使用 full-RIR image
+        # 目标电平归一化。
+        target:
+          # 目标音量控制。
+          volume:
+            # 同 train：启用。
+            enabled: true
+            db_range: [-40, -12]          # dBFS 初标；后续 SIR/D 可进一步缩放
+            # 同 train：RMS 度量。
+            use_rms: true
+            # 同 train：beta 分布。
+            distribution: beta
+            # 同 train：α。
+            beta_a: 1.5
+            # 同 train：β。
+            beta_b: 1.5
+        # 加性背景（验证集未声明 snr_reference/music_ratio，取 SS 默认）。
+        background:
+          snr_low: -5 # dB；背景 active-power SNR 下限
+          # 同 train，单位 dB。
+          snr_high: 20 # dB；背景 active-power SNR 上限
+          # 同 train：sidechain 关闭。
+          prob_wind_noise_sidechain: 0.0
+      # Layer E。
+      channel:
+        enabled: false             # Layer E 总开关，仅改变 mixture
+      # Layer F。
+      device:
+        enabled: false                            # Layer F 总开关；不控制 D/E
+  # DataLoader 参数。
+  dataloader:
+    # 每批样本数。
+    batch_size: 4
+    # 训练 loader worker 数。
+    num_workers: 4
+    # 是否锁页内存；true 可加速 GPU 拷贝。
+    pin_memory: true
+    # 是否保持 worker 存活跨 epoch；true 复用进程（worker 为 0 时强制 false）。
+    persistent_workers: true
+# SS 任务专属段：固定 K 路源合同。
+ss:
+  num_sources: 2  # 固定 K，同时约束 Dataset/模型/PIT；当前不支持 variable-K
+  sir_range: [-5, 5]  # 每个后续 full-RIR source 相对第一路的 SIR，单位 dB
+# 损失段：type 与 args。
+loss:
+  # loss 类型；PITLoss（置换不变训练损失）。
+  type: PITLoss
+  # loss 构造参数。
+  args:
+    # 成对损失类型；PairwiseNegSISDRLoss = 负 SI-SDR。
+    pairwise_loss: PairwiseNegSISDRLoss
+    # 排列分配方式；exhaustive = 穷举全部 K! 排列取最优。
+    assignment: exhaustive
+    # 归约方式；mean = 对 batch 取均值。
+    reduction: mean
+# 优化器段：type 与 args。
+optimizer:
+  # 优化器类型；Adam。
+  type: Adam
+  # 优化器参数。
+  args:
+    # 学习率，无量纲。
+    lr: 0.001
+# 学习率调度段：type 与 args。
+scheduler:
+  # 调度器类型；ReduceLROnPlateau（验证指标停滞时衰减）。
+  type: ReduceLROnPlateau
+  # 调度器参数。
+  args:
+    # 监控方向；min = 指标越小越好。
+    mode: min
+    # 每次触发的衰减因子，无量纲。
+    factor: 0.5
+    # 无改善容忍 epoch 数。
+    patience: 15
+# 训练控制段。
+trainer:
+  # Trainer 类名；对应 tasks/ss/trainer/。
+  type: SSTrainer
+  # 实验输出目录（checkpoint / 日志 / TensorBoard）。
+  exp_path: exp/ss/tdanet_dynamic_sisdr
+  # 训练总 epoch 数。
+  epochs: 100
+  # 梯度裁剪范数上限，无量纲。
+  gradient_clip_value: 5.0
+  # 梯度累积步数；1 = 不累积。
+  accumulation_steps: 1
+  # 学习率调度按 epoch 还是按 step；false = 每 epoch 调用一次（配合 ReduceLROnPlateau）。
+  lr_schedule_per_step: false
+  # 日志打印间隔，单位 optimizer step。
+  log_interval: 50
+  # 每次验证最多跑多少 batch；0 = 不限制。
+  max_val_batches: 0
+  # 每多少 epoch 做一次验证。
+  validation_epoch_interval: 1
+  # 每多少 step 做一次验证；0 = 关闭按 step 验证。
+  validation_steps_interval: 0
+  # 保留最优 checkpoint 数。
+  save_top_k: 3
+  # 在线验证指标配置。
+  val_metrics:
+    # 关闭在线指标：动态 SS 配方不做侵入式指标；如需 SI-SDR 等由 evaluate/ 离线计算。
+    enabled: false
+  # checkpoint 保存间隔，单位 epoch。
+  save_checkpoint_interval: 1
+# 分布式段：多卡训练后端。
+distributed:
+  # 分布式后端；单卡与多卡统一 nccl；其余分布式键（如 find_unused_parameters）取 runtime 默认。
+  backend: nccl

@@ -1,0 +1,219 @@
+# ======================================================================
+# URGENT2026 dynamic online mixing（16 kHz）
+# Recipe: GTCRN + MetricDiscriminator / GANTrainer
+# ======================================================================
+# Model: GTCRN + MetricDiscriminator
+# Generator Params: 0.048245 M（本配置实测；G+D = 0.068217 M）
+# 1 秒输入 MACs: 0.034077 G（THOP partial coverage；generator scope，B=1、16 kHz）
+#   STFT/iSTFT 按 0 计，functional/complex/custom 算子可能漏计；不含 discriminator。
+# 独立 FLOPs: N/A（not measured：无覆盖上述算子的独立 profiler，不以 2×MACs 推算）
+# Trainer MOS boundary/PESQ 边界：普通 GANTrainer 下的 LSGAN（MSE 对 1/0 标签），不是
+#   PESQ-guided MetricGAN；不注入 PESQ，也不训练或输出 MOS；
+#   val_metrics.enabled=false 只关闭验证指标。
+# 用途：普通 LSGAN 语音增强训练
+#   generator: GTCRN (spectrum-in / spectrum-out)
+#   discriminator: MetricDiscriminator (mag+pha → quality score)
+#
+# Train:
+#   python train.py -C configs/se/urgent2026/gan/gtcrn_metricdiscriminator_dynamic.yaml
+#
+# 数据管线：data.mode=dynamic 在线混合；Layer A 仅 high_pass，Layer B 三路互斥场景固定 target+noise，
+#   Layer C 含 RIR/音量/加性噪声/sidechain 风噪，Layer E/F 关闭（channel.enabled=false、device.enabled=false）；
+#   validation 用 inherit_simulation 继承同一 simulation_cfg，只覆盖资源 SCP。
+# 实现路径：generator tasks/se/models/discriminative/gtcrn.py；discriminator tasks/se/models/gan/discriminators/discriminator.py
+#
+# 注意：本配置为模板 / 冒烟测试用，epochs 与 batch_size 较小。
+# ======================================================================
+
+# ---- meta：随机种子与运行模式 ----
+meta:
+  seed: 42        # 随机种子；固定后 Layer A–F 抽样与 DataLoader worker 序列可复现
+  use_amp: false  # false = FP32；改 true 时须同时设置 amp_dtype（推荐 bfloat16）
+  use_ema: false  # 是否维护 EMA 权重
+  # false = 保留 cudnn.benchmark 默认 true（按 shape 自动选最快 kernel，速度优先）；
+  # true = 强制 cudnn.benchmark=false 并启用确定性算法，牺牲吞吐换跨运行可复现
+  deterministic: false
+
+# ---- STFT：框架 STFT；GTCRN 谱进谱出 ----
+stft:
+  n_fft: 512          # FFT 点数
+  hop_length: 256     # 帧移，单位 sample
+  win_length: 512     # 窗长，单位 sample
+  window: hann        # 分析窗类型
+
+# ---- Model：Generator + Discriminator ----
+model:
+  # GAN 两模块：generator 生成增强谱，discriminator 只参与训练，不进入推理 artifact
+  generator:
+    type: GTCRN                    # 轻量实时 SE 模型（谱进谱出）；实现见 tasks/se/models/discriminative/gtcrn.py
+    args: {}                       # 空映射 = 全部取 GTCRN 模型默认构造参数（未知 kwargs 会抛 TypeError）
+  # discriminator 只参与训练（LSGAN 真假判别），不进入推理 artifact
+  discriminator:
+    type: MetricDiscriminator      # mag+pha → 质量分数；实现见 tasks/se/models/gan/discriminators/discriminator.py
+    args:                          # 构造参数；未知 kwargs 会抛 TypeError
+      input_features: 4          # 判别器输入：ref_mag / ref_pha / enh_mag / enh_pha 四通道
+      channels: [32, 32, 32, 1]  # 各层通道数，末层输出 1 个质量分数
+      kernel_size: 3             # 卷积核大小
+      use_spectral_norm: true    # 是否启用谱归一化
+
+# ---- Data：URGENT2026 动态在线混合 ----
+data:
+  mode: dynamic                       # SE 动态在线混合
+  sample_rate: 16000                  # Hz；加载后统一重采样到 16 kHz
+
+  # train split：split 级资源键（*_scp / filter_* / max_duration_* / repeat_*）只能写在这里，不能放进 simulation_cfg
+  train:
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # clean 语音四列 SCP（uid/fs/length/path）
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"    # Layer C-1 加性噪声 source SCP
+    # music_scp: data/ss/background/music/train.scp  # 可选背景音乐池；是否混入由 simulation_cfg.acoustic.background.music_ratio（默认 0.0，逐 source read 独立 rng 抽样）决定，与 Layer C-3 彩色噪声无关；本机当前未提供该 SCP，故保持注释
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # Layer C-2 side-chain 风噪 source SCP
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp"    # Layer C-0 RIR SCP
+    # filter_min_duration / filter_max_duration 在 source manifest 阶段按时长过滤，不进入 simulation_cfg
+    filter_min_duration: 2.0   # 最短 clean 语音时长，单位 s
+    filter_max_duration: 30.0  # 最长 clean 语音时长，单位 s
+
+    # A-3 模式 A 对齐：max_duration_seconds / repeat_to_max_duration 是 split 级 Dataset 参数，不能放进 simulation_cfg
+    max_duration_seconds: 4        # 固定 canvas 时长，单位 s
+    repeat_to_max_duration: true   # true = 短句 tile 到 max_duration_seconds
+    simulation_cfg:                # Layer A–F 在线仿真；顺序与 tasks/se/data/dynamic_dataset.py::_run 一致
+      # Layer A：仅启用 A-4 高通滤波，其余 A-1/A-2/A-3 子层保持默认关闭
+      speech:
+        high_pass:                 # A-4 高通滤波
+          enabled: true            # Layer A 高通滤波开关
+
+      # Layer B：三路互斥场景。三项 prob_* 为一个互斥组，和必须为 1（abs 容差 1e-8），另要求
+      #   prob_target_only + prob_noise_only <= 1.0；由 tasks/se/data/dynamic_dataset.py 在构造期 fail-fast。
+      #   抽样方式：逐样本用 multinomial CDF 在 [0,1) 取一段，命中哪一场景即整条样本走该路径；
+      #   nominal = 配置概率，realized = 实际命中率（随样本数波动）。Layer A 的 gap/留白在该层之前已生效。
+      #   未声明而取 runtime 默认 0.0 的同层概率字段：scene.prob_timeline（跨源时间线窗口，配合 overlap_ratio_range）。
+      scene:
+        prob_target_only: 0.0    # [0,1]；observation = target = clean_target，跳过 C-1/C-2/C-3 加噪；本配置关闭
+        prob_noise_only: 0.0     # [0,1]；observation = additive、target = 0；本配置关闭
+        prob_target_noise: 1.0   # [0,1]；observation = target + additive（本配置唯一启用路径，保证三项和=1）
+      # Layer C：声学混合（C-0 RIR / C-0b target volume / C-1 加性噪声 / C-2 sidechain 风噪）；
+      # 本层 prob_* 为独立伯努利门（逐样本 rng 抽样，可共现），非互斥组
+      acoustic:
+        # C-0b post-RIR target volume：以 early target 的 RMS 标定，full/early/target 共用同一 gain
+        target:                            # C-0b 目标音量随机化
+          volume:                          # 音量参数；enabled=false 时整块跳过
+            enabled: true                 # true = 启用 C-0b 目标音量随机化；false = 保持原始电平
+            db_range: [-40, -20]          # target 电平范围，单位 dBFS
+            use_rms: true                 # true = 以 RMS 标定而非峰值
+            distribution: uniform         # 枚举：uniform | beta；beta_a/beta_b 仅对 beta 生效
+            beta_a: 2.0                   # Beta 分布参数 a（仅 distribution=beta 时消费）
+            beta_b: 2.0                   # Beta 分布参数 b（仅 distribution=beta 时消费）
+
+        # Layer C-0：RIR 由 acoustic.rir.* 控制；backend 与 gpurir_* 房间几何用默认值，不在本文件重复。
+        #   未声明而取 runtime 默认 0.0 的阵列概率字段：prob_array_rotation / prob_microphone_position_jitter
+        #   （均要求 spatial_enabled=true，本非空间配置不可用）。
+        rir:
+          reverberation_prob: 0.5 # [0,1]；独立伯努利门，逐样本抽样；0 = 全干信号
+          moving_prob: 0.0  # 在线 moving RIR 概率；0=全静态（本模板配方保持关闭，非框架限制）
+          # acoustic.rir.segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定
+          target_type: early          # clean_target 保留 early-RIR；枚举：early | dry | rts
+          normalize: true            # full/early RIR 共用 full peak 归一化
+        # C-1/C-2 背景：未声明而取 runtime 默认 0.0 的 family 概率为 music_ratio（背景音乐）、
+        #   prob_point_source_background / prob_wind_noise_background（要求 spatial_enabled=true 且 rir_backend=online）。
+        background:
+          snr_low: -5                # 加性噪声 SNR 下限，单位 dB
+          snr_high: 25               # 加性噪声 SNR 上限，单位 dB
+          # C-2 side-chain 风噪：非加性叠加，直接改变 target/observation（compressor 路径见 core/data/simulation_configs.py）
+          prob_wind_noise_sidechain: 0.05  # [0,1]；sidechain 风噪命中概率，逐样本抽样
+
+      # Layer E/F 总开关；Layer D post-mix normalize → guard 始终执行，本文件不设 post_mix
+      channel:
+        enabled: false                            # false = 跳过 Layer E 信道退化
+      device:                                     # Layer F：post-mix distortion；enabled=false 时整层跳过
+        enabled: false                            # false = 跳过 Layer F noisy-only 后处理
+
+  # validation split：dynamic 仿真继承 data.train.simulation_cfg，只覆盖下列资源 SCP
+  validation:
+    mode: dynamic                    # validation 走同一 dynamic 仿真
+    inherit_simulation: true         # 继承 data.train.simulation_cfg，仅覆盖下列资源
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # clean 语音四列 SCP
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp"                        # Layer C-0 RIR SCP
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"                               # Layer C-1 加性噪声 source SCP
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp"                      # Layer C-2 side-chain 风噪 source SCP
+
+  # dataloader：SE dynamic 标准 collate；batch 内样本长度由 max_duration_seconds 对齐
+  dataloader:
+    batch_size: 4                    # 单卡 batch 大小
+    num_workers: 4                   # 每 rank 的数据加载进程数
+    pin_memory: true                 # 固定内存加速 H2D 拷贝
+
+# ---- Loss：显式 CompositeLoss；STFT 几何由顶层 stft 注入 ----
+loss:
+  type: CompositeLoss          # 复合损失；顶层只接受 type/components/strict/enable_ss_undesired_energy
+  components:                  # 组件列表；每项只接受 type/weight/args/name/enable_ss_undesired_energy
+  - type: GTCRNCompressedSpectralLoss   # 压缩谱损失（实/虚部 + 幅度）
+    weight: 1.0                # 组件总权重（无量纲）
+    args:                      # 组件参数；未知键在 loss 构造前报错
+      compress_factor: 0.3   # 论文幅度压缩指数 c = 0.3
+      lamda_ri: 30.0         # 实部/虚部损失权重：30 × (L_real + L_imag)
+      lamda_mag: 70.0        # 幅度损失权重：70 × L_mag
+  - type: GTCRNLogRatioLoss    # 压缩谱 log-ratio 损失（幅度域）
+    weight: 1.0                # 组件总权重（无量纲）
+
+# ---- Optimizer：独立 G/D 优化器 ----
+optimizer:
+  generator:                   # 生成器优化器
+    type: Adam                 # 优化器类型；未知类型在构造期 fail-fast
+    args:                      # 优化器参数；未知键在构造期报错
+      lr: 0.001           # G 学习率（无量纲）
+      eps: 1.0e-8         # Adam 数值稳定项
+  discriminator:               # 判别器优化器（与 G 独立）
+    type: Adam                 # 优化器类型；未知类型在构造期 fail-fast
+    args:                      # 优化器参数；未知键在构造期报错
+      lr: 0.0005          # D 通常用更低学习率
+      eps: 1.0e-8         # Adam 数值稳定项
+
+# ---- Scheduler：独立 G/D 调度器 ----
+scheduler:
+  generator:                   # 生成器调度器
+    type: LinearWarmupCosineAnnealing   # 线性 warmup + 余弦退火；按 optimizer step 计步
+    args:                      # 调度器参数；未知键在构造期报错
+      warmup_steps: 1000      # 线性 warmup 步数（optimizer step）
+      decay_until_step: 10000 # 余弦退火终止步
+      max_lr: 1.0e-3          # warmup 后的峰值学习率
+      min_lr: 1.0e-6          # 退火终点学习率
+  # 与 generator 同构，仅峰值学习率更低
+  discriminator:               # 判别器调度器
+    type: LinearWarmupCosineAnnealing   # 同 G；按 optimizer step 计步
+    args:                      # 调度器参数；未知键在构造期报错
+      warmup_steps: 1000      # 线性 warmup 步数（optimizer step）
+      decay_until_step: 10000 # 余弦退火终止步
+      max_lr: 5.0e-4          # warmup 后的峰值学习率（低于 G）
+      min_lr: 1.0e-6          # 退火终点学习率
+
+# ---- Trainer：GAN ----
+trainer:
+  type: GANTrainer            # 普通 LSGAN 训练器（MSE 对 1/0 标签）；实现见 tasks/se/trainer/gan_trainer.py
+  exp_path: exp/se/gtcrn_metricdiscriminator_dynamic  # 日志/checkpoint 输出目录（相对仓库根）
+
+  epochs: 2              # 冒烟模板：正式训练需提高
+  gradient_clip_value: 5.0    # 梯度裁剪阈值
+  accumulation_steps: 1       # 梯度累积；DDP 中间步由 no_sync() 自动跳过 AllReduce
+  lr_schedule_per_step: true  # true = 调度器按 optimizer step 更新
+  log_interval: 10            # 每 N 个 optimizer step 记录一次日志
+
+  # GAN 特定超参
+  discriminator_steps: 1   # 每个 optimizer step 的 D 更新次数
+  generator_steps: 1       # 每个 optimizer step 的 G 更新次数（当前只允许 1）
+  adversarial_weight: 0.05 # 对抗损失权重（无量纲）
+
+  # 验证
+  validation_epoch_interval: 1  # 每 N 个 epoch 做一次 epoch 末验证
+  max_val_batches: 0            # 0 = 不限制 validation batch 数
+  val_metrics:                  # 在线验证指标；enabled=false 时整块跳过
+    enabled: false      # 关闭以加快冒烟测试（正式训练可置 true；MOS 类指标须走 evaluate/ 离线）
+    max_utterances: 2167  # 启用后覆盖 URGENT2026 全部有效验证样本（全局，各 rank 均分）
+
+  # 存盘
+  save_checkpoint_interval: 1   # epoch 末写盘间隔
+
+# ---- Distributed：DDP 后端与未使用参数策略 ----
+distributed:
+  backend: nccl                   # DDP 通信后端；单机 GPU 用 nccl
+  # SE GAN entry 强制推导为 true：交替冻结 G/D 导致一侧 DDP wrapper 在某次 backward 无梯度；
+  # 显式写 false 会被 tasks/se/trainer/entry.py 直接拒绝，故此处必须为 true。
+  find_unused_parameters: true

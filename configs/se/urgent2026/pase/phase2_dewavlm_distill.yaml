@@ -1,0 +1,215 @@
+# ======================================================================
+# 配置：PASE Phase 2，DeWavLM representation distillation。
+# 数据管线：data.mode=dynamic（SE 在线混合；Layer A/B/C 仿真 + Layer D/E/F 后处理）。
+# 采样率/帧移：16 kHz；waveform-native（meta.allow_no_stft=true），本阶段不产生音频，
+#   无框架 STFT 也无 iSTFT；训练切片 4 s。
+# 模型：冻结 clean WavLM teacher，训练 noisy DeWavLM student；L24 feature MSE，无 GAN/vocoder。
+# 实现路径：tasks/se/models/pase_family/common/dewavlm_distill.py（DeWavLMDistillModel）、
+#   tasks/se/models/pase_family/common/wavlm_frontend.py（WavLM_feat 双副本）。
+# WavLM 依赖：teacher 与 student 均直接依赖 Microsoft WavLM-Large checkpoint。
+# Artifact 披露：model.args.teacher_ckpt_path / model.args.student_ckpt_path 指向的
+#   ~/use_train_checkpoints/pase/WavLM-Large.pt 已在本机（1.27 GB，SHA256
+#   6fb4b3c3...0bf100f）；路径非空即走 safe_torch_load 严格加载，缺失时在模型构造期直接报错。
+# Params：约 315.45M/副本（checkpoint 实测）；训练时为双副本，推理 artifact 仅包含 student。
+# MACs：not measured；不得以完整 PASE 的 21.42 GMAC/s 代替双分支训练开销。
+# FLOPs：not measured；未运行独立 FLOPs profile。
+# THOP：not measured（未运行）。
+# RTF：not measured（未在本机计时）。
+# 复杂度输入口径：teacher/student 各 B=1，16 kHz，shape=[1, 16000] 的 float waveform，
+#   幅度 [-1, 1]；实际训练切片为 4 s；仅计模型前向，图外 STFT 不计入。
+# Trainer MOS boundary：DualInputLossTrainer 只消费 scalar feature MSE，不生成增强音频；
+#   本阶段不计算或解释 MOS/PESQ/STOI（在线指标有意关闭），MOS 只能由后续阶段的
+#   evaluate/eval_pipeline_se.py --audio_quality 对导出音频离线评估。
+# 冻结/可训练：冻结 teacher，训练 student；discriminator 不适用。
+# 与其他变体的关键区别：本阶段只训练 encoder（student），不构造 vocoder/判别器；
+#   StuPASE Phase 0 结构相同，但 student 以 PASE Phase 2 产物 warm start。
+# 产物：DeWavLM student（约定导出名 DeWavLM.pt），供 Phase 3 encoder 使用；
+#   单独不输出增强音频。
+# Source: cisco-open/pase — pase/configs/cfg_train_dewavlm.yaml
+# 口径：对齐 official cfg_train_dewavlm.yaml 与 train_dewavlm.py——seed=34、fp32（无 autocast）、
+#   optimizer.lr=1e-3、逐 epoch validation；scheduler.max_lr=1e-4 不变，峰值仍由 scheduler 驱动。
+# Train:
+#   python train.py -C configs/se/urgent2026/pase/phase2_dewavlm_distill.yaml
+# ======================================================================
+
+# ---- meta：随机性 / 精度 / 确定性开关（core/trainer/entry.py、core/trainer/base_trainer.py）----
+meta:
+  seed: 34              # 全局随机种子；official train_dewavlm.py:33 seed=34；各 rank 模型初始化同种子，数据打乱按 rank 偏移
+  allow_no_stft: true   # 本阶段输出为 WavLM 特征 MSE，全程 waveform-native，不使用框架 STFT
+  use_amp: false        # 官方训练脚本为 fp32（无 autocast）；amp_dtype 仅保留作参考
+  amp_dtype: bfloat16   # 若手动开启 AMP 必须保持 bfloat16：bf16 与 fp32 同指数范围、无需 GradScaler
+  deterministic: false  # false=保留 cuDNN benchmark 自动选算法（默认）；true 关闭 benchmark 并置 cudnn.deterministic
+
+# ---- model：双副本 WavLM 蒸馏（teacher 冻结 / student 可训练）----
+model:
+  type: DeWavLMDistillModel  # 注册名 → tasks/se/models/pase_family/common/dewavlm_distill.py
+  # 模型结构参数（显式形参；未知键在构造期 TypeError）
+  args:
+    teacher_ckpt_path: "~/use_train_checkpoints/pase/WavLM-Large.pt"  # 冻结 teacher 初始化权重；本机已准备，缺失时构造期报错
+    student_ckpt_path: "~/use_train_checkpoints/pase/WavLM-Large.pt"  # 可训练 student 初始化权重；同上，缺失即报错
+    output_layer: 24    # 参与 MSE 的 WavLM 层号；本阶段为单层 int 24（不是多层的 list）
+    feature_norm: batch  # PASE 官方 LayerNorm 口径：F.layer_norm(feat, feat.shape)
+
+# ---- data：SE dynamic 数据管线（train/validation 资源 + Layer A–F 仿真）----
+data:
+  mode: dynamic                    # 枚举：dynamic（SE 在线混合）；offline 变体用 offline
+  sample_rate: 16000               # Hz；训练/验证采样率，同时是仿真 target_sr
+
+  # 训练 split 声明：clean/noise/wind/RIR 清单路径、时长过滤、固定画布与分层仿真配置
+  train:
+    speech_scp: "data/se/pase/manifests/pase_clean_train.scp"  # official DNS5 LibriVox + LibriTTS + VCTK 过滤清单；teacher 的唯一输入
+    noise_scp: "data/se/pase/manifests/dns5_noise_train.scp"  # DNS5 noise；official 只使用 DNS5 noise
+    # Layer C-3 背景音乐清单（本 split 级键，不属于 simulation_cfg）；本配方未启用。
+    # music_scp: data/ss/background/music/train.scp
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪清单；prob_wind_noise_sidechain=0 时不采样
+    rir_scp: "data/se/pase/manifests/dns5_rir_train.scp"   # SLR26/28；对齐 official PASE RIR 口径
+    # wind 概率为 0，运行时不采样；windnoise_scp 仍会在 Dataset 初始化时解析。
+    filter_min_duration: 2.0        # s；源语音最短时长过滤阈值
+    filter_max_duration: 30.0       # s；源语音最长时长过滤阈值
+    num_per_epoch: 8000             # 每个 epoch 的无放回抽样上限（nominal 目标条数）
+    # Dataset lifecycle: fixed canvas/repeat belongs to this split, not simulation_cfg.
+    max_duration_seconds: 4       # s；固定画布长度；official wav_len=4
+    repeat_to_max_duration: false # 短句右侧补零；对齐 official 零填充，不做 tile
+    # 分层在线仿真配置（Layer A–F）；unknown 键在配置边界 fail-fast
+    simulation_cfg:
+      # ---- Layer B：场景分支（scene 三路互斥概率）----
+      # scene 三路为互斥 multinomial：逐样本单次 uniform 抽样按 CDF 顺序命中（core/data/simulation/scenario_sampler.py），
+      # 最后一项 prob_target_noise 为兜底；三者之和必须严格 = 1（abs_tol=1e-8），
+      # 且 prob_target_only + prob_noise_only <= 1，违反时 tasks/se/data/dynamic_dataset.py:279-291 在 Dataset 构造期报错。
+      # 概率是 nominal 目标比例，realized 计数受 num_per_epoch 有限抽样影响。
+      # 未声明的仿真概率字段取 runtime 默认 0.0（core/data/simulation_configs.py:147-294）：
+      # prob_timeline、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter、prob_speed_perturb 等。
+      # Layer B timeline：多源相对窗口；SE/AEC 单路默认关闭，Layer A gap/留白仍生效。
+      # prob_timeline: 0.0            # Layer B 多源相对窗口概率；未声明=0.0
+      # overlap_ratio_range: [0.1, 0.5]  # 多源窗口重叠比例范围，无量纲；未声明时取默认
+      speech:
+        random_start: true        # 与 official random_start=True 对齐；长句随机起点裁剪 4 s
+        # Layer A-4 高通预处理（约 70 Hz 的 filtfilt）
+        high_pass:
+          enabled: false            # Layer A-4 ~70 Hz 高通 filtfilt；对齐 official PASE 关闭
+      # Layer B 场景分支：三路互斥概率，和必须为 1
+      scene:
+        prob_target_only: 0.0       # Layer B target-only 概率；本阶段不采样
+        prob_noise_only: 0.0        # Layer B 纯背景概率；本阶段不采样
+        prob_target_noise: 1.0      # Layer B 目标+噪声概率；三路之和必须为 1（本配置由本项独占）
+      # ------------------------------------------------------------------
+      # Layer C-0：RIR backend / room geometry / static-moving policy
+      # ------------------------------------------------------------------
+      # rir_backend: offline  # offline | online；在线时同组 source 共用 room/mic
+      # gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # [length, width, height]
+      # gpurir_rt60_range_sec: [0.1, 1.0]
+      # gpurir_source_distance_range_m: [0.2, 3.0]
+      # gpurir_source_height_range_m: [1.1, 1.8]
+      # gpurir_mic_height_range_m: [1.0, 1.8]
+      # gpurir_enrollment_distance_range_m: [0.05, 0.2]  # 仅 TSE enrollment 近场
+      # 稳定服务默认值（source budget/device/omni/timeout/cache）由 core 提供，不在 YAML 重复。
+      acoustic:
+        # Layer C-0 RIR/混响：卷积概率、moving 策略与监督 target 口径
+        rir:
+          reverberation_prob: 0.5   # [0, 1]；Layer C-0 RIR 卷积采样概率；0=全部 dry
+          moving_prob: 0.0  # [0, 1]；在线 moving RIR 概率；0=全静态（本配方保持关闭，非框架限制）
+          # segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定。
+          target_type: early        # official teacher 的 clean 是 early-RIR（dataloader 前 50 ms 反射）；枚举 early/dry/rts
+          normalize: false          # D-05：false 保留 official raw RIR gain 及 full/early 相对增益（封闭复现例外）
+        # Layer C-1/C-2 加性噪声与风噪 side-chain
+        background:
+          snr_low: -5               # dB；official SNR range 下界
+          snr_high: 15              # dB；official SNR range 上界
+          # 对齐 official PASE：仅使用 reverb 与 SNR-controlled additive noise，
+          # 关闭 high-pass、wind、Layer E channel degradation 与 Layer F post-mix degradation。
+          prob_wind_noise_sidechain: 0.0  # [0, 1]；非加性风噪 sidechain 概率；0=禁用且零 RNG 消耗
+      # Layer D：post-mix amplitude conditioning（normalize → guard）
+      post_mix:
+        # Layer D post-mix 幅度归一化（公共枚举仅 off/joint）
+        normalization:
+          mode: joint                  # 公共枚举仅 off/joint；noisy/clean/noise 共用 scale，保持线性分解
+      # Layer E：URGENT2026 信道退化（仅作用于 noisy）
+      channel:
+        enabled: false              # Layer E 总开关；false 跳过整层信道退化
+      # Layer F：observation/device 退化（总开关关闭时整层跳过）
+      device:
+        enabled: false              # Layer F 总开关；false 跳过 observation/device 退化，不控制 Layer D/E
+
+  # data.validation：验证 split；inherit_simulation=true 时复用 train.simulation_cfg，仅覆盖下列资源键
+  validation:
+    mode: dynamic                   # 枚举：dynamic
+    inherit_simulation: true        # 继承 data.train.simulation_cfg（同一配置内的仿真继承，非文件级配置继承）
+    # 官方 validation 的 random_start=False；train 为 true，必须显式覆盖。
+    simulation_cfg:
+      speech:
+        random_start: false     # 官方 validation random_start=False；长句固定起点裁剪
+    speech_scp: "data/se/pase/manifests/pase_clean_val.scp"  # 验证 clean 语音清单；DNS5 前 90 speaker + LibriTTS dev + VCTK 10 speaker
+    rir_scp: "data/se/pase/manifests/dns5_rir_val.scp"   # SLR26/28；对齐 official PASE RIR 口径
+    noise_scp: "data/se/pase/manifests/dns5_noise_val.scp"          # DNS5 noise validation
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp" # 验证风噪清单（本配置不采样）
+    max_duration_seconds: 4         # s；验证固定画布；official wav_len=4
+    repeat_to_max_duration: false   # 短句右侧补零；对齐 official 零填充
+    num_per_epoch: 1000             # validation 无放回抽样上限
+
+  # data.dataloader：train/val loader 共享参数（验证侧默认沿用，可用 val_num_workers/val_persistent_workers 覆盖）
+  dataloader:
+    batch_size: 4                   # source train_dataloader.batch_size (per-GPU)；双分支显存开销大，故较小
+    val_batch_size: 1               # 官方 validation_dataloader.batch_size=1；显式写出，不沿用 train
+    num_workers: 4                  # train loader worker 数；验证 loader 默认沿用（0 时强制 persistent_workers=false）
+    pin_memory: true                # 锁页内存，加速 host→device 拷贝
+
+# ---- loss：占位 loss，真实特征 MSE 在模型 forward 内计算 ----
+loss:
+  type: ScalarPassthroughLoss   # 占位 loss：特征 MSE 由 DualInputLossTrainer 在 model.forward() 内计算
+
+# ---- optimizer：单优化器 AdamW ----
+optimizer:
+  type: AdamW                       # 单优化器（teacher 冻结，只更新 student）
+  # AdamW 超参数
+  args:
+    lr: 1.0e-3                      # 官方 optimizer.lr 初始值；实际由 scheduler.max_lr 驱动（峰值 1e-4）
+    betas: [0.8, 0.99]              # Adam β1/β2（source 值）
+    weight_decay: 0.01              # 权重衰减系数，无量纲
+
+# ---- scheduler：线性 warmup + 余弦退火，按 optimizer step 推进 ----
+scheduler:
+  type: LinearWarmupCosineAnnealing  # 线性 warmup 后余弦退火
+  # warmup/退火参数（单位 optimizer steps）
+  args:
+    warmup_steps: 10000             # 单位 optimizer steps；线性升到 max_lr
+    decay_until_step: 100000        # 单位 optimizer steps；余弦退火到该步结束
+    max_lr: 1.0e-4                  # 峰值学习率
+    min_lr: 1.0e-6                  # 退火下界学习率
+    zero_based_warmup: true  # 官方 LinearWarmupCosineAnnealingLR：step 0 lr=0
+
+# ---- trainer：双输入特征蒸馏训练（DualInputLossTrainer）----
+trainer:
+  type: tasks.se.trainer.dual_input_loss_trainer.DualInputLossTrainer  # 双输入：noisy 送 student、clean 送 teacher
+  exp_path: exp/se/phase2_dewavlm_distill                   # 输出目录；取配置文件名去 .yaml
+
+  # data.train.num_per_epoch 是无放回抽样上限；上限不小于 Dataset 大小时全量遍历。
+  # 实际 optimizer steps 取决于 min(8000, Dataset 大小)、batch、DDP 与 drop_last。
+  epochs: 200                       # source trainer.epochs
+  gradient_clip_value: 3.0          # source clip_grad_norm_value；梯度 L2 范数裁剪阈值
+  lr_schedule_per_step: true        # true=每个 optimizer step 推进 scheduler
+  log_interval: 50                  # 每多少 optimizer steps 打印一次日志
+
+  validation_epoch_interval: 1      # 对齐官方 validation 逐 epoch；每多少个 epoch 跑一次 validation
+  output_clamp: false               # 关闭 [-1,1] clamp，严格对齐官方 PASE 家族训练；仅保留非有限值清零
+  max_val_batches: 0                # 0=不限制 validation batch 数
+  # 在线客观指标配置（enabled=false 时整段不生效）
+  val_metrics:
+    enabled: false                  # 输出是 WavLM 特征 MSE，不是音频，故不计算 PESQ/STOI；有意关闭在线指标
+
+  # 验证音频（官方 train_dewavlm.py:265-285）：student 特征经 Vocoder_L24 还原
+  val_audio:
+    enabled: true                   # true=按官方条件保存验证音频；false=整段零开销
+    save_initial_epochs: 10         # 官方 1-based epoch < start_epoch + 10
+    save_every_n_epochs: 10         # 官方 epoch % 10 == 0
+    initial_epoch_reference: start_epoch  # 枚举 start_epoch/zero；本阶段用 start_epoch
+    max_batches: 10                 # 官方 step <= 10
+    vocoder_ckpt_path: "tasks/se/models/pase_family/pase/open_model_checkpoint/Vocoder_L24.pt"  # 官方 train_dewavlm.py 的 Vocoder_L24
+    vocoder_kind: stupase           # 枚举 stupase/unipase；PASE 发布 artifact 用 StuPASE VocosVocoder 加载
+
+  save_checkpoint_interval: 10      # 每多少 epoch 存一次 checkpoint
+
+# ---- distributed：DDP 后端与 reducer 选项 ----
+distributed:
+  backend: nccl                     # DDP 通信后端；GPU 训练固定 nccl
+  find_unused_parameters: true      # student 的 mask_emb（mask=False 不走掩码）与 encoder.layer_norm 不参与 loss，必须显式开启

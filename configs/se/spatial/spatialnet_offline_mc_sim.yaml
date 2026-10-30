@@ -1,0 +1,137 @@
+# ============================================================
+# SpatialNet SE：WSJ0-mix 风格离线多通道训练 recipe
+# ------------------------------------------------------------
+# Params: 1190898（SpatialNet_SE；与动态空间配方相同）
+# MACs: 6.13G @1s/8kHz（上游口径，不含 STFT/iSTFT）
+# FLOPs: 23.08 G/s（逐帧估计；注意力路径计数与论文接近）
+# RTF: not measured（未在本机实测端到端实时因子；无量纲 realtime factor）
+# Trainer MOS boundary: 仅使用侵入式指标；MOS 指标在 evaluate 阶段计算。
+# 数据先由 tools/prepare_data_tools/generators/se/generate_mc_sim_testset.py
+# 基于 target/interference 四列 SCP 生成 clean/noisy 多通道配对，再填入本配置的
+# train/validation 路径。Dataset 保持 clean mono、noisy [C,T] 和显式 channel_order。
+# 生成器按源动态配置（configs/se/spatial/spatialnet_dynamic.yaml）的
+# data.train.max_duration_seconds 裁剪/补齐样本，mc_sim 样本时长固定（默认 4 s）；
+# 本配置显式声明的 filter_min/max_duration 与 urgent26 模板一致（2–30 s），不剔除样本。
+# 推荐入口：python train.py -C configs/se/spatial/spatialnet_offline_mc_sim.yaml
+# 实现路径：tasks/se/models/discriminative/spatialnet.py（SpatialNet_SE）
+# 数据现状：data.train / data.validation 的 4 条 clean/noisy SCP 路径当前不存在，须先运行
+#   tools/prepare_data_tools/generators/se/generate_mc_sim_testset.py 生成后才可运行本配置。
+# 与同目录 dynamic 配方的关键区别：offline 读预生成配对、无 Layer A–F 仿真与仿真概率字段，
+#   spatial 合同改为 split 级 spatial_enabled / array_profile / reference_channel / channel_order。
+# ============================================================
+# 性能开关：默认 FP32；可选键 meta.use_amp / meta.amp_dtype / meta.cudnn_benchmark / meta.deterministic /
+#   meta.compile_model / meta.gradient_checkpointing、trainer.accumulation_steps，均需在目标硬件与
+#   PyTorch 版本上实测后再启用。
+meta:
+  seed: 42                             # 全局随机种子；offline 无仿真随机性，仅影响 dataloader shuffle 与验证采样
+  use_amp: false                       # 混合精度总开关；FP32 基准，关闭以保持与论文数值口径可比
+  use_ema: false                       # 权重 EMA 总开关；本配方未使用，关闭
+  deterministic: false                 # cudnn 确定性模式；false=允许非确定性 kernel 换吞吐，不保证逐 bit 复现
+# 顶层 STFT 合同：trainer 统一管理 STFT/iSTFT，模型内部不得重复引入。
+stft:
+  n_fft: 256                           # FFT 点数；8 kHz 下 32 ms 窗，频点数 F=n_fft/2+1=129
+  hop_length: 128                      # 帧移，单位 samples；8 kHz 下 16 ms
+  win_length: 256                      # 窗长，单位 samples；与 n_fft 相等（无补零）
+  window: hann                         # 窗函数；Hanning，与上游 NBSS 口径一致
+  center: true                         # 是否补零对齐（torch.stft center 语义）；框架默认 true，显式写出便于复现
+# 模型：注册名 + 构造参数；构造参数逐项透传 __init__，未知键抛 TypeError。
+model:
+  type: SpatialNet_SE                  # 模型注册名；实现 tasks/se/models/discriminative/spatialnet.py
+  args:                                # 构造参数；与顶层 stft 冲突时由 core/models/build.py 拒绝
+    n_fft: 256                         # 必须等于顶层 stft.n_fft；冲突由 core/models/build.py 拒绝
+    n_channel: 6                       # 输入麦克风通道数 C；必须等于 split 级 array_profile 的通道数
+    ref_channel: 0                     # 输出参考通道索引；与 split 级 reference_channel 同口径
+    num_layers: 8                      # 窄带 backbone 层数（论文口径 8）
+    dim_hidden: 96                     # 隐藏维（论文口径 96）
+    dim_ffn: 192                       # FFN 中间维
+    dim_squeeze: 8                     # squeeze-excitation 压缩维
+    num_heads: 4                       # 注意力头数
+    kernel_size: [5, 3]                # 窄带/宽带卷积核尺寸 [窄带, 宽带]
+    conv_groups: [8, 8]                # 对应卷积的分组数
+    full_share: 0                      # full-band 模块跨层共享起点层索引；层 full_share 起所有层共享 layers[full_share].full；0=全部共享（上游/论文口径），num_layers-1=不共享
+# 数据：路由 mode + 采样率 + train/validation 配对 + dataloader。
+data:
+  mode: offline                        # 数据路由字段；offline=直接读磁盘已物化的 clean/noisy 配对，不做在线仿真
+  sample_rate: 8000                    # 采样率，单位 Hz；须与 SCP 资源一致
+  strict_load: true                    # 严格加载：SCP/音频缺失或损坏直接报错，不生成 placeholder
+  dataloader:                           # 训练/验证 loader 共享参数
+    batch_size: 4                      # 训练 batch
+    num_workers: 4                     # dataloader worker 数；0 时 persistent_workers 强制 false
+    prefetch_factor: 4                 # 每 worker 预取 batch 数；num_workers=0 时不传
+    pin_memory: true                   # 锁页内存；GPU 训练建议 true
+  train:                               # 训练 split：clean mono + noisy [C,T] 配对
+    clean_scp: data/se/mc_sim_train/clean.scp   # 训练 clean mono SCP（四列 uid fs length path）；当前不存在，需先运行 generate_mc_sim_testset.py
+    noisy_scp: data/se/mc_sim_train/noisy.scp   # 训练 noisy [C,T] SCP；当前不存在，需先运行 generate_mc_sim_testset.py
+    max_duration_seconds: 4            # 训练片段长度，单位 s；mc_sim 样本固定 4 s
+    repeat_to_max_duration: true       # 短样本补齐到固定画布
+    # 仅 repeat_to_max_duration=true 时生效；mc_sim 样本固定时长，tile 不触发。
+    repeat_tile_silence_gap: false     # tile 间是否插入静音 gap；样本已固定时长，保持 false
+    repeat_tile_silence_gap_range: [0.02, 0.2]  # tile 间 gap 范围，单位 s；gap 关闭时不生效
+    # mc_sim 样本固定 4 s，2–30 s 过滤区间与 urgent26 模板一致、不剔除样本。
+    filter_min_duration: 2.0           # 最短 clean 时长，单位 s；短于此值的条目被过滤
+    filter_max_duration: 30.0          # 最长 clean 时长，单位 s；长于此值的条目被过滤
+    spatial_enabled: true              # offline spatial 合同总开关；true 时 clean 必须 mono、noisy 必须 [C,T]，且 C 须与 array_profile 一致
+    array_profile: chime3_6ch_rect_100x190mm   # canonical array_profile：阵列拓扑；决定 C 与通道顺序，须与 noisy_scp 实际通道一致
+    reference_channel: 0               # canonical reference_channel：参考通道索引；与 model.args.ref_channel 同口径
+    channel_order: [mic_0, mic_1, mic_2, mic_3, mic_4, mic_5]   # canonical channel_order：noisy 通道顺序，显式声明且 collate 不重排
+  validation:                          # 验证 split：同 train 合同，独立声明 spatial 字段
+    clean_scp: data/se/mc_sim_validation/clean.scp   # 验证 clean mono SCP；当前不存在，需先运行 generate_mc_sim_testset.py
+    noisy_scp: data/se/mc_sim_validation/noisy.scp   # 验证 noisy [C,T] SCP；当前不存在，需先运行 generate_mc_sim_testset.py
+    max_duration_seconds: 4            # 验证片段长度，单位 s
+    repeat_to_max_duration: false      # 验证不补齐；collate 按 batch 补零
+    # false = 不齐长；collate 按 batch 补零；gap 配置仅 tile 模式生效。
+    repeat_tile_silence_gap: false     # 验证不做 tile 拼接
+    repeat_tile_silence_gap_range: [0.02, 0.2]  # tile 间 gap 范围，单位 s；gap 关闭时不生效
+    filter_min_duration: 2.0           # 最短 clean 时长，单位 s
+    filter_max_duration: 30.0          # 最长 clean 时长，单位 s
+    spatial_enabled: true              # 同 train；validation 独立声明 spatial 合同
+    array_profile: chime3_6ch_rect_100x190mm   # 与 train 同阵列
+    reference_channel: 0               # 参考通道索引
+    channel_order: [mic_0, mic_1, mic_2, mic_3, mic_4, mic_5]   # noisy 通道顺序，显式声明且不重排
+# 损失：CompositeLoss 组件与权重；构造时按 setdefault 注入顶层 stft 上下文。
+loss:
+  type: CompositeLoss                  # 复合损失容器
+  strict: true                         # 严格模式：未知结构键或非法 args 在构造前报错
+  components:                          # 组件列表；每项 type/weight/args
+    - type: ComplexIdealRatioMaskLoss  # cIRM 损失（NBSS 吸收组件）；消费 SE 参考通道与模型直接谱
+      weight: 1.0                      # 组件权重，无量纲
+      args:                            # 损失超参；显式值优先于框架注入的 stft 上下文
+        reference_channel: 0           # cIRM 参考通道索引；须与 split 级 reference_channel 一致
+# 优化器。
+optimizer:
+  type: Adam                           # 优化器类型；论文口径
+  # 优化器超参。
+  args:
+    lr: 0.001                          # 学习率，无量纲（论文 1e-3）
+# 学习率调度。
+scheduler:
+  type: ExponentialLR                  # 指数衰减调度；每 epoch 乘 gamma
+  # 调度器超参。
+  args:
+    gamma: 0.99                        # 每 epoch 衰减因子，无量纲
+# 训练器：训练/验证生命周期与在线指标。
+trainer:
+  type: SETrainer                      # SE 训练器
+  exp_path: exp/se/spatialnet_offline_mc_sim   # 产物目录（checkpoint / 日志 / TensorBoard）
+  epochs: 100                          # 训练 epoch 数
+  gradient_clip_value: 1.0             # 梯度范数裁剪阈值，无量纲
+  accumulation_steps: 1                # 梯度累积步数；1=不累积
+  lr_schedule_per_step: false          # false=按 epoch 调度；true=每 optimizer step 调度
+  log_interval: 100                    # 每多少 step 打一次训练日志
+  max_val_batches: 0                   # 每轮验证最多 batch 数；0=不限（跑全量验证）
+  validation_epoch_interval: 1         # 每多少 epoch 跑一次 validation
+  validation_steps_interval: 0         # 每多少 step 跑一次 validation；0=关闭 step 级验证
+  save_top_k: 3                        # 按验证指标保留的最优 checkpoint 数
+  val_metrics:                         # 在线侵入式客观指标；MOS 类指标须经 evaluate/ 离线计算
+    enabled: true                      # 在线验证指标总开关
+    metrics: [SI-SDR]                  # 只算 SI-SDR（与动态配方不同，未启用 PESQ/ESTOI）【假设：原因未在仓库记录，推测为控制离线评估耗时，需人工确认】
+    interval: 1                        # 每多少 epoch 计算一次指标
+    max_utterances: 2167               # 每 epoch 全局 quota 上限，单位条（按 world_size 在各 rank 均分）；沿用 urgent26 验证口径【假设：具体来源未在仓库记录】
+    max_utterances_metrics: 2167       # 配置指标全局 quota；省略会回退 max_utterances，显式写出避免共享上限误读
+    metrics_workers: 8                 # 指标计算进程池 worker 数
+  save_checkpoint_interval: 1          # 每多少 epoch 存一次 checkpoint
+# 分布式：DDP 后端与集合通信超时。
+distributed:
+  backend: nccl                        # 分布式后端；GPU 用 nccl
+  find_unused_parameters: false        # 单路径模型无未用参数，false 以避免每步图遍历开销
+  nccl_timeout_minutes: 10             # nccl 集合通信超时，单位 min

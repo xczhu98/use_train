@@ -1,0 +1,11 @@
+# RWSA-MambaUNet 来源说明
+
+本目录中的 `generator.py`、`mambattention_block.py`、`codec_module.py` 与 `lsigmoid.py` 移植自论文官方仓库：
+
+- 论文：*Exploring Resolution-Wise Shared Attention in Hybrid Mamba-U-Nets for Improved Cross-Corpus Speech Enhancement*
+- 官方仓库：<https://github.com/NikolaiKyhne/RWSAMamba-UNet>
+- 固定 commit：`02635ab7e92a0584fde729f8a55f398c2379da82`
+- 上游路径：`models/generator.py`、`models/mambattention_block.py`、`models/codec_module.py`、`models/lsigmoid.py`
+- 许可证：MIT，Copyright (c) 2025 Nikolai Lund Kühne；完整文本见本目录 `LICENSE`
+
+本项目仅做包内相对 import 与可选依赖错误提示适配；网络拓扑、RWSA attention 共享关系及 XS/S/M 模型参数沿用上述固定提交。框架谱输入、STFT 参数校验和时间帧补齐逻辑位于 `tasks/se/models/gan/generators/rwsa_mamba_unet.py`，不属于上游网络主体。训练配置中的 `ExponentialLR(gamma=0.99)` 沿用官方按 epoch 更新语义。

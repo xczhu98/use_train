@@ -1,0 +1,23 @@
+# ======================================================================
+# 配置：UniPASE 48 kHz 推理（DeWavLM-Omni -> Adapter -> Vocoder -> PostNet）。
+# 其余字段由 unipase_infer.yaml 继承（base_config），只覆盖输出采样率与 PostNet。
+# 采样率/帧移：输入任意采样率（内部重采样到 16 kHz），三模块链输出 16 kHz，
+#   再由 PostNet 带宽扩展到 48 kHz；waveform-native，无框架 STFT。
+# 实现路径：tasks/se/models/pase_family/unipase/unipase_model.py（UniPASE）、
+#   tasks/se/models/pase_family/unipase/vocoder.py、.../adapter.py、
+#   .../postnet/（PostNet）。
+# Params: not measured（PostNet 只增加小规模参数；论文含 PostNet 完整链参考值 545.7M，
+#   不能视为本配置实测）。
+# MACs: not measured（未执行 48 kHz 完整 inference profile）。
+# FLOPs: not measured。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS 只能对四件 artifact 严格加载后的
+#   输出音频离线评估，缺任一 artifact 时不得报告 MOS。
+# 48 kHz 必须提供 PostNet：sr_out=48000 时 postnet_ckpt_path 不能为空，
+#   UniPASE 构造期对该组合 fail-closed。
+# ======================================================================
+base_config: unipase_infer.yaml
+
+model:
+  args:
+    sr_out: 48000        # 输出采样率，单位 Hz；>16000 时必须提供 postnet_ckpt_path
+    postnet_ckpt_path: "tasks/se/models/pase_family/unipase/open_model_checkpoint/PostNet.pt"  # 48 kHz 带宽扩展 PostNet artifact

@@ -1,0 +1,526 @@
+# ======================================================================
+# 实验配置：TSE_BSRNN_SPK（spkemb cue，joint training），LibriMix 风格动态仿真
+# 数据管线：dynamic_tse（Target Speaker Extraction，目标说话人提取）
+# ======================================================================
+# 已复核复杂度；输入是标准化合成 benchmark（B=1，16kHz，1 秒 mixture +
+#   3 秒明确 enrollment），不是实际训练 batch，也不代表训练时长分布或吞吐。
+#   Params 27.617800M total / 21.427080M trainable；trainable 值仅在 ECAPA
+#   预训练权重成功加载且 freeze: null 自动冻结 encoder 时成立，无预训练则不冻结。
+#   本地 THOP 0.1.1 MACs 49.316640G，是 backend-specific partial module-hook count；
+#   除 STFT/iSTFT 外，functional matmul、softmax、complex/fused attention 等无 hook
+#   路径也可能漏计，不代表完整端到端运算量。
+#   独立 PyTorch profiler FLOPs 下界 6.563611G（CPU，Python 3.10.19，PyTorch
+#   2.4.0+cu121，with_flops=True）；仅覆盖受支持算子，RNN/复数等路径不完整，
+#   不是由 MACs 倍算。统一复杂度入口不接受 TSE 的简化双张量调用；模型
+#   ``forward(batch: dict)`` 缺少 cue-aware 字段会 fail-fast。训练/推理边界由
+#   tasks.tse.model_io 构造 dict，TSEExtractor 传入 mixture 与 enrollment。partial THOP
+#   MACs 不输出独立 FLOPs；正式配置缺少声明的官方 checkpoint
+#   时可能在 profile 前 fail-fast，命令与复核边界见架构文档 §1。
+# RTF: not measured（本机未做端到端实时率测量）。
+#   Trainer MOS boundary：Trainer 不负责 MOS；未做本地主观 MOS，DNSMOS 代理不等价于主观听测。
+# ======================================================================
+# 变体摘要：本文件是 Dynamic TSE 唯一训练配置，默认激活 spkemb + 非因果（官方 ckpt
+#   `spk_emb_100`）；其余三个官方组合由下方切换模板手工覆盖 model.args.causal、
+#   model.args.features 与 trainer.exp_path，每次只保留一组，且必须配套不同的
+#   trainer.exp_path 与 checkpoint。
+# ----------------------------------------------------------------------
+# 手工 variant 切换模板（只复制一组到下方 model.args.features，并同步修改
+# model.args.causal 与下方 trainer.exp_path；不要保留多个 active 组合）：
+#
+# spkemb + causal（spk_emb_causal_100）：
+#   causal: true
+#   features:
+#     spkemb: {enabled: true, fusion: multiply}
+#   trainer.exp_path: exp/tse/dynamic/tse_bsrnn_spk_causal
+#
+# tfmap + context + noncausal（tfmap_context_100）：
+#   causal: false
+#   features:
+#     spkemb: {enabled: false, fusion: multiply}
+#     tfmap: {enabled: true}
+#     context: {enabled: true}
+#   trainer.exp_path: exp/tse/dynamic/tse_bsrnn_spk_tfmap_context
+#
+# tfmap + context + causal（tfmap_context_causal_100）：
+#   causal: true
+#   features:
+#     spkemb: {enabled: false, fusion: multiply}
+#     tfmap: {enabled: true}
+#     context: {enabled: true}
+#   trainer.exp_path: exp/tse/dynamic/tse_bsrnn_spk_tfmap_context_causal
+# ----------------------------------------------------------------------
+# 分发与资源：本文件是 tests/test_configs.py 精确白名单识别的可分发训练模板（不是
+#   inference_only）；迁移数据集时替换 data.train.speech_scp 与 data.train.spk2enroll_json，
+#   *_scp/*.jsonl 路径相对仓库根，SCP/JSON 内部音频路径相对清单所在目录。
+# 可选开关（默认关闭，entry 按 loss/dataset 自动推导）：model.args.multi_task、
+#   model.args.spks_in_train、loss.components 中的 SpeakerCrossEntropyLoss 分量、trainer.ssa_prob。
+# 推荐统一入口：python train.py -C configs/tse/dynamic/tse_bsrnn_spk.yaml
+# 实现路径：模型 tasks/tse/models/discriminative/tse_bsrnn_spk.py；数据
+#   tasks/tse/data/dynamic_dataset.py + tasks/tse/data/scene_dataset.py；Trainer
+#   tasks/tse/trainer/tse_trainer.py（entry tasks/tse/trainer/entry.py）。
+# ----------------------------------------------------------------------
+# Layer B 概率合同（七路场景 / 人数分布 / timeline 模式权重）：
+#   七路 prob_* 互斥，和必须为 1，由 core/data/simulation/tse_scenarios.py:55
+#   validate_tse_scenarios 以 rel_tol=0 / abs_tol=1e-8 校验，越界或和不为 1 直接
+#   fail-fast（"TSE seven scenario probabilities must sum to 1"）；抽样走同文件
+#   select_tse_scenario 的逐样本单次 rng.random() + 累积 CDF（等价 categorical /
+#   multinomial n=1），不做七次独立伯努利判定。因此配置值是 nominal 名义分布，
+#   realized 是逐样本实际命中分支（写入 trace），二者不保证逐样本一致。
+#   data.train.simulation_cfg.scene.num_interferers 的 key 概率和同样必须为 1
+#   （abs_tol=1e-8，且 key 必须为正整数）；data.train.simulation_cfg.scene.timeline.mode_weights
+#   必须恰好覆盖 head/tail/middle/crossing/containment 且和必须为 1（rel_tol=abs_tol=1e-9）。
+#   本配置未声明、取 runtime 默认 0.0 的概率键（core/data/simulation_configs.py）：
+#   prob_point_source_background、prob_wind_noise_background、prob_array_rotation、
+#   prob_microphone_position_jitter、prob_moving_rir、prob_speed_perturb /
+#   prob_pitch_shift / prob_eq_perturb / prob_add_extra_space、silence_pad_prob，
+#   以及 Layer E/F 全部 prob_*（由 channel.enabled=false / device.enabled=false 整层跳过）。
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# meta：全局训练超参（随机种子、混合精度）
+# ----------------------------------------------------------------------
+meta:
+  # 全局随机种子（int，无量纲）；同时驱动 Python/NumPy/Torch 与仿真命名子流，改值即改变数据与初始化
+  seed: 42
+  # 是否启用 AMP 自动混合精度（bool）；false = 全 fp32，句级 BatchNorm 与复数谱在 fp16 下更易失稳
+  use_amp: false
+  # 是否维护 EMA 影子权重（bool）；false = 只保存原始权重，不做 EMA 平均
+  use_ema: false
+  # 是否强制 cudnn 确定性算法（bool）；false = 允许 autotune 选最快 kernel，以速度优先
+  deterministic: false
+  # AMP 数据类型枚举：float16 | bfloat16（无量纲）；仅 meta.use_amp=true 时生效
+  amp_dtype: float16
+  # cudnn autotune 开关（bool）；meta.deterministic=true 时被强制关闭（core/trainer/base_trainer.py:152）
+  cudnn_benchmark: true
+
+# ----------------------------------------------------------------------
+# stft：分析综合窗；trainer 侧统一计算 mix/enroll 谱（模型内部 STFT 已剥离）。
+# win_length 必须等于 n_fft（BandSplit 子带表据此推导）；512/128 @16 kHz → 帧移 8 ms，与比赛 baseline 内部 STFT 一致。
+# ----------------------------------------------------------------------
+stft:
+  # FFT 点数（samples，正整数偶数）；决定频谱 bin 数 F=n_fft/2+1=257，BandSplit 子带表按此推导
+  n_fft: 512
+  # 帧移（samples）；128 @ 16 kHz = 8 ms，与官方 ckpt 训练时的内部 STFT 条件一致
+  hop_length: 128
+  # 分析窗长（samples）；必须等于 stft.n_fft，否则 TSE_BSRNN_SPK 构造期 fail-fast（tse_bsrnn_spk.py:178）
+  win_length: 512
+  # 窗函数枚举：hann（TSE_BSRNN_SPK 唯一合法值，比赛 ckpt 条件固定）；center 未声明取 runtime 默认 True
+  window: hann
+
+# ----------------------------------------------------------------------
+# model：TSE_BSRNN_SPK（tasks/tse/models/discriminative/tse_bsrnn_spk.py），
+#   BandSplit → SubbandNorm → 6×BSNet → BandMasker 复数掩码，dict 谱进谱出。
+# ----------------------------------------------------------------------
+model:
+  # 模型注册名，必须是 tasks/tse/models/__init__.py lazy map 的键；TSE_BSRNN_SPK = BSRNN 分离主干 + 可插拔 speaker cue
+  type: TSE_BSRNN_SPK
+  # 模型构造参数；键必须是 TSE_BSRNN_SPK.__init__ 的显式形参，未知键抛 TypeError，STFT 上下文冲突由 core/models/build.py 拒绝
+  args:
+    sr: 16000                # 模型采样率（Hz）；须与 data.sample_rate 一致，fbank 与 STFT 时间轴据此对齐
+    feature_dim: 128         # BandSplit 子带特征维（无量纲，正整数）；BSNet 内部通道宽度
+    num_repeat: 6            # BSNet 重复次数（无量纲，正整数）；官方 spk_emb_100 同值
+    causal: false            # false = 非因果（本文件默认，官方 spk_emb_100）；true = 时间 LSTM 单向，可流式
+    joint_training: true     # true = 模型内含 vendored ECAPA-TDNN，从 enroll_wav 提 embedding；false = 用预提取 spk_embedding
+    # features：cue 开关表（5 种可插拔 cue：listen/usef/tfmap/context/spkemb）；未列出的 cue 取构造默认 enabled=false
+    features:
+      # 句级 speaker embedding cue（ECAPA-TDNN 输出）；本文件默认激活
+      spkemb:
+        # 是否启用该 cue（bool）；true = 用句级 embedding 条件化分离主干
+        enabled: true
+        # 条件融合方式枚举：concat | additive | multiply | FiLM（无量纲）；multiply = 逐通道乘性调制
+        fusion: multiply     # concat | additive | multiply | FiLM
+    # speaker cue 的 fbank 与 ECAPA 编码器配置；仅 joint_training=true 或 spkemb 启用时构造
+    speaker_model:
+      # 句级 speaker 编码器；权重与 fbank 前端
+      speaker_encoder:
+        # ECAPA 结构名（speaker 模型注册名）；ECAPA_TDNN_GLOB_c512 = 512 通道全局 ECAPA
+        model: ECAPA_TDNN_GLOB_c512
+        # 官方完整 TSE checkpoint；权重文件不进 git，需先按 tasks/tse/speaker_embedding_models/README.md 下载放置
+        pretrained: "tasks/tse/pretrained_models/spk_emb_100/avg_model.pt"
+        # 权重前缀；必须完整命中全部 speaker keys，缺失即 fail-closed，separator 权重不会进入 SpeakerEncoder
+        pretrained_prefix: "spk_ft.encoder.spk_model."
+        # 是否冻结 ECAPA（bool | null）；null = 有预训练则自动冻结（本文件推荐），false = 参与微调并触发 batch>=2 约束
+        freeze:              # null = 有预训练则冻结（默认推荐）
+
+# ----------------------------------------------------------------------
+# data：mode=dynamic_tse 时构建 TSEDynamicMixingDataset；simulation_cfg 先按 TSE 合同提升
+#   enrollment / multi-target Dataset 键，其余仿真键经 SimulationConfigs strict 解析（未知键报错）。
+# ----------------------------------------------------------------------
+data:
+  # 数据模式路由键（必填）；dynamic_tse → TSEDynamicMixingDataset，缺失或非法值由 normalize_data_mode() 立即 fail-fast
+  mode: dynamic_tse
+  # 仿真与 STFT 的采样率（Hz）；须与 model.args.sr 一致，fbank/STFT 时间轴据此对齐
+  sample_rate: 16000
+  # 训练 split 的资源清单与固定画布生命周期键
+  train:
+    # Libri2Mix source pool：tools/prepare_data_tools/generators/tse 生成的 strict speech JSONL
+    speech_scp: "data/tse/spk/wesep/datasets/Libri2Mix/dynamic_tse/train-100/speech.jsonl"
+    # 注册音索引：dataset_id → speaker_id → [path]，所有 path 必须为已 trim 的非空字符串
+    spk2enroll_json: "data/tse/spk/wesep/datasets/Libri2Mix/dynamic_tse/train-100/spk2enroll.json"
+    # 加性噪声源清单；music_ratio > 0 时必须显式提供非空 music_scp
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"
+    # 音乐 SCP（四列，同 noise_scp）；留空仅用于记录：simulation_cfg.acoustic.background.music_ratio=0.0 时不需要
+    music_scp:           # 未配置：音乐 SCP（四列，同 noise_scp）；music_ratio=0 时不需要
+    # 是否按 data.train.filter_min_duration / filter_max_duration 过滤干净语音时长（bool）
+    filter_by_duration: true
+    # manifest 模式只读 fs16000/static 纯 gpuRIR PKL 清单（本池 train 95,000 / validation 5,000）；
+    # 每个 PKL 自带 room_dim/mic_loc/source_loc/dist/rt60/field/uid 元数据，在线模式不读此清单。
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/tse/train_rirs.scp"
+    # 风噪源清单（Wind role 与 noise_scp 合并扩池）
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"
+    filter_min_duration: 2.0   # 过滤短于 2 s 的干净语音
+    filter_max_duration: 30.0  # 过滤长于 30 s 的干净语音
+
+    # 固定画布/重复填满属于本 split 的生命周期键，不是 simulation_cfg 参数
+    max_duration_seconds: 10.0                  # 画布上限时长（s）
+    repeat_to_max_duration: true                # 不足画布的样本按需重复填满
+    repeat_tile_silence_gap: true               # 重复拼接处插入静音间隔
+    repeat_tile_silence_gap_range: [0.02, 0.8]  # 静音间隔范围（s）
+    # 执行顺序：B 场景/存在性/人数 → 各源 A（输出 SR + 固定画布）→ 相对窗口 → 各源 C-0/C-0b
+    #   → post-RIR SIR → 背景 → D/E/F → 独立 enrollment；enrollment 不共享 mixture 时间轴。
+    simulation_cfg:
+      # ------------------------------------------------------------------
+      # Layer A：目标/干扰语音预处理（splice + 概率扰动；音量控制在 RIR 后执行）；
+      #   下方 simulation_cfg.tse 是独立 TSE enrollment 分支，不属于 mixture Layer A–F。
+      # ------------------------------------------------------------------
+      speech:
+        # Layer A-1 splice：把短语音重复拼接成目标长度
+        splice:
+          # 是否启用 splice 拼接（bool）
+          enabled: true
+          seconds_range: [5.0, 10.0]  # 目标 splice 长度范围（s），core sanity check 按上限校验
+          gap_range: [0.02, 1.0]      # splice 段间静音间隔范围（s）
+          max_repeat_times: 4         # 短语音最多重复拼接次数（0 = 不限）
+          equal_volume: true          # 拼接段之间做等音量对齐
+          equal_volume_range: [-6, 6] # 等音量对齐的随机偏移范围（dB）
+        # 是否从源音频随机位置起裁（bool）；false = 从固定起点起裁，保证 TSE 数据可复现
+        random_start: false
+
+        # Layer A-2 语速扰动；prob=0.0 时零 rng 消耗，恒等通过
+        speed:
+          # 语速扰动命中概率（无量纲 [0,1]）；0.0 = 关闭（本文件显式关闭，避免改变注册音身份线索）
+          prob: 0.0
+          # 语速缩放系数范围（无量纲，>0）；仅 speed.prob>0 时生效
+          rate_range: [0.9, 1.1]
+        # Layer A-2 音高扰动；prob=0.0 时零 rng 消耗
+        pitch:
+          # 音高扰动命中概率（无量纲 [0,1]）；0.0 = 关闭（保护 speaker 身份特征）
+          prob: 0.0
+          # 半音偏移范围（semitone）；仅 pitch.prob>0 时生效
+          semitone_range: [-1.5, 1.5]
+        # Layer A-2 均衡器扰动；prob=0.0 时零 rng 消耗
+        eq:
+          # EQ 扰动命中概率（无量纲 [0,1]）；0.0 = 关闭
+          prob: 0.0
+          # 增益偏移范围（dB）；仅 eq.prob>0 时生效
+          db_range: [-5, 5]
+        # 额外留白概率（无量纲 [0,1]）；0.0 = 关闭，固定画布由 data.train.max_duration_seconds 控制
+        extra_space_prob: 0.0
+        # Layer A-3 静音填充；本文件关闭（固定画布模式已由 repeat_tile_silence_gap 处理间隔）
+        silence:
+          # 静音填充命中概率（无量纲 [0,1]）；0.0 = 关闭固定静音画布；启用时再显式配置布局参数
+          prob: 0.0               # 关闭固定静音画布；启用时再显式配置布局参数
+
+        # Layer A-4 高通滤波（70 Hz filtfilt，随 sample_rate 设计）
+        high_pass:
+          # 是否启用 70 Hz 高通（bool）；关闭会保留低频噪声，与官方 ckpt 前端条件不符
+          enabled: true
+
+      # ------------------------------------------------------------------
+      # Layer B：七路互斥场景（逐样本 categorical 单次抽样，概率和须为 1）；T 指注册身份，不是最大声的说话人。
+      #   抽样方式、校验位置与容差、nominal/realized 语义见文件头「Layer B 概率合同」。
+      # ------------------------------------------------------------------
+      scene:
+        prob_target_only: 0.05              # T：主讲人；full-RIR input 与 early/dry target 可不同
+        prob_interference_only: 0.05        # I：其他人；target=0
+        prob_noise_only: 0.05               # N：背景；target=0，不请求语音 RIR
+        prob_interference_noise_only: 0.05  # I+N；target=0
+        prob_target_noise: 0.20             # T+N
+        prob_target_interference: 0.20      # T+I
+        prob_target_interference_noise: 0.40 # T+I+N
+        # 仅含 I 的场景参与抽样的人数分布（key=人数正整数，value=概率无量纲）；rng.choice 抽样，keys 概率和须为 1（abs_tol=1e-8）
+        num_interferers: {1: 0.95, 2: 0.05}  # 仅含 I 时抽样；不同身份，不足则报错
+        # Layer B timeline：为第一路之外的其他源规划相对时间窗
+        timeline:
+          # 额外跨源窗口命中概率（无量纲 [0,1]，canonical 键 prob_timeline）；0.0 = 关闭；Layer A gap/留白仍有效
+          prob: 0.0                         # 额外跨源窗口；Layer A gap/留白仍有效
+          overlap_ratio_range: [0.1, 0.5]   # 窗口占画布比例，非实测 VAD 重叠率
+          # 五种多源窗口模式的概率，必须完整覆盖且总和为 1；默认保持均匀分布。
+          mode_weights: {head: 0.2, tail: 0.2, middle: 0.2, crossing: 0.2, containment: 0.2}
+      # Layer C：声学混合（RIR + 加性噪声 + 音乐噪声源扩展）
+      acoustic:
+        # Layer C-0：RIR backend / room geometry / static-moving policy；稳定服务默认值
+        # （source budget/device/omni/timeout/cache）由 core 提供，下列 gpurir_* 为在线模式示例。
+        # gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # 房间尺寸 [长, 宽, 高] 各自范围（m）
+        # gpurir_rt60_range_sec: [0.1, 1.0]                                # RT60 范围（s）
+        # gpurir_source_distance_range_m: [0.2, 3.0]                       # 声源距离范围（m）
+        # gpurir_source_height_range_m: [1.1, 1.8]                         # 声源高度范围（m）
+        # gpurir_mic_height_range_m: [1.0, 1.8]                            # 麦克风高度范围（m）
+        # gpurir_enrollment_distance_range_m: [0.05, 0.2]                  # 仅 TSE enrollment 近场（m）
+        rir:
+          backend: offline     # offline | online；在线时全组同房间/麦克风，不隐式回退
+          # 在线参数由 core.data.simulation.rir_config 校验，采样率使用 data.sample_rate。
+          reverberation_prob: 0.5     # 施加混响的概率（在线模式生效）
+          moving_prob: 0.0  # 框架支持 online moving；本 mono 模型/模板保持关闭，moving RIR 需 native spatial TSE model
+          early_window_sec: 0.05  # early target 窗口长度（s）
+          target_type: early      # 目标口径：early | dry | rts；本配置取 early
+          normalize: true  # RIR shared full-peak；随后以 early target 标定并共享 volume gain
+          # 是否跨样本复用同一 RIR（bool）；false = 每条样本独立取 RIR，避免固定房间偏置
+          reuse: false
+        # 各源 post-RIR 电平初标：early reference 推导 gain，full/early/target 同比缩放；
+        # 后续 SIR 和 D 还会调整电平，因此该范围不是最终输出 dBFS 保证。
+        target:
+          # Layer C-0b 目标源音量标定；键名不表示在 RIR 前处理 source waveform
+          volume:
+            # 是否启用 early-target 电平标定（bool）；false 时保持 RIR 原始增益
+            enabled: true
+            db_range: [-40, -12]   # 电平初标范围（dB）
+            # 是否按 RMS 而非峰值测量电平（bool）；true = RMS 口径，避免单点峰值主导
+            use_rms: true
+            # 抽样分布枚举：uniform | beta（无量纲）；beta 在 db_range 内按 Beta 分布集中
+            distribution: beta
+            # Beta 分布 α 参数（无量纲，>0）；1.5/1.5 为对称分布，中心落在 db_range 中点
+            beta_a: 1.5
+            # Beta 分布 β 参数（无量纲，>0）；与 beta_a 对称
+            beta_b: 1.5
+
+        # Layer C-1/C-2/C-3 背景：加性噪声 SNR、音乐源扩池、风噪 side-chain。
+        #   未声明而取 runtime 默认 0.0 的键（core/data/simulation_configs.py:210-214）：
+        #   prob_point_source_background、prob_wind_noise_background（两者还要求 spatial_enabled=True）。
+        background:
+          snr_reference: all_speech       # 有语音时背景参考；primary | all_speech
+          snr_low: -5                     # 背景 SNR 采样下限（dB）
+          snr_high: 20                    # 背景 SNR 采样上限（dB）
+          # 是否跨样本复用同一噪声段（bool）；false = 每条样本重新抽噪声，减少过拟合
+          reuse_noise: false
+          noise_mix_prob: 0.0             # Layer C-1b：再混第二段加性噪声的概率（默认关闭）
+          noise_mix_ratio_range: [0.1, 1.0]  # 双段噪声混合比例范围（无量纲）
+          # Layer C-3：音乐源选择概率（默认关闭）；music_scp 在 data.train / data.validation 配置，
+          # 内嵌 Music role 与显式 music_scp 合并扩池，双源禁止 Music+Music。
+          music_ratio: 0.0
+          # 本配置显式设为 0.05；框架默认 0.0。命中 side-chain 后 Wind 替代普通 additive noise，或与其叠加。
+          prob_wind_noise_sidechain: 0.05
+          # 风噪 side-chain 合成参数组；仅 prob_wind_noise_sidechain 命中时消费
+          wind_noise_config:
+            # 触发阈值范围（无量纲，[0,1]）；风噪检测门限，越大越难触发
+            threshold: [0.1, 0.3]
+            # compressor 压缩比范围（无量纲，>=1）；1 = 不压缩
+            ratio: [1, 20]
+            # attack 时间范围（ms）；越大越慢起控
+            attack: [5, 100]
+            # release 时间范围（ms）；越大越慢释放
+            release: [5, 100]
+            # side-chain 增益范围（无量纲）；1.0 = 不额外缩放
+            sc_gain: [0.8, 1.2]
+            # 削波阈值范围（无量纲，[0,1] 峰值）；命中后按此上限截幅
+            clipping_threshold: [0.85, 1.0]
+            # 削波触发概率（无量纲 [0,1]）；0.75 = 多数样本保留削波色彩
+            clipping_chance: 0.75
+            # 风噪与语音的 SNR 范围（dB）；独立于 background.snr_low/snr_high
+            wind_noise_snr_range: [-10.0, 15.0]
+          # 有色噪声选择概率（无量纲 [0,1]）；0.0 = 关闭，仅使用 noise_scp 原始噪声
+          prob_colored_noise: 0.0
+
+
+      # Layer D：post-mix 幅度条件（固定执行 D-normalize → D-guard）；D-guard 按 mixture/
+      #   primary_target/noise/全部 alternate targets 的共同峰值触发并同比缩放，enrollment 不进入。
+      post_mix:
+        # D-normalize 子步骤；D-guard 无配置键，固定执行
+        normalization:
+          mode: "off"             # off | joint（joint 用于多目标联合标定）；本配置显式关闭
+          scale_range: [0.5, 0.95]  # D-normalize 缩放范围（无量纲）；mode=off 时不生效
+      # ------------------------------------------------------------------
+      # Layer E/F：信道退化 / 设备失真（TSE baseline 从简，默认关闭）
+      #   本配置为 mono，未声明 prob_array_rotation / prob_microphone_position_jitter
+      #   （runtime 默认 0.0，且需 spatial_enabled=True 才生效）。
+      # ------------------------------------------------------------------
+      channel:
+        # 是否启用 Layer E 信道退化（bool）；false = 整层跳过，且其 prob_* 不消耗 rng
+        enabled: false
+      # Layer F 设备失真（CPU-only observation/device 退化）；本配置关闭
+      device:
+        # 是否启用 Layer F 设备失真（bool）；false = 整层跳过（Layer F 为 CPU-only observation/device 退化）
+        enabled: false
+
+      # TSE enrollment：独立时钟和近端录音；本节 enrollment_* 控制键提升为 Dataset kwargs
+      tse:
+        targets_per_mixture: 1              # 监督目标数上限，非场景人数
+        sir_range: [-15, 10]              # 所有含 I 场景的 SIR 范围（dB）；目标缺席时用 latent target full-RIR 作 numerator
+        enrollment_duration: 8    # 注册音定长（s）；短则 tile 拼接，长则随机裁剪
+        enrollment_db: -30        # 注册音 RMS 归一目标（dBFS，含峰值防截幅）
+        enroll_policy: random     # 注册音抽样策略；train=random（每样本随机抽），validation=fixed
+        # 注册音只执行一次完整增强；资源与 mixture 独立
+        enrollment_augment:
+          # 是否启用注册音增强（bool）；false 时下列 prob_* 全部不消耗 rng
+          enabled: true
+          # 注册音语速扰动概率（无量纲 [0,1]）；0.3 = 约三成注册音被变速
+          prob_speed: 0.3
+          # 注册音语速缩放范围（无量纲，>0）；仅 prob_speed 命中时生效
+          speed_rate_range: [0.9, 1.1]
+          # 注册音音高扰动概率（无量纲 [0,1]）
+          prob_pitch: 0.3
+          # 注册音半音偏移范围（semitone）；仅 prob_pitch 命中时生效
+          semitone_range: [-1.5, 1.5]
+          # 注册音 EQ 扰动概率（无量纲 [0,1]）
+          prob_eq: 0.3
+          # 注册音 EQ 增益范围（dB）；仅 prob_eq 命中时生效
+          eq_db_range: [-5, 5]
+          # 注册音加混响概率（无量纲 [0,1]）；与 mixture 混响相互独立
+          prob_reverb: 0.6
+          # 注册音采用近端静态 RIR，独立于 mixture 的全场景 RIR 池；房间/RT60 等几何与 mixture 共用 gpurir_* 配置
+          rir_static_only: true
+          # 近场契约：只用 16 kHz static/near 池（该池 dist 实测约 0.2-0.8 m），不要用 TSE mixture 的 near+far 池；在线模式不接受本键
+          rir_scp: data/shared/rirs/gpurir_static/gpurir/fs16000/static/near/train_rirs.scp
+          # 注册音加性噪声概率（无量纲 [0,1]）；仅 prob_reverb 之外的独立加噪分支
+          prob_noise: 0.5
+          # 注册音噪声源清单（与 mixture 共用同一池，可独立替换）
+          noise_scp: data/shared/noise/filter/v2/train_noise_sources.scp
+          snr_range: [5, 30]           # 加性噪声 SNR 范围（dB）
+          # 注册音后置 EQ 概率（无量纲 [0,1]）；在噪声之后执行
+          prob_eq_post: 0.3
+          # 注册音低通概率（无量纲 [0,1]）；模拟远场/带宽受限注册音
+          prob_lowpass: 0.5
+          lowpass_cutoff_range: [1000, 8000]  # 低通截止频率范围（Hz）
+
+  # 动态验证 split：dynamic_tse 无离线 val 路径，必须显式声明动态验证（缺段即 fail-fast）
+  validation:
+    mode: dynamic_tse               # 此 dynamic_tse 训练入口要求动态验证；offline_tse 本身另有独立入口
+    inherit_simulation: true        # 继承共享仿真设置；speaker pool 使用 validation 本地资源
+    # dev 语音池 strict JSONL（含 dataset_id/speaker_id metadata，identity 直接由 JSONL 构建）
+    speech_scp: "data/tse/spk/wesep/datasets/Libri2Mix/dynamic_tse/dev/speech.jsonl"
+    # 注册音索引（dev split）：结构同 data.train.spk2enroll_json
+    spk2enroll_json: "data/tse/spk/wesep/datasets/Libri2Mix/dynamic_tse/dev/spk2enroll.json"
+    # fs16000/static 纯 gpuRIR 池（val 5,000 条），与 train 同 manifest 语义
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/tse/val_rirs.scp"
+    # 加性噪声源清单（val）
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"
+    # 风噪源清单（val；Wind role 与 noise_scp 合并扩池）
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp"
+    # 按 filter_min_duration / filter_max_duration 过滤干净语音时长
+    filter_by_duration: true
+    filter_min_duration: 2.0     # 过滤短于 2 s 的干净语音
+    filter_max_duration: 30.0    # 过滤长于 30 s 的干净语音
+    # validation 本地仿真覆盖：只列出与 train 不同的键，其余继承 data.train.simulation_cfg
+    simulation_cfg:
+      # 验证侧声学覆盖：固定离线池 + 保留 early-target 标定
+      acoustic:
+        # 验证 RIR 覆盖
+        rir:
+          backend: offline  # 默认验证使用离线固定池；可显式切换在线
+          normalize: true           # 继承 post-RIR early-target volume 合同
+      # 验证侧 TSE enrollment 覆盖
+      tse:
+        enroll_policy: fixed        # 固定候选及裁剪；场景随机子流由 epoch/index 决定
+        # 基础 validation 不继承 train 的随机注册音扰动，只替换资源清单
+        enrollment_augment:
+          enabled: false            # 基础 validation 不继承 train 的随机注册音扰动
+          rir_scp: data/shared/rirs/gpurir_static/gpurir/fs16000/static/near/val_rirs.scp  # validation 近场静态 RIR 池
+          noise_scp: data/shared/noise/filter/v2/val_noise_sources.scp                      # validation 加性噪声源清单
+
+  # DataLoader 配置；DDP 下每个 rank 各建一份 train/val loader
+  dataloader:
+    # 未冻结 ECAPA（pretrained: null 或 freeze: false）时 train 模式要求 per-rank batch_size >= 2
+    batch_size: 8
+    # 训练 loader worker 数（进程数）；0 会强制 persistent_workers=false 且不传 prefetch_factor
+    num_workers: 4
+    # 每个 worker 预取 batch 数（无量纲，>=1）；num_workers=0 时不传该键
+    prefetch_factor: 2
+    # 是否把 batch pin 到页锁定内存（bool）；GPU 训练开启可减少 H2D 拷贝等待
+    pin_memory: true
+    # worker 取 batch 超时（s）；超时即报错而非静默挂起
+    timeout: 120
+    # 是否跨 epoch 保留 worker 进程（bool）；true 避免每 epoch 重启进程与音频 cache 重建
+    persistent_workers: true
+
+# ----------------------------------------------------------------------
+# loss：SI-SNR 监督非零目标；AbsentTargetLoss 监督 noise-only / 目标缺席样本
+# ----------------------------------------------------------------------
+loss:
+  # 复合损失注册名；CompositeLoss 顶层只接受 type / components / strict
+  type: CompositeLoss
+  # 是否把指标缺失当致命错误（bool）；false = 容错继续，仅告警
+  strict: false
+  # 损失分量列表；每项只接受 type / weight / args / name / enable_ss_undesired_energy
+  components:
+  # 尺度不变信噪比，监督含目标场景的主损失
+  - type: SISNRLoss
+    # 分量权重（无量纲，>0）；1.0 = 主监督项
+    weight: 1.0
+    # 日志与 history 中显示的分量名（字符串，需唯一）
+    name: SI-SNR
+  # 目标缺席样本的均方能量惩罚；场景含 target=0 分支时必须为非零（tasks/tse/trainer/entry.py:352-360 fail-fast）
+  - type: AbsentTargetLoss    # 仅 target 近零时惩罚输出均方能量；padding 不参与
+    # 分量权重（无量纲，>0）；与 SI-SNR 等权
+    weight: 1.0
+    # 日志与 history 中显示的分量名
+    name: Absent-Target
+
+# --- 优化器 ---
+optimizer:
+  # 优化器注册名；Adam 顶层只接受 type / args
+  type: Adam
+  # 优化器超参；lr 为无量纲学习率
+  args:
+    # 学习率（无量纲）；1e-3 与官方 spk_emb_100 baseline 对齐
+    lr: 0.001
+
+# --- 调度器（LinearWarmupCosineAnnealing）---
+# scheduler.args.decay_until_step 缺省（不写或 'auto'）自动推导为 epochs * steps_per_epoch
+scheduler:
+  # 调度器注册名；线性 warmup + 余弦退火
+  type: LinearWarmupCosineAnnealing
+  # 调度器超参；学习率单位无量纲
+  args:
+    # 峰值学习率（无量纲）；应与 optimizer.args.lr 一致
+    max_lr: 1.0e-3
+    # 退火下限学习率（无量纲）；低于该值不再下降
+    min_lr: 1.0e-6
+
+# --- 训练器 ---
+trainer:
+  # Trainer 注册名；TSETrainer 由 tasks/tse/trainer/entry.py 路由
+  type: TSETrainer
+  exp_path: exp/tse/dynamic/tse_bsrnn_spk   # 实验输出目录；手工切换 variant 时必须同步修改
+
+  # 训练规模与日志
+  epochs: 100                    # 训练总 epoch 数
+  # 梯度裁剪阈值（无量纲 L2 范数）；超过即按比例缩放
+  gradient_clip_value: 5.0
+  # 梯度累积步数（无量纲，>=1）；1 = 每个 batch 做一次 optimizer step
+  accumulation_steps: 1
+  # 调度器推进粒度（bool）；true = 按 optimizer step 推进，与 LinearWarmupCosineAnnealing 配套
+  lr_schedule_per_step: true
+  # 训练日志打印间隔（optimizer step 数）
+  log_interval: 100
+
+  # 验证 (全局)
+  max_val_batches: 0             # 单次 val 最大 forward 的 batch 数 (每 rank); 0=不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 末验证; 0=关闭
+  validation_steps_interval: 0   # 0=关闭步级验证
+  save_top_k: 3                  # 保留的最优 checkpoint 数量（0 = 不保留）
+
+  # 客观指标：metrics 列表项基于 (target, target_estimate) 计算（可选 SI-SDR / PESQ / ESTOI）
+  val_metrics:
+    # 是否启用在线客观指标（bool）；关闭则只记录 loss，不做指标评估
+    enabled: true
+    # 指标名列表（枚举）；每项基于 (target, target_estimate) 计算，按固定顺序跨 rank 聚合
+    metrics: [SI-SDR, ESTOI]
+    # 指标计算间隔（epoch 数）；1 = 每个 validation epoch 都算
+    interval: 1
+    # 每 epoch 全局 utterance quota（条，非 per-rank）；各 rank 自动按 world_size 精确均分
+    max_utterances: 160
+    # 侵入式指标进程池 worker 数（进程数）；0/null = 自动
+    metrics_workers: 8
+
+  # 存盘与曲线
+  # 中间 checkpoint 保存间隔（epoch 数）；与 save_top_k 的最优保留相互独立
+  save_checkpoint_interval: 1
+
+# --- 分布式（DDP）---
+distributed:
+  # 通信后端枚举：nccl | gloo；nccl 要求 CUDA 可用，否则 bootstrap 期 fail-fast
+  backend: nccl
+  # TSETrainer 按 cue 配置自动推导（tasks/tse/trainer/entry.py::_resolve_tse_distributed_cfg），显式配置优先
+  find_unused_parameters: false
+  # NCCL 集合通信超时（分钟）；超时即中止训练
+  nccl_timeout_minutes: 30       # NCCL 超时（分钟）

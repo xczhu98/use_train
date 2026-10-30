@@ -1,0 +1,28 @@
+# ======================================================================
+# Model: GAP-URGENet Phase 2 官方续训段（PostNet GAN resume fine-tune）。
+# 继承 gap_urgenet_phase2_postnet_gan.yaml（本机 120 epoch 从零口径），仅覆盖 trainer 段：
+#   epochs=60、逐 epoch validation、逐 epoch 保存 checkpoint、独立 exp_path。
+# 官方 cfg_train_postnet.yaml 的 trainer.epochs=10 是 resume 续训段的相对值（50 + 10）；
+#   本框架 trainer.epochs 是绝对结束 epoch，因此这里写 60，保持“续训到第 60 epoch”
+#   的等价语义。启动方式：
+#   python train.py -C configs/se/urgent2026/pase/gap_urgenet/
+#     gap_urgenet_phase2_postnet_finetune.yaml --resume-from <前序 50 epoch checkpoint>
+#   scheduler 状态由 resume 恢复，decay_until_step 仍为 60000（本文件不重写 scheduler）。
+# Params: PostNet 4,777,751（4.78 M，沿用 base 实测值）；完整链 not measured。
+# MACs: not measured（未对 PostNet 或完整链做独立 profile）。
+# FLOPs: not measured（同上）。
+# Trainer MOS boundary: PASEGANTrainer 输出 48 kHz 波形但 val_metrics.enabled=false；
+#   MOS 只能对严格加载后的 artifact 离线评估，本配置不推断 MOS。
+# 验证音频（trainer.val_audio）深合并继承 base_config：官方 GAP 条件为 1-based
+#   `epoch<10 or epoch%10==0`；续训从 epoch=51 开始，首段窗口不再命中，
+#   只在 60/70/... 保存。
+# ======================================================================
+
+base_config: gap_urgenet_phase2_postnet_gan.yaml  # 继承 Phase 2 从零训练配置，仅覆盖 trainer 段
+
+# ---- trainer：官方续训段覆盖（其余字段沿用 base_config）----
+trainer:
+  epochs: 60                        # 官方 50 + 10 续训段的绝对结束 epoch；需 --resume-from 前序 50 epoch checkpoint
+  validation_epoch_interval: 1      # 每个 epoch 跑一次 validation（官方 validation 口径）
+  save_checkpoint_interval: 1       # 每个 epoch 保存一次 checkpoint（官方 save_checkpoint_interval）
+  exp_path: exp/se/gap_urgenet_phase2_postnet_finetune  # 续训产物目录；取配置文件名去 .yaml

@@ -1,0 +1,247 @@
+# ======================================================================
+# Model: GAP-URGENet Phase 1（可训练的 16 kHz 单通道 TFGridNetV3 Predictor）。
+# Params: Predictor 22,087,196（22.09 M，保留现有实测值）；完整 GAP inference
+#   chain 为 not measured（五件官方 artifact 缺失）；论文 567.76 M 仅作 reference。
+# MACs: not measured（未执行 Predictor 独立 profile，完整链 artifact 亦不齐备）。
+# THOP: not measured（未运行）。
+# 1 秒复杂度输入/范围: B=1、16 kHz、[1, 16000] float waveform，标称幅度 [-1, 1]。
+# FLOPs: not measured；论文完整链 472.84 GMAC/s 仅作 reference，不能归因于
+#   Predictor 或本训练配置。
+# Trainer MOS boundary: SETrainer 输出波形，但 val_metrics.enabled=false；不在线计算
+#   MOS。DNSMOS/UTMOS 需对 Predictor artifact 离线评估，且不代表完整 GAP 链。
+# Frozen: N/A；Trainable: Predictor；Discriminator: N/A。
+# Artifact: Predictor.pt；完整 inference chain 为 DeWavLM-Omni -> Adapter -> Vocoder
+#   与 Predictor 双支路 -> 48 kHz PostNet；单独 Predictor 不是完整 GAP 系统。
+# GAP-URGENet Phase 1：训练 16 kHz 单通道 TFGridNetV3 Predictor。
+# 使用 SETrainer + GAPHybridLoss（压缩复数谱 RI×30 + 压缩幅度×70 + 符号 SDR×1）；
+# 模型为 waveform-native，内部 STFT 按时长比例参数化，16 kHz 时 n_fft=512、hop=256。
+#
+# Source: gap-urgenet/configs/cfg_train_predictor.yaml
+#   （predictor_config 见 cfg:1-15；scheduler 见 cfg:23-27；trainer 见 cfg:68-74）
+# Output: Predictor.pt（22.09 M；state_dict 与官方格式逐字兼容，可直接导出）。
+#
+# Train:
+#   python train.py -C configs/se/urgent2026/pase/gap_urgenet/gap_urgenet_phase1_predictor.yaml
+# ======================================================================
+
+# ---- meta：随机性 / 精度 / 确定性开关（core/trainer/entry.py、core/trainer/base_trainer.py）----
+meta:
+  seed: 0               # 官方 cfg_train_predictor.yaml seed；各 rank 模型初始化同种子，数据打乱按 rank 偏移
+  allow_no_stft: true   # waveform-native 模型（内部自带 STFT），免框架 STFT
+  use_amp: false        # 官方训练脚本为 fp32（无 autocast）；amp_dtype 仅保留作参考
+  amp_dtype: bfloat16   # 家族统一 bfloat16：bf16 与 fp32 同指数范围、无需 GradScaler；本阶段不含 ISTFTHead
+  deterministic: false  # false=保留 cuDNN benchmark 自动选算法（默认）；true 关闭 benchmark 并置 cudnn.deterministic
+
+# ---- model：单通道 16 kHz TFGridNetV3 Predictor（无判别器）----
+model:
+  type: GAPURGENetPredictor      # 注册名 → tasks/se/models/pase_family/gap_urgenet/gan_wrappers.py
+  args:                           # 对齐官方 predictor_config（cfg_train_predictor.yaml:1-15）
+    fft_len: 0.032                # 秒；内部 STFT 窗长，16 kHz 时为 512 samples
+    hop_len: 0.016                # 秒；内部 STFT 帧移，16 kHz 时为 256 samples
+    win_len: 0.032                # 秒；内部 STFT 窗长，16 kHz 时为 512 samples
+    n_srcs: 1                     # 输出源数；单通道增强固定 1
+    n_imics: 1                    # 输入麦克风数；该实现仅支持单通道，其他值 forward 期报错
+    n_layers: 10                  # GridNetV3Block 层数
+    lstm_hidden_units: 200        # 每层 BLSTM 隐层单元数
+    attn_n_head: 8                # 每层注意力头数
+    attn_qk_output_channel: 4     # 注意力 Q/K 每头输出通道数
+    emb_dim: 96                   # 卷积/块隐层维度
+    emb_ks: 4                     # 块内卷积核大小，单位 samples
+    emb_hs: 1                     # 块内卷积步长，单位 samples
+    activation: prelu             # 块内激活函数；本配方用 prelu
+    eps: 1.0e-5                   # 数值稳定项（GroupNorm/归一化），无量纲
+
+# ---- data：SE dynamic 数据管线（train/validation 资源 + Layer A–F 仿真）----
+data:
+  mode: dynamic                  # 枚举：dynamic（SE 在线混合）；offline 变体用 offline
+  sample_rate: 16000             # Hz；对齐官方 samplerate；同时是仿真 target_sr
+
+  # 训练 split 声明：clean/noise/wind/RIR 清单路径、时长过滤、固定画布与分层仿真配置
+  train:
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # clean 语音清单
+    # 官方只保留原生 fs >= default_fs 的源语音（loaders/dataloader.py:71）。
+    speech_min_sample_rate: 16000  # Hz；低于该原生采样率的 source 在 Dataset 构造期被过滤
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"  # 加性噪声清单；prob_target_noise 命中时抽取
+    # Layer C-3 背景音乐清单（本 split 级键，不属于 simulation_cfg）；本配方未启用。
+    # music_scp: data/ss/background/music/train.scp
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪清单；prob_wind_noise_sidechain=0.05 时按概率采样
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp"  # RIR 按运行时 sample_rate 加载
+    filter_min_duration: 1.0     # 秒；源语音最短时长过滤阈值
+    filter_max_duration: 30.0    # 秒；源语音最长时长过滤阈值
+    num_per_epoch: 4000          # 对齐官方 train_dataset.num_per_epoch；每 epoch 无放回抽样上限
+    # Dataset lifecycle: fixed canvas/repeat belongs to this split, not simulation_cfg.
+    max_duration_seconds: 4    # 秒；固定画布长度；对齐官方 wav_len
+    repeat_to_max_duration: false  # 短源零填充到固定画布；对齐 official 零填充，不做 tile
+    # 分层在线仿真配置（Layer A–F）；unknown 键在配置边界 fail-fast
+    simulation_cfg:
+      # ---- Layer B：场景分支（scene 三路互斥概率）----
+      # scene 三路为互斥 multinomial：逐样本单次 uniform 抽样按 CDF 顺序命中（core/data/simulation/scenario_sampler.py），
+      # 最后一项 prob_target_noise 为兜底；三者之和必须严格 = 1（abs_tol=1e-8），
+      # 且 prob_target_only + prob_noise_only <= 1，违反时 tasks/se/data/dynamic_dataset.py:279-291 在 Dataset 构造期报错。
+      # 概率是 nominal 目标比例，realized 计数受 num_per_epoch 有限抽样影响。
+      # 未声明的仿真概率字段取 runtime 默认 0.0（core/data/simulation_configs.py:147-294）：
+      # prob_timeline、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter、prob_speed_perturb 等。
+      # Layer B timeline：多源相对窗口；SE/AEC 单路默认关闭，Layer A gap/留白仍生效。
+      # prob_timeline: 0.0            # Layer B 多源相对窗口概率；未声明=0.0
+      # overlap_ratio_range: [0.1, 0.5]  # 多源窗口重叠比例范围，无量纲；未声明时取默认
+      speech:
+        random_start: true        # 对齐 official train_dataset.random_start=True；长句随机起点裁剪
+        # Layer A-4 高通预处理（约 70 Hz 的 filtfilt）
+        high_pass:
+          enabled: false            # Layer A-4 ~70 Hz 高通 filtfilt；对齐官方配置关闭
+      # Layer B 场景分支：三路互斥概率，和必须为 1
+      scene:
+        prob_target_only: 0.0       # Layer B target-only 概率；本配方不采样
+        prob_noise_only: 0.0        # Layer B 纯背景概率；本配方不采样
+        prob_target_noise: 1.0      # Layer B 目标+噪声概率；三路之和必须为 1（本配置由本项独占）
+      # ------------------------------------------------------------------
+      # Layer C-0：RIR backend / room geometry / static-moving policy
+      # ------------------------------------------------------------------
+      # rir_backend: offline  # offline | online；在线时同组 source 共用 room/mic
+      # gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # [length, width, height]
+      # gpurir_rt60_range_sec: [0.1, 1.0]
+      # gpurir_source_distance_range_m: [0.2, 3.0]
+      # gpurir_source_height_range_m: [1.1, 1.8]
+      # gpurir_mic_height_range_m: [1.0, 1.8]
+      # gpurir_enrollment_distance_range_m: [0.05, 0.2]  # 仅 TSE enrollment 近场
+      # 稳定服务默认值（source budget/device/omni/timeout/cache）由 core 提供，不在 YAML 重复。
+      # Layer C 声学混合：RIR/混响与加性背景
+      acoustic:
+        # Layer C-0 RIR/混响：卷积概率、moving 策略与监督 target 口径
+        rir:
+          reverberation_prob: 0.5 # [0, 1]；Layer C-0 RIR 卷积采样概率；0=全部 dry
+          moving_prob: 0.0  # [0, 1]；在线 moving RIR 概率；0=全静态（本配方保持关闭，非框架限制）
+          # segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定。
+          target_type: early     # 枚举 early/dry/rts；显式保留 early-RIR 监督目标
+          normalize: false       # D-05：不归一化 RIR，保留静态/移动 RIR 的原始增益（封闭复现例外）
+        # Layer C-1/C-2 加性噪声与风噪 side-chain
+        background:
+          snr_low: -5            # dB；对齐官方 snr_range: [-5, 15] 下界
+          snr_high: 15           # dB；对齐官方 snr_range 上界
+          prob_wind_noise_sidechain: 0.05 # [0, 1]；对齐官方 simulation_train.yaml:24 的 5% wind noise（Layer C-2 side-chain）
+      # 固定 post-mix 顺序：pre-finite -> D-normalize -> D-guard -> E -> F -> task-post-EF -> final-guard -> post-finite；
+      # SE 的 task-post-EF 为 no-op；device.enabled（Layer F 总开关）为 false 时只跳过 F，不影响 Layer D/E。
+      post_mix:
+        # Layer D post-mix 幅度归一化（公共枚举仅 off/joint）
+        normalization:
+          # off=关闭公共 Layer D-normalize；官方 noisy/clean 各自 peak 归一化见 se.pase_preprocess（target peak 取 schema 默认 [0.5, 0.95]）。
+          mode: "off"
+      # GAP-URGENet 专属预处理（不进入公共 SimulationConfigs）：noisy/clean 各自 peak 归一化，
+      # 且在 Layer E 信道退化之后执行（官方 loaders/dataloader.py 在增广之后归一化）。
+      se:
+        # GAP-URGENet 专属幅度预处理参数（不进入公共 SimulationConfigs）
+        pase_preprocess:
+          peak_normalization_mode: separate # 枚举 separate/single；separate=noisy 与 clean 各自按同一 U(0.5,0.95) 目标峰值归一，noise 不参与
+          apply_after_channel: true         # true=在 Layer E 信道退化之后执行归一化（对齐官方增广后归一化顺序）
+      # Layer E（仅作用于 noisy）：channel.enabled 为总开关，true 时按 num_augmentations 分布与权重抽样，不是逐项全部执行。
+      channel:
+        enabled: true             # Layer E 总开关；true 时按 num_augmentations 分布与权重抽样
+        # runtime 枚举仅支持 bandwidth_limitation/clipping/codec/packet_loss。
+        augmentations_name: [bandwidth_limitation, clipping, codec, packet_loss]
+        # key=一次选取的增强项数，value=概率；完整分布之和为 1。
+        num_augmentations: {0: 0.25, 1: 0.40, 2: 0.20, 3: 0.15}
+        # Layer E 各增强项参数（weight 为相对抽样权重）
+        augmentations:
+          bandwidth_limitation: {weight: 1.0, resample_methods: random, target_sr: 8000}  # target_sr=固定 8 kHz（官方硬编码）；random 随机重采样方法
+          clipping: {weight: 1.0, clipping_min_quantile: [0.0, 0.1], clipping_max_quantile: [0.9, 1.0]}  # 分位点范围，无量纲（0–1）
+          # codec 增强：按 config 列表随机选一种格式与质量档位
+          codec:
+            weight: 1.0           # 相对抽样权重
+            # codec 备选组合列表（每项 format/encoder/qscale）
+            config:
+            - {format: mp3, encoder: ~, qscale: [1, 10]}          # ~=不指定 encoder；qscale 为质量档位范围
+            - {format: ogg, encoder: [vorbis, opus], qscale: [-1, 10]}  # ogg 随机取 vorbis/opus；qscale=-1 表示后端默认
+          # packet_duration_ms 单位为 ms；连续丢包上限按 packet 计；loss rate 为 [0, 1]。
+          packet_loss: {weight: 1.0, packet_duration_ms: 20, max_continuous_packet_loss: 10, packet_loss_rate: [0.05, 0.25]}
+      # Layer F：observation/device 退化（总开关关闭时整层跳过）
+      device:
+        enabled: false            # Layer F 总开关；false 跳过 observation/device 退化，不控制 Layer D/E
+
+  # data.validation：验证 split；inherit_simulation=true 时复用 train.simulation_cfg，仅覆盖下列资源键
+  validation:
+    mode: dynamic                 # 枚举：dynamic
+    inherit_simulation: true      # 继承 train.simulation_cfg，仅覆盖下列验证集资源
+    # 官方 validation random_start=False；train 为 true，必须显式覆盖。
+    simulation_cfg:
+      speech:
+        random_start: false     # 官方 validation random_start=False；长句固定起点裁剪
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # 验证 clean 语音清单
+    # 官方只保留原生 fs >= default_fs 的源语音（loaders/dataloader.py:71）；validation 与 train 同口径。
+    speech_min_sample_rate: 16000  # Hz；低于该原生采样率的 source 在 Dataset 构造期被过滤
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp"   # 验证 RIR 清单
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"          # 验证噪声清单
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp" # 验证风噪清单（继承 train 的 5% 风噪 sidechain）
+    num_per_epoch: 1000           # 对齐官方 validation_dataset.num_per_epoch；validation 无放回抽样上限
+
+  # data.dataloader：train/val loader 共享参数（验证侧默认沿用，可用 val_num_workers/val_persistent_workers 覆盖）
+  dataloader:
+    batch_size: 1                 # 对齐官方 train_dataloader.batch_size；每 GPU 计
+    val_batch_size: 1             # 官方 validation_dataloader.batch_size=1；显式写出，不沿用 train
+    num_workers: 4                # train loader worker 数；验证 loader 默认沿用（0 时强制 persistent_workers=false）
+    pin_memory: true              # 锁页内存，加速 host→device 拷贝
+
+# ---- loss：GAP-URGENet Predictor 混合损失（RI + Mag + signed SDR）----
+loss:
+  type: GAPHybridLoss             # 对齐官方 utils/loss_factory.py:33-89 HybridLoss；注册名 → core/losses/pase_family.py::GAPHybridLoss
+  # loss 构造参数（单位与来源见各键注释）
+  args:
+    sample_rate: 16000            # Hz；与 data.sample_rate 一致；官方 forward 逐样本传 fs，本配置固定 16 kHz（见 README 差异说明）
+    # 以下四项为 GAPHybridLoss 的 runtime 默认值（core/losses/pase_family.py:369-380），
+    # 按 D1 显式写出以消除「头部声称 RI×30+Mag×70+SDR×1 但 YAML 无对应键」的漂移；数值与默认完全一致，不改变行为。
+    compress_factor: 0.3          # 压缩指数 c：S_c = S / |S|^(1-c)，无量纲
+    lamda_ri: 30                  # 压缩复数谱 RI 项权重，无量纲
+    lamda_mag: 70                 # 压缩幅度项权重，无量纲
+    lamda_sdr: 1                  # 带符号 SDR 项权重，无量纲
+
+# ---- optimizer：单优化器 AdamW ----
+optimizer:
+  type: AdamW                       # 单优化器（Predictor 全参数可训练）
+  # AdamW 超参数
+  args:
+    lr: 1.0e-3                    # 官方 optimizer.lr 初始值；scheduler.max_lr 后续接管
+    betas: [0.8, 0.99]            # Adam β1/β2（官方值，非默认 0.9/0.999）
+    weight_decay: 0.01            # 权重衰减系数，无量纲
+
+# ---- scheduler：线性 warmup + 余弦退火，按 optimizer step 推进 ----
+scheduler:
+  type: LinearWarmupCosineAnnealing  # 线性 warmup 后余弦退火
+  # warmup/退火参数（单位 optimizer steps）
+  args:
+    warmup_steps: 10000           # 对齐官方 scheduler.warmup_steps；单位 optimizer steps
+    decay_until_step: 110000      # 对齐官方 scheduler.decay_until_step；单位 optimizer steps
+    max_lr: 1.0e-4                # 对齐官方 scheduler.max_lr
+    min_lr: 1.0e-6                # 对齐官方 scheduler.min_lr
+    zero_based_warmup: true  # 官方 LinearWarmupCosineAnnealingLR：step 0 lr=0
+
+# ---- trainer：SE 标准训练器（SETrainer）----
+trainer:
+  type: SETrainer                   # 标准 SE 训练器：单模型、单优化器、无判别器
+  exp_path: exp/se/gap_urgenet_phase1_predictor             # 输出目录；取配置文件名去 .yaml
+
+  epochs: 200                     # 对齐官方 trainer.epochs
+  gradient_clip_value: 3.0        # 对齐官方 clip_grad_norm_value；梯度 L2 范数裁剪阈值
+  lr_schedule_per_step: true      # true=每个 optimizer step 推进 scheduler（非每 epoch）
+  log_interval: 50                # 每多少 optimizer steps 打印一次日志
+
+  validation_epoch_interval: 1      # 每多少个 epoch 跑一次 validation；官方逐 epoch 验证
+  output_clamp: false               # 关闭 [-1,1] clamp，严格对齐官方 PASE 家族训练；仅保留非有限值清零
+  max_val_batches: 0              # 0=不限制 validation batch 数
+  # 在线客观指标配置（enabled=false 时整段不生效）
+  val_metrics:
+    enabled: false                # 不在线计算 SI-SDR/PESQ/STOI 或 MOS；有意关闭在线指标
+
+  # 验证音频（官方 train_predictor.py:250-263）：rank0、1-based epoch<10 或 %10==0、step<=10
+  val_audio:
+    enabled: true                 # true=按官方条件保存验证音频；false=整段零开销
+    save_initial_epochs: 10       # 官方 epoch < 10（1-based）
+    save_every_n_epochs: 10       # 官方 epoch % 10 == 0
+    initial_epoch_reference: zero # 枚举 start_epoch/zero；本阶段用 zero
+    max_batches: 10               # 官方 step <= 10
+
+  save_checkpoint_interval: 10    # 对齐官方 trainer.save_checkpoint_interval；每多少 epoch 存一次
+
+# ---- distributed：DDP 后端与 reducer 选项 ----
+distributed:
+  backend: nccl                   # DDP 通信后端；GPU 训练固定 nccl
+  find_unused_parameters: false   # 单路径模型（Predictor 全参数参与 backward）；保持默认 false

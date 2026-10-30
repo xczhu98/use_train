@@ -1,0 +1,35 @@
+digraph ULUNASNASDataflow {
+  graph [rankdir=LR, bgcolor="white", pad="0.20", nodesep="0.28", ranksep="0.52",
+    splines=ortho, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=22,
+    fontcolor="#142338", labelloc=t, label="UL-UNAS｜NAS 选择结果与运行时数据流"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=12,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.6,
+    margin="0.14,0.10"];
+  edge [color="#405A75", penwidth=1.8, arrowsize=0.75];
+
+  subgraph cluster_search {
+    label="架构搜索空间（离线决定配置）"; color="#B8CDE1"; fillcolor="#F4F8FB"; style="rounded,filled";
+    candidates [label="candidate block\nXConv / XDWS / XMB", fillcolor="#EAF2FA", color="#2E6EB5"];
+    choices [label="每层联合选择\ntype · channels · kernel\nstride · groups", fillcolor="#EAF2FA", color="#2E6EB5"];
+    selected [label="Table IV 默认结果\n[XConv, XMB, XDWS, XMB, XDWS]\nstrides [2,2,1,1,1]\nchannels [12,24,24,32,16]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.0];
+    candidates -> choices -> selected;
+  }
+
+  subgraph cluster_runtime {
+    label="部署 / 训练时固定拓扑（模型边界）"; color="#6FA4D8"; fillcolor="#F8FBFE"; style="rounded,filled";
+    input [label="noisy_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+    erb [label="log magnitude\nERB Band Merge", fillcolor="#E7F5EC", color="#388B57"];
+    enc [label="selected causal encoder\nAPReLU + cTFA", fillcolor="#E7F5EC", color="#388B57"];
+    dp [label="G-DPRNN × N\n频率双向 · 时间单向", fillcolor="#FFF3D1", color="#C78300"];
+    dec [label="selected decoder\nmirror blocks + skip", fillcolor="#F1E8FA", color="#7047A3"];
+    irm [label="sigmoid IRM\nBand Split × noisy complex", fillcolor="#FDE8EE", color="#B33A55"];
+    output [label="enhanced_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+    input -> erb -> enc -> dp -> dec -> irm -> output;
+    enc -> dec [style=dashed, color="#6E8191", label="skip"];
+    input -> irm [style=dashed, color="#6E8191", label="noisy complex"];
+  }
+
+  selected -> enc [style=dashed, color="#2E6EB5", label="固化配置"];
+  framework [shape=note, label="waveform I/O、STFT / iSTFT\n均属于 Framework / Trainer，位于模型外", fillcolor="#EEF3F7", color="#6E8191"];
+  framework -> input [style=dotted, color="#6E8191", arrowhead=none, constraint=false];
+}

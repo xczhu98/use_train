@@ -1,0 +1,265 @@
+# ======================================================================
+# 配置：StuPASE Phase 2，Conditional Flow Matching（CFM/DiT）训练。
+# 数据管线：data.mode=dynamic（SE 在线混合；Layer A/B/C 仿真 + Layer D/E/F 后处理）。
+# 采样率/帧移：16 kHz；waveform-native（meta.allow_no_stft=true）。前端 mel 由
+#   model.args.cfm_kwargs.mel_spec_kwargs 参数化（n_fft=1280 / hop_length=320，即
+#   80 ms 窗 / 20 ms 帧移）；训练 forward 不含 iSTFT，iSTFT 在推理期由 Mel vocoder 承担。
+# 模型：冻结 DeWavLM-R encoder，训练 CFM/DiT；训练 forward 不包含 Mel vocoder。
+# 实现路径：tasks/se/models/pase_family/stupase/flow_train_wrapper.py（StuPASEFlowTrainModel）、
+#   tasks/se/models/pase_family/stupase/flow/cfm.py（CFM）、
+#   tasks/se/models/pase_family/stupase/flow/dit.py（DiT）、
+#   tasks/se/models/pase_family/stupase/flow/modules.py（Attention / AttnProcessor / MelSpec）。
+# WavLM 依赖：直接依赖 StuPASE Phase 0 的 DeWavLM-R artifact；通过该 artifact
+#   间接依赖 WavLM-Large。本阶段不直接加载 WavLM-Large checkpoint。
+# Artifact 占位披露：model.args.encoder_ckpt_path 指向的
+#   exp/se/stupase_phase0_dewavlm_r_distill/checkpoints/DeWavLM-R.pt 当前不存在，
+#   需先跑 stupase_phase0_dewavlm_r_distill.yaml 并显式导出到该精确路径；缺失时构造期报错。
+# Params：not measured（本机缺少 DeWavLM-R checkpoint）。参考口径为 encoder
+#   ~315.45M、CFM/DiT ~189.5M、Mel vocoder ~60.67M；保留原数值，均非本次实测。
+# MACs：not measured；完整 8-step 推理链约 104 GMAC/s 仅为论文 reference。
+# FLOPs：not measured；未运行独立 FLOPs profile。
+# THOP：not measured（未运行）。
+# RTF：not measured（未在本机计时）。
+# 复杂度输入口径：B=1，16 kHz，shape=[1, 16000] 的 float waveform，幅度 [-1, 1]；
+#   实际训练切片为 4 s，训练 forward 不含 ODE inference chain；仅计模型前向。
+# Trainer MOS boundary：DualInputLossTrainer 只消费 CFM scalar velocity loss，不生成音频；
+#   本阶段不计算 MOS/PESQ/STOI（在线指标有意关闭），需组合三件 artifact 后用
+#   evaluate/eval_pipeline_se.py --audio_quality 离线推理评估。trainer.val_audio 只写
+#   官方 validation 样例（mel vocoder + CFM.sample），不参与 loss/指标。
+# 冻结/可训练：冻结 encoder，训练 CFM/DiT；discriminator 不适用。
+# 与其他变体的关键区别：本阶段只训练 flow-matching 速度场；mel vocoder 与 encoder
+#   均冻结且在训练 forward 中不参与；PASE/UniPASE 对应阶段直接训练波形 decoder。
+# 产物：CFM.pt；完整推理链为 noisy -> DeWavLM-R -> 8-step CFM/DiT
+#   -> Mel vocoder -> 16 kHz enhanced waveform。
+# 数据：noisy/clean 配对，采用 official StuPASE 的 reverb + noise 语义。
+# Source: cisco-open/pase — stupase/configs/cfg_train_flow.yaml
+# Train:
+#   python train.py -C configs/se/urgent2026/pase/stupase_phase2_flow.yaml
+# ======================================================================
+
+# ---- meta：随机性 / 精度 / 确定性开关（core/trainer/entry.py、core/trainer/base_trainer.py）----
+meta:
+  seed: 34              # 全局随机种子；模型初始化各 rank 同种子，数据打乱按 rank 偏移
+  allow_no_stft: true   # 模型自带 mel 前端，全程 waveform-native，不使用框架 STFT
+  use_amp: false        # 官方训练脚本为 fp32（无 autocast）；amp_dtype 仅保留作参考
+  amp_dtype: bfloat16   # 家族统一 bfloat16：bf16 与 fp32 同指数范围、无需 GradScaler；训练 forward 不含 ISTFTHead
+  deterministic: false  # false=保留 cuDNN benchmark 自动选算法（默认）；true 关闭 benchmark 并置 cudnn.deterministic
+
+# ---- model：冻结 DeWavLM-R + 可训练 CFM/DiT（无判别器）----
+model:
+  type: StuPASEFlowTrainModel  # 注册名 → tasks/se/models/pase_family/stupase/flow_train_wrapper.py
+  # 模型结构参数（显式形参；未知键在构造期 TypeError）
+  args:
+    encoder_ckpt_path: "exp/se/stupase_phase0_dewavlm_r_distill/checkpoints/DeWavLM-R.pt"  # 冻结 DeWavLM-R；当前不存在，需先导出
+    encoder_output_layer: 24  # 作为 phonetic condition 的 WavLM 层号
+    feature_norm: batch  # StuPASE 官方 LayerNorm 口径：F.layer_norm(feat, feat.shape)
+    # cfm_kwargs 整包转发给 CFM.__init__（flow/cfm.py:32-58）；dit/mel_spec/odeint 三组分别再转发。
+    cfm_kwargs:
+      # DiT transformer 结构参数（整包转发给 DiT.__init__）
+      dit_kwargs:
+        dim: 1024           # DiT transformer 隐层维度；heads=16 时每头 64 维（dim_head 用库默认 64）
+        mel_dim: 100        # 输入 mel 通道数；须与 mel_spec_kwargs.n_mel_channels 一致
+        text_in_dim: 1024   # phonetic condition 输入维度，等于 DeWavLM/WavLM-Large 特征维度
+        text_dim: 512       # TextEmbedding 投影后的条件维度（DiT 内部 text_embed 输出）
+        depth: 12           # DiTBlock 层数
+        heads: 16           # 每层注意力头数
+        ff_mult: 2          # FFN 隐层相对 dim 的倍数（隐层 = dim × ff_mult）
+        conv_layers: 4      # TextEmbedding 前置卷积层数
+        text_mask_padding: true  # 条件序列按 padding mask 屏蔽补齐帧
+        qk_norm:            # 留空=使用默认（None）：不做 q/k 归一化；可选值仅 "rms_norm"，其他值构造期 ValueError
+        pe_attn_head:       # 留空=使用默认（None）：RoPE 施加到全部注意力头；设为整数 N 则仅前 N 个头
+        checkpoint_activations: false  # 关闭逐层激活重计算；开启以显存换计算
+      # mel 前端参数（整包转发给 MelSpec.__init__）
+      mel_spec_kwargs:
+        target_sample_rate: 16000  # Hz；mel 前端目标采样率
+        n_mel_channels: 100        # mel 通道数
+        hop_length: 320            # mel 帧移，单位 samples（20 ms）
+        win_length: 1280           # mel 窗长，单位 samples（80 ms）
+        n_fft: 1280                # mel FFT 窗长，单位 samples
+        mel_spec_type: vocos       # 唯一支持值；其他值在 MelSpec 构造期 assert 失败
+      # ODE 求解器参数（整包转发给 torchdiffeq.odeint；仅推理期 sample() 使用）
+      odeint_kwargs:
+        method: euler       # ODE 求解器；仅推理期 sample() 使用，训练 forward 不触发
+      sigma: 0.0            # flow-matching 噪声尺度；0.0=线性插值路径
+      audio_drop_prob: 0.5  # [0,1]；独立伯努利门，逐样本丢 clean 条件（CFG 训练）
+      # 官方 stupase/models/flow/cfm.py:308-317 注释掉 noisy/text 两条独立 drop；为对齐 released 权重设为 0，
+      # 两者只在 cond_drop_prob 的「全无条件」分支被丢弃。
+      noisy_audio_drop_prob: 0.0  # [0,1]；0=关闭独立 noisy drop（官方代码忽略此项）
+      text_drop_prob: 0.0   # [0,1]；0=关闭独立 text drop（官方代码忽略此项）
+      cond_drop_prob: 0.2   # [0,1]；无条件分支概率，命中时同时丢弃上述三类条件（可与三者共现）
+      frac_lengths_mask: [0.7, 1.0]        # clean 侧随机 infilling 掩码长度比例范围，无量纲
+      frac_lengths_mask_noisy: [0.5, 1.0]  # noisy 侧随机 infilling 掩码长度比例范围，无量纲
+
+# ---- data：SE dynamic 数据管线（train/validation 资源 + Layer A–F 仿真）----
+data:
+  mode: dynamic                    # 枚举：dynamic（SE 在线混合）；offline 变体用 offline
+  sample_rate: 16000               # Hz；训练/验证采样率，同时是仿真 target_sr
+
+  # 训练 split 声明：clean/noise/wind/RIR 清单路径、时长过滤、固定画布与分层仿真配置
+  train:
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # clean 语音清单；本阶段 noisy/clean 配对监督
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"  # 加性噪声清单；prob_target_noise 命中时抽取
+    # Layer C-3 背景音乐清单（本 split 级键，不属于 simulation_cfg）；本配方未启用。
+    # music_scp: data/ss/background/music/train.scp
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪清单；prob_wind_noise_sidechain=0 时不采样
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp"   # 16 kHz 静态 gpuRIR 清单；reverberation_prob 命中时抽取
+    # wind 概率为 0，运行时不采样；windnoise_scp 仍会在 Dataset 初始化时解析。
+    filter_min_duration: 2.0        # s；源语音最短时长过滤阈值
+    filter_max_duration: 30.0       # s；源语音最长时长过滤阈值
+    num_per_epoch: 60000            # 每个 epoch 的无放回抽样上限（nominal 目标条数）
+    # Dataset lifecycle: fixed canvas/repeat belongs to this split, not simulation_cfg.
+    max_duration_seconds: 4       # s；固定画布长度；official wav_len=4
+    repeat_to_max_duration: false  # 短源零填充到固定画布；对齐 official 零填充，不做 tile
+    # 分层在线仿真配置（Layer A–F）；unknown 键在配置边界 fail-fast
+    simulation_cfg:
+      # ---- Layer B：场景分支（scene 三路互斥概率）----
+      # scene 三路为互斥 multinomial：逐样本单次 uniform 抽样按 CDF 顺序命中（core/data/simulation/scenario_sampler.py），
+      # 最后一项 prob_target_noise 为兜底；三者之和必须严格 = 1（abs_tol=1e-8），
+      # 且 prob_target_only + prob_noise_only <= 1，违反时 tasks/se/data/dynamic_dataset.py:279-291 在 Dataset 构造期报错。
+      # 概率是 nominal 目标比例，realized 计数受 num_per_epoch 有限抽样影响。
+      # 未声明的仿真概率字段取 runtime 默认 0.0（core/data/simulation_configs.py:147-294）：
+      # prob_timeline、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter、prob_speed_perturb 等。
+      # Layer B timeline：多源相对窗口；SE/AEC 单路默认关闭，Layer A gap/留白仍生效。
+      # prob_timeline: 0.0            # Layer B 多源相对窗口概率；未声明=0.0
+      # overlap_ratio_range: [0.1, 0.5]  # 多源窗口重叠比例范围，无量纲；未声明时取默认
+      speech:
+        random_start: true        # 对齐 official train_dataset.random_start=True；长句随机起点裁剪
+        # Layer A-4 高通预处理（约 70 Hz 的 filtfilt）
+        high_pass:
+          enabled: false            # Layer A-4 ~70 Hz 高通 filtfilt；对齐 official StuPASE 关闭
+      # Layer B 场景分支：三路互斥概率，和必须为 1
+      scene:
+        prob_target_only: 0.0       # Layer B target-only 概率；本阶段不采样
+        prob_noise_only: 0.0        # Layer B 纯背景概率；本阶段不采样
+        prob_target_noise: 1.0      # Layer B 目标+噪声概率；三路之和必须为 1（本配置由本项独占）
+      # ------------------------------------------------------------------
+      # Layer C-0：RIR backend / room geometry / static-moving policy
+      # ------------------------------------------------------------------
+      # rir_backend: offline  # offline | online；在线时同组 source 共用 room/mic
+      # gpurir_room_dim_range_m: [[3.0, 8.0], [3.0, 8.0], [2.5, 3.5]]  # [length, width, height]
+      # gpurir_rt60_range_sec: [0.1, 1.0]
+      # gpurir_source_distance_range_m: [0.2, 3.0]
+      # gpurir_source_height_range_m: [1.1, 1.8]
+      # gpurir_mic_height_range_m: [1.0, 1.8]
+      # gpurir_enrollment_distance_range_m: [0.05, 0.2]  # 仅 TSE enrollment 近场
+      # 稳定服务默认值（source budget/device/omni/timeout/cache）由 core 提供，不在 YAML 重复。
+      acoustic:
+        # Layer C-0 RIR/混响：卷积概率、moving 策略与监督 target 口径
+        rir:
+          reverberation_prob: 0.5   # [0, 1]；Layer C-0 RIR 卷积采样概率；0=全部 dry
+          moving_prob: 0.0  # [0, 1]；在线 moving RIR 概率；0=全静态（本配方保持关闭，非框架限制）
+          # segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定。
+          target_type: dry          # 枚举：early/dry/rts；dry 表示去混响监督（StuPASE 口径）
+          normalize: false          # D-05：false 保留 official raw RIR gain 及 full/early 相对增益（封闭复现例外）
+        # Layer C-1/C-2 加性噪声与风噪 side-chain
+        background:
+          snr_low: -5               # dB；official SNR range 下界
+          snr_high: 15              # dB；official SNR range 上界
+          # 对齐 official StuPASE：仅使用 reverb 与 SNR-controlled additive noise，
+          # 关闭 high-pass、wind、Layer E channel degradation 与 Layer F post-mix degradation。
+          prob_wind_noise_sidechain: 0.0  # [0, 1]；非加性风噪 sidechain 概率；0=禁用且零 RNG 消耗
+      # Layer D：post-mix amplitude conditioning（normalize → guard）
+      post_mix:
+        # Layer D post-mix 幅度归一化（公共枚举仅 off/joint）
+        normalization:
+          mode: "off"               # 枚举 off/joint；off=不做公共 Layer D-normalize，独立归一化见 se.pase_preprocess
+      # Layer E：URGENT2026 信道退化（仅作用于 noisy）
+      channel:
+        enabled: false              # Layer E 总开关；false 跳过整层信道退化
+      # Layer F：observation/device 退化（总开关关闭时整层跳过）
+      device:
+        enabled: false              # Layer F 总开关；false 跳过 observation/device 退化，不控制 Layer D/E
+      # StuPASE 专属预处理（不进入公共 SimulationConfigs）：noisy/clean 各自归一化；
+      # 公共 Layer D 的 post_mix.normalization.mode 仅允许 off/joint。
+      se:
+        # StuPASE 专属幅度预处理参数（不进入公共 SimulationConfigs）
+        pase_preprocess:
+          peak_normalization_mode: separate # 枚举 separate/single；separate=noisy 与 clean 各自按同一 U(0.5,0.95) 目标峰值归一，noise 不参与
+
+  # data.validation：验证 split；inherit_simulation=true 时复用 train.simulation_cfg，仅覆盖下列资源键
+  validation:
+    mode: dynamic                   # 枚举：dynamic
+    inherit_simulation: true        # 继承 data.train.simulation_cfg（同一配置内的仿真继承，非文件级配置继承）
+    # 官方 validation random_start=False；train 为 true，必须显式覆盖。
+    simulation_cfg:
+      speech:
+        random_start: false       # 官方 validation random_start=False；长句固定起点裁剪
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # 验证 clean 语音清单
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp"   # 验证 RIR 清单
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"          # 验证噪声清单
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp" # 验证风噪清单（本配置不采样）
+    num_per_epoch: 1000             # validation 无放回抽样上限
+
+  # data.dataloader：train/val loader 共享参数（验证侧默认沿用，可用 val_num_workers/val_persistent_workers 覆盖）
+  dataloader:
+    batch_size: 20                  # 官方 cfg per-GPU batch；num_per_epoch 60000 隐含 6 卡 → 200 epochs = 100k steps
+    val_batch_size: 1               # 官方 validation_dataloader.batch_size=1；验证 loader 独立 batch，不沿用 train
+    num_workers: 4                  # train loader worker 数；验证 loader 默认沿用（0 时强制 persistent_workers=false）
+    pin_memory: true                # 锁页内存，加速 host→device 拷贝
+
+# ---- loss：占位 loss，真实 CFM velocity loss 在模型 forward 内计算 ----
+loss:
+  type: ScalarPassthroughLoss   # 占位 loss：CFM velocity loss 由 DualInputLossTrainer 在模型 forward 内计算
+
+# ---- optimizer：单优化器 AdamW ----
+optimizer:
+  type: AdamW                       # 单优化器（encoder 冻结，只更新 CFM/DiT）
+  # AdamW 超参数
+  args:
+    lr: 1.0e-3                      # 官方 optimizer.lr 初始值；scheduler.max_lr 后续接管
+    betas: [0.8, 0.99]              # Adam β1/β2（source 值）
+    weight_decay: 0.01              # 权重衰减系数，无量纲
+
+# ---- scheduler：线性 warmup + 余弦退火，按 optimizer step 推进 ----
+scheduler:
+  type: LinearWarmupCosineAnnealing  # 线性 warmup 后余弦退火
+  # warmup/退火参数（单位 optimizer steps）
+  args:
+    warmup_steps: 10000             # 单位 optimizer steps；线性升到 max_lr
+    decay_until_step: 110000        # 单位 optimizer steps；余弦退火到该步结束
+    max_lr: 1.0e-4                  # 峰值学习率
+    min_lr: 1.0e-6                  # 退火下界学习率
+    zero_based_warmup: true  # 官方 LinearWarmupCosineAnnealingLR：step 0 lr=0
+
+# ---- trainer：双输入 CFM 训练（DualInputLossTrainer）----
+trainer:
+  type: tasks.se.trainer.dual_input_loss_trainer.DualInputLossTrainer  # 双输入：noisy 送 encoder、clean/noisy 送 CFM
+  exp_path: exp/se/stupase_phase2_flow                     # 输出目录；取配置文件名去 .yaml
+
+  # data.train.num_per_epoch 是无放回抽样上限；上限不小于 Dataset 大小时全量遍历。
+  # 实际 optimizer steps 取决于 min(60000, Dataset 大小)、batch、DDP 与 drop_last。
+  epochs: 200                       # source trainer.epochs
+  gradient_clip_value: 3.0          # 梯度 L2 范数裁剪阈值
+  lr_schedule_per_step: true        # true=每个 optimizer step 推进 scheduler
+  log_interval: 50                  # 每多少 optimizer steps 打印一次日志
+
+  validation_epoch_interval: 1      # 每多少个 epoch 跑一次 validation；官方逐 epoch 验证
+  output_clamp: false               # 关闭 [-1,1] clamp，严格对齐官方 PASE 家族训练；仅保留非有限值清零
+  max_val_batches: 0                # 0=不限制 validation batch 数
+  # 在线客观指标配置（enabled=false 时整段不生效）
+  val_metrics:
+    enabled: false                  # 输出是 CFM 标量 loss，不是音频；有意关闭在线指标
+
+  # 官方验证音频（train_flow.py:245-300）：rank 0 且 (epoch < start_epoch+10 或 epoch%10==0) 且 step<=10；
+  # 写 {step}_noisy.wav / {step}_clean.wav / {step}_recon.wav / {step}_enh_epoch{NNN}.wav，16 kHz；
+  # recon/enhanced 各自峰值归一到 0.9；uid 使用官方 train_flow.py 的 step（从 1 开始）。
+  val_audio:
+    enabled: true                   # true=按官方条件保存验证音频；false=整段零开销
+    save_initial_epochs: 10         # 官方 epoch < start_epoch + 10
+    save_every_n_epochs: 10         # 官方 epoch % 10 == 0
+    initial_epoch_reference: start_epoch  # 枚举 start_epoch/zero；本阶段用 start_epoch
+    max_batches: 10                 # 官方 step <= 10
+    vocoder_ckpt_path: "tasks/se/models/pase_family/stupase/open_model_checkpoint/Vocoder_Mel-16k.pt"  # 官方 cfg_train_flow.yaml 的 Mel vocoder（input_channels=100）
+    vocoder_kind: stupase           # 枚举 stupase/unipase；本阶段用 StuPASE Mel VocosVocoder
+    sample_settings:                # 官方 cfg_train_flow.yaml 的 CFM 采样参数
+      steps: 8                      # ODE 采样步数
+      cfg_strength: 0.5             # classifier-free guidance 强度，无量纲
+      sway_sampling_coef: -1.0      # sway sampling 系数，无量纲
+
+  save_checkpoint_interval: 10      # 每多少 epoch 存一次 checkpoint
+
+# ---- distributed：DDP 后端与 reducer 选项 ----
+distributed:
+  backend: nccl                     # DDP 通信后端；GPU 训练固定 nccl
+  find_unused_parameters: true      # 官方 train_flow.py 使用 true；与官方 DDP reducer 语义一致

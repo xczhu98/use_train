@@ -1,0 +1,61 @@
+# ============================================================
+# 仿真回声对生成配置
+# 用法:
+#   python -m tools.prepare_data_tools.generators.echo.generate_simulated_farend_echo_pairs -C tools/prepare_data_tools/generators/echo/generate_simulated_farend_echo_pairs.yaml
+# ============================================================
+
+# 输入数据源（SCP 格式：uid 采样率 采样点数 绝对路径）
+farend_scp: data/lite_realtime_denoie_dynamic_16k/train_speech_sources.scp
+rir_scp: data/lite_realtime_denoie_dynamic_16k/rirs.scp
+
+# 可选：线路噪声源（用于模拟设备线路噪声）
+# 若不指定或留空，则跳过线路噪声
+noise_scp: data/lite_realtime_denoie_dynamic_16k/noise_sources.scp
+
+# 输出目录
+output_dir: data/synthetic_echo_pairs
+
+# 生成规模
+num_pairs: 10000
+sample_rate: 16000
+max_duration_seconds: 10
+
+# 随机种子（保证可复现）
+seed: 42
+
+# 并行进程数；0=单进程（便于调试），建议设为 CPU 核心数
+workers: 8
+
+# ------------------------------------------------------------------
+# 物理参数
+# ------------------------------------------------------------------
+
+# SER（Signal-to-Echo Ratio）目标范围
+# train 时 tasks.aec.data.dynamic_dataset 会再次按 clean_target 缩放，
+# 但这里的初始 SER 决定了 echo 的绝对能量水平。
+ser_range_db: [-20, 20]
+
+# 非线性失真（模拟扬声器饱和/谐波失真）
+nonlinear_distortion:
+  enabled: true
+  # 可选类型: soft_clip, hard_clip, harmonic, none
+  types: [soft_clip, hard_clip, harmonic, none]
+  # 每条样本以该概率施加非线性失真
+  prob: 0.5
+
+# 线路噪声（模拟播放设备底噪）
+line_noise:
+  enabled: true
+  # 线路噪声 vs echo 的 SNR 范围
+  snr_db: [20, 40]
+  # 每条样本以该概率叠加线路噪声
+  prob: 0.3
+
+# 额外随机延迟（模拟设备 buffer / 传输延迟）
+# 单位: ms；会在 echo 前端 prepend 零延迟
+random_delay_ms: [0, 50]
+
+# EQ 扰动（当前占位，未来可接入 phone_DL_EQ_perturb）
+eq_perturb:
+  enabled: false
+  prob: 0.0

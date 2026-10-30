@@ -1,0 +1,250 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+*.egg
+.mypy_cache/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Training outputs
+exp/
+wandb/
+runs/
+output/
+logs/
+*.log
+
+# Checkpoints & model weights
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.gguf
+# TSE 声纹 embedding 预训练权重（显式标注：仅目录结构与 README 进 git）
+tasks/tse/speaker_embedding_models/**/*.pt
+# TSE 模型预训练 checkpoint（比赛官方，仅目录结构与 README 进 git）
+tasks/tse/pretrained_models/**/*.pt
+tasks/tse/pretrained_models/**/config.yaml
+
+# TensorFlow / TensorRT / other formats
+*.pb
+*.tflite
+*.engine
+*.plan
+*.trt
+
+# NumPy serialized weights
+*.npy
+*.npz
+
+# Pickle / serialized objects
+*.pkl
+*.pickle
+
+# ONNX / DNSMOS (large model files, download separately)
+*.onnx
+# ONNX 原子发布过程的临时锁文件，不扩大到模型资产本体
+onnx/onnx_model/.onnx-publish-*.lock
+# 推理输出目录持久锁文件（core.inference 创建）
+.inference.lock
+tools/DNSMOS/
+
+
+# 第三方本地资产：按下列规则使用占位目录或整目录忽略
+third_party_scripts/AST/*
+!third_party_scripts/AST/.gitkeep
+third_party_scripts/DNSMOS/*
+!third_party_scripts/DNSMOS/.gitkeep
+/third_party_scripts/NISQA/
+third_party_scripts/Qwen2.5-Omni-7B/*
+third_party_scripts/SCOREQ/*
+!third_party_scripts/SCOREQ/.gitkeep
+third_party_scripts/UTMOS/*
+!third_party_scripts/UTMOS/.gitkeep
+/third_party_scripts/URGENT-PK/
+third_party_scripts/SileroVAD/*
+!third_party_scripts/SileroVAD/.gitkeep
+third_party_scripts/Step-Audio-2-mini/*
+!third_party_scripts/Step-Audio-2-mini/.gitkeep
+third_party_scripts/zipformer/*
+!third_party_scripts/zipformer/README.md
+!third_party_scripts/zipformer/.gitkeep
+third_party_scripts/wespeaker/*
+!third_party_scripts/wespeaker/README.md
+!third_party_scripts/wespeaker/.gitkeep
+# WeSpeaker 本地模型资产和官方源码克隆不进入主仓库
+third_party_scripts/wespeaker_models/
+third_party_scripts/wespeaker_official/
+# FireRedASR2S 为外部仓库浅克隆（timing 官方口径 FireRedVAD），整个忽略
+third_party_scripts/FireRedASR2S/
+# apollo_repo 为指向外部 Look2Hear 克隆的符号链接，整个忽略（不需要 .gitkeep）
+third_party_scripts/apollo_repo
+third_party_scripts/icefall/
+third_party_scripts/icefall_audiotaq/*
+!third_party_scripts/icefall_audiotaq/04_audioset_label_audiotag.py
+!third_party_scripts/icefall_audiotaq/audiotag_daemon.py
+!third_party_scripts/icefall_audiotaq/audiotag_result.py
+
+# ModelScope 下载缓存元数据仅保留在本机
+/third_party_scripts/speech_zipenhancer_ans_multiloss_16k_base/.msc
+/third_party_scripts/speech_zipenhancer_ans_multiloss_16k_base/.mv
+
+
+# Temporary
+*.tmp
+/pytest-of-root/
+/.staged-*/
+
+# Audio (generated / local data)
+/audio_filter_output/
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.wma
+*.aiff
+*.aif
+*.pcm
+*.raw
+
+# Local data / download caches (large, do not commit)
+data/
+# 例外：core/data 与 tasks/*/data 是源码包；仅放开目录，资源后缀仍按全局规则忽略
+!core/data/
+!tasks/*/data/
+# 例外：tools/ops/data 是源码域，不是本地数据产物
+!tools/ops/data/
+
+# Documents (local reference material, do not commit)
+*.pdf
+# docs/paper 全部内容（论文精读笔记、方法图解、原文 PDF）仅作本地学习材料，不入库、不随仓库开源
+/docs/paper/
+
+# Zip files
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.lzma
+*.tar.lz
+*.tar.zst
+# Error output (narrow to common names/paths if you need to track some error.*)
+error.log
+error.txt
+
+# Data / list files (Kaldi-style)
+*.scp
+*.json
+*.list
+# experiment_report 全局持久 flock（mode 锁位于已忽略的 data/ 下）
+docs/reports/experiments/.experiment_report.lock
+
+# 例外：Hive/AudioSet ontology 作为统一管道配置的一部分纳入版本控制
+!tools/noise_filter_pipeline/config/ontology/*.json
+
+third_party_scripts/AST/*.bin
+third_party_scripts/AST/*.safetensors
+third_party_scripts/AST/*.zip
+third_party_scripts/AST/
+
+.env
+.env.local
+.ruff_cache/
+*.h5
+*.hdf5
+*.csv
+.ipynb_checkpoints/
+.vscode/
+
+research/
+autoresearch/
+
+# AI Research Skills / autoresearch workspace — do not commit to git
+.research/research-state.yaml
+.research/research-log.md
+.research/findings.md
+.research/literature/
+.research/to_human/
+.research/paper/
+.research/experiments/
+
+# HTML：默认忽略；允许提交 docs 下的用户指南内嵌页面
+*.html
+!docs/**/*.html
+
+# Markdown：允许提交根 README、docs 下全部文档以及 configs 子目录 README，其余任意 .md 均忽略
+*.md
+!/README.md
+!docs/**/*.md
+!/AGENTS.md
+!configs/**/README.md
+!tools/prepare_data_tools/generators/se/README.md
+!tools/prepare_data_tools/generators/ssl/README.md
+# 例外：仅纳入 core/losses 的 Loss 说明，不放开其他 core Markdown
+!/core/losses/README.md
+# 例外：任务模块 README 纳入版本控制（任务规则唯一落点）；TSE 权重存放约定单独放开
+!tasks/*/README.md
+!tasks/tse/speaker_embedding_models/README.md
+!tasks/tse/pretrained_models/README.md
+# 例外：tools/verify 与 tests 的 README 是项目文档，需随开源仓库发布
+!tools/verify/README.md
+!tools/verify/ssl/README.md
+!tools/ARCHITECTURE.md
+!tools/audio_filter_pipeline/ARCHITECTURE.md
+!tools/noise_filter_pipeline/ARCHITECTURE.md
+!tools/noise_filter_pipeline/assets/noise_filter_pipeline_overview.md
+!tests/README.md
+# 例外：zipformer ASR 模型存放约定说明纳入版本控制
+!third_party_scripts/zipformer/README.md
+# 例外：wespeaker spksim 模型存放约定说明纳入版本控制
+!third_party_scripts/wespeaker/README.md
+# 例外：Qwen2.5-Omni 本地上游模型卡（Noise Filter C1 口径）纳入版本控制
+!third_party_scripts/Qwen2.5-Omni-7B/README.md
+*.so
+.claude/
+.agents/
+
+# Kimi Code skills：所有 skill 均为本机 agent 配置，整目录忽略，不设例外
+.kimi-code/
+
+# C++ build artifacts
+tasks/aec/inference/csrc/build/
+build/
+*.pyd
+# Added by code-review-graph
+.code-review-graph/
+
+# 本地工具配置目录（可能包含凭据/个人配置，禁止入库）
+.aws/
+.codex/
+
+# 本地个人沉淀：docs/reports（本机实验/评估记录）与 docs/paper（论文精读、图解、原文 PDF）
+# 均不入库、不随仓库开源；docs/paper 整体忽略规则见上方 Documents 块
+/docs/reports/

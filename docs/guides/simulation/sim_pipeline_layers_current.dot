@@ -1,0 +1,48 @@
+digraph SimulationLayersCurrent {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.18", margin="0.05",
+    nodesep="0.30", ranksep="0.52", splines=ortho,
+    outputorder=edgesfirst, fontname="Noto Sans CJK SC",
+    fontsize=26, fontcolor="#142338",
+    labelloc=t, label="当前动态仿真管线：Layer A–F"
+  ];
+  node [
+    shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
+    fontsize=13, color="#365875", fontcolor="#142338",
+    penwidth=1.6, margin="0.15,0.10"
+  ];
+  edge [color="#526E86", penwidth=1.8, arrowsize=0.78];
+
+  input [label="Dynamic 输入资产\nclean · noise · RIR\nAEC farend / echo pair\nSSL typed scene / noise pool", fillcolor="#EAF2FA"];
+  a [label="Layer A\nclean 预处理 + CanvasSpec\nsplice · augment · align · high-pass", fillcolor="#E7F5EC", color="#388B57"];
+  b [label="Layer B\none-branch / source draw\nSE / AEC / TSE / SS / SSL 场景\nTSE/SS/SSL relative timeline", fillcolor="#DFF3F0", color="#248277"];
+  c [label="Layer C\n声学与场景混合\nRIR · post-RIR target gain\nnoise · wind · colored · AEC C-aec", fillcolor="#FFF0DA", color="#D56A16"];
+  scene [label="scene bundle\nobservation + target\n+ synchronized stems", fillcolor="#EEF3F7"];
+  pre [label="pre-finite", fillcolor="#F5F8FA", color="#6E8191"];
+
+  dn [label="Layer D / D-normalize\npost-mix amplitude conditioning\n可配置 peak normalization · 默认 off", fillcolor="#F5EDFC", color="#7651A8"];
+  dg [label="Layer D / D-guard\npost-mix amplitude conditioning\n确定性线性安全缩放 · 固定执行\n不执行 hard clip", fillcolor="#FFF3D1", color="#C78300"];
+
+  e [label="Layer E\nchannel degradation\n含 channel clipping", fillcolor="#EAF7E8", color="#55A33D"];
+  f [label="Layer F\nobservation / device degradation\npre-drive → fixed_rail clipping", fillcolor="#FDE3E8", color="#B33A55"];
+  post [label="task-post-EF\n→ final-guard → post-finite", fillcolor="#FFF3D1", color="#C78300"];
+  time [label="scene-wide TimeTransformPlan\n→ sample / tuple", fillcolor="#EAF2FA", color="#2E6EB5"];
+  collate [label="collate → batch", fillcolor="#DCEAF7", color="#183B66", penwidth=2.0];
+  frontend [label="AECDeploymentFrontend\n仅 AEC：collate 后、STFT 前\n可选 GCC-PHAT → 可选 LinearAEC\n不属于 Dataset 仿真", fillcolor="#FDE8EE", color="#D84A73", penwidth=2.0];
+  model [label="STFT → AEC model", fillcolor="#F4F7FA", color="#6A7F93"];
+
+  offline [label="Offline reader\n直接读取预物化轨道\n→ sample / tuple\n不重放 Layer A–F", style="rounded,filled,dashed", fillcolor="#F4F7FA", color="#6A7F93"];
+
+  { rank=same; input; a; b; c; }
+  { rank=same; scene; pre; dn; dg; }
+  { rank=same; e; f; post; time; }
+  { rank=same; offline; collate; frontend; model; }
+
+  input -> a -> b -> c;
+  c -> scene -> pre -> dn -> dg;
+  dg -> e;
+  e -> f -> post -> time -> collate;
+  offline -> collate [style=dashed, color="#6A7F93"];
+  collate -> frontend [style=dashed, color="#D84A73"];
+  frontend -> model [color="#D84A73"];
+}

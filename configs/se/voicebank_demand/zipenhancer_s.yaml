@@ -1,0 +1,120 @@
+# ======================================================================
+# 实验配置：ZipEnhancer-S，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：ZipEnhancer-S（Dual-Path Zipformer，显式幅度/相位解码）
+# Params：local 2.0444M total；paper/reference 2.04M
+# 1 秒输入 MACs：local 24.8388G @ 16 kHz（THOP，partial/unverified；通常不计 STFT/iSTFT）；paper/reference not measured
+# 独立 FLOPs：paper/reference 62.41 GFLOPs（vendored README 原口径，未注明输入时长或算子范围）；local not measured
+# Trainer MOS boundary：Trainer 默认不计算 MOS，本配置更未启用在线客观指标（见 trainer 段）；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文/参考：H. Wang & B. Tian, "ZipEnhancer", arXiv:2501.05183；vendored README 报告 2.04M/62.41 GFLOPs
+# 本地口径：当前 YAML 经 tools/model_tools/audit_metrics.py 按 1 秒输入复核；不得把 24.8388G MACs 与 62.41 GFLOPs 直接等同
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/zipenhancer_s.yaml
+# 模型实现：tasks/se/models/discriminative/zipenhancer.py（ZipEnhancer 类）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、EMA、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42，此处显式化以便复现）
+  # 性能开关：use_amp=false 时 amp_dtype 不生效；compile_model 与 gradient_checkpointing 均关闭
+  use_amp: false         # 关闭 AMP：Zipformer 的 relative positional attention 在 BF16 下未验证，本配置保持 FP32
+  amp_dtype: bfloat16    # 仅 use_amp=true 时生效的 AMP 精度枚举（bfloat16 / float16）；此处保留记录，当前不生效
+  compile_model: false   # 关闭 torch.compile：ScheduledFloat 训练进度分支与动态 shape 易造成 graph breaks，收益未实测
+  use_ema: false         # 关闭 EMA 权重：上游未使用 EMA，避免额外显存与 eval 分支
+  gradient_checkpointing: false  # 关闭梯度检查点：2.04M 参数显存压力小，省显存收益不抵重算开销
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；谱进谱出模型只消费本段几何 ----
+stft:
+  n_fft: 400             # FFT 长度（采样点），16 kHz 下 25 ms；决定频率轴 F = n_fft//2+1 = 201
+  hop_length: 100        # 帧移（采样点），16 kHz 下 6.25 ms；上游 ZipEnhancer 的 100-sample 帧移
+  win_length: 400        # 窗长（采样点），16 kHz 下 25 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hann           # 分析窗类型；构造期用 core.stft 窗名白名单校验，拼写错误直接报错
+  center: true           # 居中补齐（框架默认值，此处显式化）；带来 win_length//2 = 200 samples lookahead
+
+# ---- model：ZipEnhancer（tasks/se/models/discriminative/zipenhancer.py）----
+model:
+  type: ZipEnhancer      # registry 名称（@MODEL_REGISTRY.register("ZipEnhancer")）；本配置为 ZipEnhancer-S 尺度
+  # n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入；args 只放模型自身超参
+  args:
+    dense_channel: 64    # encoder/decoder 通道宽度（正整数）；64 = ZipEnhancer-S（官方小模型）口径
+    num_tsconformers: 4  # dual-path Zipformer block 数（正整数）；S 变体为 4
+    downsampling_factor: [1, 2, 2, 1]      # 每个 block 的时间轴降采样倍率（长度须等于 num_tsconformers）；[1,2,2,1] 为官方 S 口径
+    f_downsampling_factor: [1, 2, 2, 1]    # 每个 block 的频率轴降采样倍率（长度同上）；与时间倍率解耦
+    encoder_dim: [64, 64, 64, 64]          # 每个 block 的嵌入维度（长度须等于 num_tsconformers）；S 变体全 64
+    num_encoder_layers: [1, 1, 1, 1]       # 每个 block 的 encoder 层数（长度同上）；S 变体每块 1 层
+    encoder_unmasked_dim: [64, 64, 64, 64] # 每个 block 中不做掩码/注意力约束的维度（长度同上）；此处等于 encoder_dim
+    num_heads: 4         # attention 头数（正整数）；与 query/pos/value head dim 共同决定注意力宽度
+    query_head_dim: 12   # 每个 head 的 query 维度（正整数）；官方 S 口径
+    pos_head_dim: 4      # 每个 head 的相对位置编码投影维度（正整数）；官方 S 口径
+    value_head_dim: 8    # 每个 head 的 value 维度（正整数）；官方 S 口径
+    feedforward_dim: [256, 256, 256, 256]  # 每个 block 的 FFN 隐层维度（长度须等于 num_tsconformers）
+    cnn_module_kernel: 15  # 深度可分离卷积核大小（正整数）；causal=false 时为对称卷积
+    pos_dim: 24          # 相对位置编码维度（正整数）；官方 S 口径
+    compress_factor: 0.3 # 幅度压缩指数（0 < c <= 1，无量纲）；encoder 输入为 |mag|^c 与相位拼接
+    causal: false        # 关闭因果卷积/注意力：本配置为离线增强口径；streaming 变体需置 true 并配合 streaming wrapper
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；与 SCP 内嵌 fs 一致
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile，保持原始时长与官方评测口径一致
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 2        # 单卡 batch（假设：未核对官方配方；按 Zipformer 注意力显存压力取小 batch）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：CompositeLoss（多分辨率 STFT + SI-SNR 加权和）----
+loss:
+  type: CompositeLoss    # 组合损失容器；顶层仅接受 type/components/strict/enable_ss_undesired_energy
+  components:            # 每个 component 仅接受 type/weight/args/name/enable_ss_undesired_energy
+    - type: MultiResSTFTLoss  # 多分辨率谱一致性（SC + log-magnitude L1），默认 2048/1024/512 三档 FFT
+      weight: 0.7        # 该组件在总损失中的权重（无量纲）；谱域项为主
+    - type: SISNRLoss    # 时域负 SI-SNR（core/losses/time_domain.py）；补足波形级保真
+      weight: 0.3        # 该组件权重（无量纲）；两组件权重之和 = 1.0，为项目配方而非论文逐项复现
+
+# ---- optimizer：AdamW ----
+optimizer:
+  # 实现仅读取 optimizer.args（core/trainer/entry.py _build_single_optimizer）
+  type: AdamW            # 归一化层参数自动进入 no-decay 组，weight_decay 只作用于其余参数
+  args:                  # 透传给 torch.optim.AdamW
+    lr: 0.0004           # 初始学习率（无量纲）；须与 scheduler.args.max_lr 一致
+    betas: [0.9, 0.999]  # 一阶/二阶动量系数（无量纲）；torch 默认值，未按论文调参
+    weight_decay: 0.01   # 权重衰减 0.01（无量纲）；仅作用于非归一化层参数组
+
+# ---- scheduler：线性 warmup + 余弦退火（core/optim/scheduler.py）----
+# 实现仅读取 scheduler.args（core/optim/scheduler.py resolve_scheduler_auto_args）；
+# max_lr 须与 optimizer.args.lr 一致（否则 warmup 峰值 lr 取调度器默认 1e-3）；decay_until_step 为总训练步数
+scheduler:
+  type: LinearWarmupCosineAnnealing  # lr: 0 → max_lr（warmup）→ min_lr（余弦）；本配置未设 min_lr，取构造器默认 1e-5
+  args:                  # 单位随 trainer.lr_schedule_per_step 变化：本配置为 true，故均为 optimizer step
+    warmup_steps: 4000   # 线性 warmup 步数（单位：optimizer step）；须 <= decay_until_step，否则构造期报错
+    decay_until_step: 600000  # 余弦退火结束步数（单位：optimizer step）；100 epoch × 约 5786 step/epoch 的量级
+    max_lr: 0.0004       # warmup 峰值学习率（无量纲）；必须等于 optimizer.args.lr，否则两者语义冲突
+
+# ---- trainer：SETrainer（单优化器、无 GAN）----
+# 有意关闭在线指标：本段未声明 trainer.val_metrics，runtime 默认 enabled=False
+# （core/trainer/metrics_trainer.py:364），即验证只算 val loss、不算 SI-SDR/PESQ/STOI；
+# 原因是 ZipEnhancer-S 单卡训练以 val loss 早停为主，在线侵入式指标的 CPU 开销与收益不匹配。
+# 需要在线指标时显式补 val_metrics（enabled/metrics/interval/max_utterances/metrics_workers）。
+trainer:
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/zipenhancer_s   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 100            # 训练轮数；未声明 max_steps，故按 epoch 跑满
+  lr_schedule_per_step: true   # 调度器按 optimizer step step 一次；因此 warmup_steps/decay_until_step 以 step 为单位
+  gradient_clip_value: 5.0     # 梯度范数裁剪阈值（无量纲）
+  accumulation_steps: 1        # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  early_stop_patience: 10      # 连续 10 次 validation 无改进即早停（0 = 关闭）；本配置取 10
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

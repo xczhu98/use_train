@@ -1,0 +1,13 @@
+# RT-SEMamba 来源说明
+
+本目录的网络结构基于论文官方仓库重写：
+
+- 论文：*RT-SEMamba: Real-Time Speech Enhancement Mamba via Progressive Knowledge Distillation*
+- 官方仓库：<https://github.com/RoyChao19477/RT-SEMamba>
+- 固定 commit：`0c9e8c7c42caadd7badb6cc145c8af93f760863c`
+- 上游路径：`models/generator.py`、`models/mamba_block.py`、`models/codec_module.py`、`models/lsigmoid.py`
+- 许可证：MIT，Copyright (c) 2024 RONG CHAO；包含 MP-SENet 与 CMGAN acknowledgment 条款，完整文本见本目录 `LICENSE`
+
+本项目未原样复制上游文件，而是按本仓谱进谱出、类型标注和中文注释约定重写；去除了模型内部 STFT/iSTFT 与未被 KD1/KD8 使用的 Transformer 分支，并将上游保存在 module buffer 中的流式 cache 改为调用方显式传入/传出的固定状态。参数模块命名尽量保留官方 KD1/KD8 checkpoint 层级，转换与严格校验由 `tools/model_tools/convert_rt_semamba_checkpoint.py` 完成。
+
+本软件基于 MP-SENet（https://github.com/yxlu-0102/MP-SENet）和 CMGAN（https://github.com/ruizhecao96/CMGAN），二者均采用 MIT license。

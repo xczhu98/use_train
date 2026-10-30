@@ -1,0 +1,197 @@
+# ======================================================================
+# TSE 训练配置：TSE_Modular + textual（DAE-TSE keyword cue）
+# 数据管线：offline_tse（LibriMix-keywords 预生成 manifest，无在线仿真随机性）
+# 模型采样率 16 kHz，STFT 512/128 → 帧移 8 ms。
+# ======================================================================
+# Params: 40.470500M（separator 21.402400M + textual frontend 19.068100M）；
+# MACs: not measured；FLOPs: not measured（本配置尚未做算子统计）。
+# 复杂度口径：如需测量应显式声明 B/时长/采样率/F/T，且仅统计模型前向，
+#   图外 STFT/iSTFT 不计；此处不编造数值。
+# RTF: not measured（本机未做端到端实时率测量）。
+# Trainer MOS boundary: Trainer 不负责 MOS；本配置不包含主观听测，DNSMOS 代理
+#   也不等价于主观评估；离线代理指标统一在 evaluate/ 流水线运行。
+# 与其他变体的关键区别：唯一使用 textual cue（phoneme id 关键词条件）的配置，
+#   cue 来自 mixture 波形 + KCE 关键词，不需要 enrollment 音频索引；
+#   speaker cue 变体见 tse_modular_speaker_tfmap_emb_*.yaml。
+# 推荐入口：python train.py -C configs/tse/textual/tse_modular_textual_keywords.yaml
+# 实现路径：模型 tasks/tse/models/discriminative/tse_modular.py + 组合解析
+#   tasks/tse/models/modular_spec.py + textual frontend
+#   tasks/tse/models/modules/textual/；数据 tasks/tse/data/offline_dataset.py；
+#   Trainer tasks/tse/trainer/tse_trainer.py。
+# ======================================================================
+# 数据：本机已整理的 WeSep v0.1 LibriMix-keywords（Libri2Mix mixture + 关键词索引）。
+#   samples.jsonl / cues.yaml 的 textual 资源为 json/dae_keyword_phoneme，
+#   scope=speaker、policy=fixed、key=mix_spk_id、selection=random(word_range)。
+#   目标监督取 raw.list 的 src[spk]，因此本配置不需要 enrollment 音频索引。
+#
+# 模型：TSE_Modular（backbone=bsrnn + textual cue）。
+#   textual cue 消费 mixture 波形（16 kHz）与 phoneme id，由 TextualFrontend(KCE)
+#   计算句级条件并按 presence 融合；STFT/iSTFT 仍由 runtime 统一管理。
+#
+# 必要外部资源：官方 DAE-TSE KCE backbone 权重（epoch_149.pt 及同目录
+#   model.yaml/data.yaml），已存放在本机 LibriMix-keywords/resources/kce/。
+# ======================================================================
+
+# meta：复现性与精度开关；与 tse offline 兄弟配置对齐（未声明的 amp_dtype/cudnn_benchmark 取 runtime 默认 float16/true）
+meta:
+  # 全局随机种子（int，无量纲）；固定 42 保证数据顺序与初始化可复现
+  seed: 42
+  # 是否强制 cudnn 确定性算法（bool）；false = 允许 autotune 选最快 kernel
+  deterministic: false
+  # 是否启用 AMP 自动混合精度（bool）；false = 全 fp32，KCE 前向保持与官方权重一致的数值条件
+  use_amp: false
+  # 是否维护 EMA 影子权重（bool）；false = 只保存原始权重
+  use_ema: false
+
+# stft：分析综合窗；win_length 必须等于 n_fft（BandSplit 子带表据此推导）
+stft:
+  # FFT 点数（samples，正整数偶数）；决定 F=n_fft/2+1=257
+  n_fft: 512
+  hop_length: 128             # 帧移（采样点）；128 @16 kHz = 8 ms
+  # 分析窗长（samples）；必须等于 stft.n_fft（BandSplit 子带表据此推导）
+  win_length: 512
+  # 窗函数枚举：hann；center 未声明取 runtime 默认 True
+  window: hann
+
+# model：TSE_Modular（backbone=bsrnn + textual cue：DAE-TSE KCE 关键词条件）
+model:
+  # 模型注册名；TSE_Modular 由 modular_spec 解析组合，未实现组合在构造期抛 NotImplementedError
+  type: TSE_Modular
+  # 模型构造参数；只接受 backbone / separator / cues / sample_rate 等显式形参
+  args:
+    backbone: bsrnn          # 分离主干；当前仅 bsrnn 组合实现
+    # bsrnn 主干参数；未知键被 _SEPARATOR_KEYS['bsrnn'] 拒绝（modular_spec.py:105）
+    separator:
+      feature_dim: 128       # BandSplit 子带特征维（无量纲）
+      num_repeat: 6          # BSNet 重复次数（无量纲）；multi_fuse 按该数量逐块注入
+      causal: false          # false = 非因果；true = 因果（时间 LSTM 单向）
+    # cue 装配表；key 为 frontend 名（speaker/spatial/visual/textual），未列出的 cue 不装配
+    cues:
+      # textual cue：消费 mixture 波形 + phoneme id 的 KCE 关键词条件
+      textual:
+        frontend: textual    # textual frontend（消费 mixture 波形 + phoneme id）
+        representation: phoneme_ids  # 唯一合法取值：phoneme_ids
+        # textual cue 的特征开关表
+        features:
+          # DAE-TSE KCE backbone；官方权重 + FiLM 融合
+          dae_kce:
+            # 官方 DAE-TSE KCE backbone 权重（epoch_149.pt），见文件头必要外部资源说明
+            checkpoint: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/wesep/datasets/LibriMix-keywords/resources/kce/epoch_149.pt"
+            fusion: FiLM         # concat | additive | multiply | FiLM
+            multi_fuse: true     # 每个 separator block 独立融合 KCE 条件
+            # KCE 条件到 separator 特征维的投影 adapter
+            adapter:
+              output_dim: 128    # adapter 输出维（无量纲）；须与 separator.feature_dim 一致
+              num_layers: 1      # adapter 层数（无量纲）
+    sample_rate: 16000           # 采样率（Hz）；textual 组合要求 16000
+
+# data：offline_tse 读取 LibriMix-keywords manifest（textual cue，不需要 enrollment 音频索引）
+data:
+  # 数据模式路由键（必填）；offline_tse → TSEOfflineDataset
+  mode: offline_tse
+  # 数据采样率（Hz）；须与 model.args.sample_rate 一致
+  sample_rate: 16000
+  # 训练 split 的 manifest 与 cue 合同键（offline_tse 导入合同各项必填；textual cue 无 enroll_policy）
+  train:
+    samples_jsonl: "data/tse/spk/wesep/datasets/LibriMix-keywords/data/clean/train-100/samples.jsonl"  # 训练样本清单
+    cues_yaml: "data/tse/spk/wesep/datasets/LibriMix-keywords/data/clean/train-100/cues.yaml"  # textual cue 定义（json/dae_keyword_phoneme）
+    manifest_format: jsonl        # jsonl | path_list；runtime 不按后缀猜格式
+    path_base: manifest_relative  # manifest_relative | recipe_root：清单内路径的解析基准
+    target_selection: all         # all | first | 样本→说话人映射；本配置监督全部目标
+    mix_variant: default          # 取 manifest mix 段中的变体名
+    cue_schema: wesep_v0_1        # none | realtse_raw | wesep_v0_1
+    enabled_cues: [textual]       # 启用的 cue：textual（phoneme id 关键词条件）
+    max_duration_seconds: 3.0     # 片段长度上限（s）
+  # 验证 split：合同键与 train 相同，仅资源清单不同
+  validation:
+    samples_jsonl: "data/tse/spk/wesep/datasets/LibriMix-keywords/data/clean/dev/samples.jsonl"  # dev split 样本清单
+    # textual cue 定义清单（dev）
+    cues_yaml: "data/tse/spk/wesep/datasets/LibriMix-keywords/data/clean/dev/cues.yaml"
+    # manifest 解析格式（jsonl | path_list）
+    manifest_format: jsonl
+    # 清单内路径解析基准（manifest_relative | recipe_root）
+    path_base: manifest_relative
+    # 目标选择策略（all | first）；与 train 一致，监督全部目标
+    target_selection: all
+    # 取 manifest mix 段中的变体名
+    mix_variant: default
+    # cue schema 枚举（none | realtse_raw | wesep_v0_1）
+    cue_schema: wesep_v0_1
+    # 启用的 cue 列表；dev 同样只启用 textual
+    enabled_cues: [textual]
+    # 片段长度上限（s）；与 train 一致
+    max_duration_seconds: 3.0
+  # DataLoader 配置；DDP 下每个 rank 各建一份 train/val loader
+  dataloader:
+    # 训练 batch 大小（样本数）；textual 组合含 KCE 前向，显存占用更高故取 8
+    batch_size: 8
+    # 训练 loader worker 数（进程数）
+    num_workers: 4
+    # 是否 pin 到页锁定内存（bool）
+    pin_memory: true
+
+# loss：SI-SNR 监督（weight 1.0）
+loss:
+  # 复合损失注册名；CompositeLoss 顶层只接受 type / components / strict
+  type: CompositeLoss
+  # 是否把指标缺失当致命错误（bool）；false = 容错继续
+  strict: false
+  # 损失分量列表；每项只接受 type / weight / args / name / enable_ss_undesired_energy
+  components:
+    # 尺度不变信噪比；本配置只有这一个分量
+    - type: SISNRLoss
+      # 分量权重（无量纲，>0）
+      weight: 1.0
+      # 日志与 history 中显示的分量名
+      name: SI-SNR
+
+# optimizer：Adam，lr 1e-3 / weight_decay 1e-4
+optimizer:
+  # 优化器注册名；Adam 顶层只接受 type / args
+  type: Adam
+  # 优化器超参；lr/weight_decay 均无量纲
+  args:
+    # 学习率（无量纲）
+    lr: 0.001
+    # 权重衰减系数（无量纲）
+    weight_decay: 0.0001
+
+# scheduler：逐 optimizer-step ExponentialDecrease，1e-3 → 2.5e-5
+scheduler:
+  # 调度器注册名；ExponentialDecrease 按 epoch 指数衰减（trainer.lr_schedule_per_step=false）
+  type: ExponentialDecrease
+  # 调度器超参；学习率单位无量纲
+  args:
+    # 初始学习率（无量纲）；应与 optimizer.args.lr 一致
+    initial_lr: 0.001
+    # 终止学习率（无量纲）
+    final_lr: 0.000025
+    total_steps: auto             # auto = 按总 optimizer step 数推导
+
+# trainer：150 epochs，保留 top-10 checkpoint；有意关闭在线指标——未声明 trainer.val_metrics（不做 SI-SDR/ESTOI 在线计算），指标与 MOS 走 evaluate/ 离线流水线
+trainer:
+  # Trainer 注册名；TSETrainer 由 tasks/tse/trainer/entry.py 路由
+  type: TSETrainer
+  exp_path: exp/tse/textual/tse_modular_textual_keywords  # 实验输出目录
+  epochs: 150                     # 训练总 epoch 数
+  # 梯度裁剪阈值（无量纲 L2 范数）
+  gradient_clip_value: 5.0
+  # 梯度累积步数（无量纲，>=1）；1 = 每 batch 一次 optimizer step（与 runtime 默认一致，显式写出）
+  accumulation_steps: 1
+  # 调度器推进粒度（bool）；false = 按 epoch 推进 ExponentialDecrease，非 optimizer step
+  lr_schedule_per_step: false
+  # 训练日志打印间隔（optimizer step 数）
+  log_interval: 100
+  # 单次 val 最大 forward batch 数（每 rank）；0 = 不限制
+  max_val_batches: 0
+  validation_epoch_interval: 1    # 每 N 个 epoch 末验证；0 = 关闭
+  # 步级验证间隔（optimizer step）；0 = 关闭步级验证
+  validation_steps_interval: 0
+  save_top_k: 10                  # 保留的最优 checkpoint 数量
+  save_checkpoint_interval: 10    # 每 N 个 epoch 存一次 checkpoint
+
+# distributed：DDP 后端
+distributed:
+  # 通信后端枚举：nccl | gloo；nccl 要求 CUDA 可用
+  backend: nccl
+  find_unused_parameters: false   # TSETrainer 按 cue 配置自动推导，显式配置优先

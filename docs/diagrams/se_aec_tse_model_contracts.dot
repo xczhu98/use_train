@@ -1,0 +1,180 @@
+digraph ModelContracts {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="white",
+    size="16,9!",
+    ratio=fill,
+    pad="0.20",
+    margin="0.04",
+    nodesep="0.42",
+    ranksep="0.50",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Noto Sans CJK SC",
+    fontsize=25,
+    fontcolor="#12304A",
+    label="SE / AEC / TSE canonical 模型接口与结构总览",
+    labelloc=t,
+    labeljust=l
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=13,
+    color="#B8C6D1",
+    fontcolor="#183247",
+    penwidth=1.6,
+    margin="0.18,0.12"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    color="#597084",
+    fontcolor="#3F5567",
+    penwidth=1.7,
+    arrowsize=0.78
+  ];
+
+  shared [
+    width=10.8,
+    fillcolor="#123B63",
+    color="#123B63",
+    fontcolor="white",
+    label=<<B>共享控制面 · 全局 MODEL_REGISTRY</B><BR/><FONT POINT-SIZE="11">core.utils.registry：name → class　　|　　SE / AEC / TSE 各自 task lazy map：name → module　　|　　set_lazy_map → ensure_registered → 首次按名 import</FONT>>
+  ];
+
+  subgraph cluster_se {
+    label="SE · 青绿泳道";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#087D72";
+    color="#8FD5CC";
+    fillcolor="#F1FBF9";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=16;
+
+    se_owner [
+      width=3.3,
+      fillcolor="#DDF6F1",
+      color="#22A699",
+      label=<<B>Framework transform ownership</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="11">top-level stft 存在：Framework 管 STFT / iSTFT<BR/>top-level stft 缺省：waveform 直达模型<BR/><B>结论：并非所有 SE 都是谱域</B></FONT>>
+    ];
+    se_standard [
+      width=3.0,
+      fillcolor="#C9F0E9",
+      color="#159486",
+      label=<<B>SE 标准契约 · BaseSEModel</B><BR/><FONT FACE="monospace">noisy_spec → enhanced_spec</FONT><BR/><FONT POINT-SIZE="11">forward(noisy_spec, lengths, *, fs)</FONT>>
+    ];
+    se_special [
+      width=4.4,
+      fillcolor="#FFF4DB",
+      color="#D89718",
+      label=<<B>显式 Trainer 特例</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="10">waveform-native：PASE / StuPASE / UniPASE / GAP-URGENet<BR/>dual-input scalar loss：DeWavLMDistillModel / StuPASEFlowTrainModel<BR/>GAN：generator + discriminator，多优化器 Trainer<BR/>MeanFlowSE：双谱训练 objective / 谱域推理</FONT>>
+    ];
+
+    { rank=same; se_owner; se_standard; se_special; }
+    se_owner -> se_standard [color="#159486"];
+    se_owner -> se_special [color="#D89718", style=dashed];
+  }
+
+  subgraph cluster_aec {
+    label="AEC · 洋红 / 珊瑚泳道 · AEC input frontend（STFT 前端由 Framework / Trainer 持有）";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#B02A63";
+    color="#E89AB7";
+    fillcolor="#FFF5F8";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=16;
+
+    aec_wave [
+      width=2.2,
+      fillcolor="#FFE3EB",
+      color="#D94D79",
+      label=<<B>波形输入</B><BR/><FONT FACE="monospace">mic + farend</FONT>>
+    ];
+    aec_frontend [
+      width=2.7,
+      fillcolor="#FFD5E2",
+      color="#D94D79",
+      label=<<B>canonical frontend</B><BR/><FONT POINT-SIZE="11">optional Streaming GCC-PHAT<BR/>→ optional LinearAEC</FONT>>
+    ];
+    aec_routing [
+      width=3.0,
+      fillcolor="#FFC8D9",
+      color="#C9366A",
+      label=<<B>input routing · STFT 前选择</B><BR ALIGN="LEFT"/><FONT FACE="monospace" POINT-SIZE="10">mic_farend</FONT><FONT POINT-SIZE="10">：mic + aligned farend<BR/></FONT><FONT FACE="monospace" POINT-SIZE="10">error_farend</FONT><FONT POINT-SIZE="10">：error-as-mic + farend<BR/></FONT><FONT FACE="monospace" POINT-SIZE="10">mic_farend_error</FONT><FONT POINT-SIZE="10">：mic + farend + error / mask</FONT>>
+    ];
+    aec_model [
+      width=4.1,
+      fillcolor="#F7D7E5",
+      color="#B92D64",
+      label=<<B>Framework STFT → dict model → iSTFT</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="10">至少输入：mic_spectra / farend_spectra<BR/>可选输入：error_spectra / error_mask<BR/>输出：nearend_estimate_spectra<BR/>state_probs：仅 DBGNet state head<BR/><B>五模型</B>：CAGCRN · DBGNet · DeepVQE<BR/>LocalVQE · UltraDPCAEC</FONT>>
+    ];
+
+    { rank=same; aec_wave; aec_frontend; aec_routing; aec_model; }
+    aec_wave -> aec_frontend [color="#D94D79"];
+    aec_frontend -> aec_routing [color="#C9366A"];
+    aec_routing -> aec_model [color="#B92D64"];
+  }
+
+  subgraph cluster_tse {
+    label="TSE · 紫色泳道 · TSE_BSRNN_SPK（dict 谱进谱出）";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#6C3FB1";
+    color="#BEA6E8";
+    fillcolor="#F8F5FE";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=16;
+
+    tse_io [
+      width=2.9,
+      fillcolor="#ECE4FA",
+      color="#845CC6",
+      label=<<B>model_io · Framework 派生</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="10">mixture → mix_spectra<BR/>enroll → enroll_spectra + enroll_wav<BR/>optional frozen encoder → spk_embedding</FONT>>
+    ];
+    tse_mode [
+      width=3.5,
+      fillcolor="#E2D6F6",
+      color="#7A4EC0",
+      label=<<B>joint_training 语义</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="10"><B>true</B>：模型内 encoder；context / spkemb 读 enroll_wav<BR/><B>false</B>：模型内无 encoder；外部 frozen encoder 仅供 spkemb<BR/>context 禁止；listen / usef / tfmap 仍可用</FONT>>
+    ];
+    tse_cues [
+      width=4.2,
+      fillcolor="#D8C9F1",
+      color="#7042B5",
+      label=<<B>cue → separator 固定顺序</B><BR/><FONT POINT-SIZE="10">listen → usef → tfmap → BandSplit → SubbandNorm<BR/>→ context → spkemb → BSRNN separator → complex mask<BR/><B>enabled cues 非互斥，可组合启用</B></FONT>>
+    ];
+    tse_output [
+      width=2.4,
+      fillcolor="#ECE4FA",
+      color="#845CC6",
+      label=<<B>TSE 输出边界</B><BR/><FONT FACE="monospace">target_estimate_spectra</FONT><BR/><FONT POINT-SIZE="10">→ Framework iSTFT<BR/>→ target waveform</FONT>>
+    ];
+
+    { rank=same; tse_io; tse_mode; tse_cues; tse_output; }
+    tse_io -> tse_mode [color="#845CC6"];
+    tse_mode -> tse_cues [color="#7042B5"];
+    tse_cues -> tse_output [color="#7042B5"];
+  }
+
+  shared -> se_owner [color="#159486", style=dotted, label="SE lazy build"];
+  shared -> aec_wave [color="#C9366A", style=dotted, label="AEC lazy build", constraint=false];
+  shared -> tse_io [color="#7042B5", style=dotted, label="TSE lazy build", constraint=false];
+
+  se_owner -> aec_wave [style=invis, weight=100];
+  aec_wave -> tse_io [style=invis, weight=100];
+}

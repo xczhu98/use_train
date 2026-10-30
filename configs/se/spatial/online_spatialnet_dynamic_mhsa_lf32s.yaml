@@ -1,0 +1,369 @@
+# ============================================================
+# OnlineSpatialNet（mhsa 分支）SE 长片段训练（LF，32 s）配方
+# ------------------------------------------------------------
+# 论文：Changsheng Quan, Xiaofei Li. "Multichannel Long-Term Streaming Neural Speech
+#   Enhancement for Static and Moving Speakers", IEEE SPL 2024 的 ST+LF 训练策略（Fig. 2）：
+#   先用 4 s 短片段训练（ST，见同目录 online_spatialnet_dynamic_mhsa.yaml），再用 32 s
+#   长片段训练（本文件）；论文用 ST+LF 修复长序列的 length extrapolation collapse。
+# 论文口径：LF 沿用 ST 的优化器与衰减（Adam 1e-3、0.99^epoch）；论文正文写 LF(32s,100e)，
+#   同段与 Fig. 2 图例写 LF(32s,5e)（论文内部歧义）。本文件按图例取 5 epochs，需要正文口径时
+#   把 trainer.epochs 改为 100，并用独立 exp_path 双轨记录，不能把两个口径混成一次实验。
+# 启动方式：从头训练，不加载 ST checkpoint：
+#   python train.py --config configs/se/spatial/online_spatialnet_dynamic_mhsa_lf32s.yaml
+# 与 4 s 基准配置相比，本文件显式调整：
+#   1) data.train.max_duration_seconds 4 → 32（论文 LF 片段长度）；
+#   2) dataloader.batch_size 4 → 2（32 s 序列激活约为 4 s 的 8 倍；论文未给 LF batch，按显存调整）；
+#   3) trainer.epochs 100 → 5（Fig. 2 图例口径，见上）、exp_path 加 _lf32s 后缀；
+#   4) model.args.gradient_checkpointing: true（逐层 activation recomputation）。32 s 训练步的
+#      激活峰值实测 29.8 GB → 5.8 GB（本机 CPU、batch 1、F=129/C=6；计算 +55%），
+#      是 32 s 片段可训练的关键开关；不需要省显存时置 false 可换回速度。
+#   validation 继承 32 s 画布；论文的指标口径是 64 s 流按 4 s segment / 1 s hop 计算，
+#   需要该口径时用 evaluate/ 离线评估，或把验证画布改回 4 s。
+# Params: 1190898（1.191 M；与上游 NBSS OnlineSpatialNet mhsa(251) 逐位一致，论文 1.2 M 为四舍五入）
+# MACs: 6.13G @1s/8kHz（THOP，partial/unverified；不计 STFT/iSTFT 与 SDPA 注意力）
+# FLOPs: 23.08 G/s（4 s/8 kHz/6 ch 逐帧流式 FlopCounterMode 口径；32 s 片段逐帧成本不变，
+#   整段序列成本随长度线性增长）
+# RTF: not measured（未在本机实测端到端实时因子；无量纲 realtime factor）
+# Trainer MOS boundary: Trainer 只计算侵入式客观指标；DNSMOS/NISQA 等须经 evaluate 离线计算。
+# 实现路径：tasks/se/models/discriminative/online_spatialnet.py（OnlineSpatialNet_SE，mhsa 分支）
+# ============================================================
+# 性能开关：默认 FP32；可选键 meta.use_amp / meta.amp_dtype / meta.cudnn_benchmark / meta.deterministic /
+#   meta.compile_model / meta.gradient_checkpointing、trainer.accumulation_steps，均需在目标硬件与
+#   PyTorch 版本上实测后再启用。32 s LF 阶段由 model.args.gradient_checkpointing 逐层重计算激活换取显存，计算量上升。
+meta:
+  seed: 42                             # 全局随机种子；Layer A–F 仿真、dataloader shuffle 与 validation 采样都由它派生
+  use_amp: false                       # 混合精度总开关；FP32 基准，关闭以保持与论文数值口径可比
+  use_ema: false                       # 权重 EMA 总开关；论文未使用，关闭（启用会额外持有一份 shadow 参数）
+  deterministic: false                 # cudnn 确定性模式；false=允许非确定性 kernel 换吞吐，不保证逐 bit 复现
+# 顶层 STFT 合同：trainer 统一管理 STFT/iSTFT，模型内部不得重复引入。
+stft:
+  n_fft: 256                           # FFT 点数；8 kHz 下 32 ms 窗，频点数 F=n_fft/2+1=129
+  hop_length: 128                      # 帧移，单位 samples；8 kHz 下 16 ms，决定序列帧数
+  win_length: 256                      # 窗长，单位 samples；与 n_fft 相等（无补零）
+  window: hann                         # 窗函数；Hanning，与上游 NBSS 口径一致
+  center: true                         # 是否补零对齐（torch.stft center 语义）；框架默认 true，显式写出便于复现
+# 模型：注册名 + 构造参数；构造参数逐项透传 __init__，未知键抛 TypeError。
+model:
+  type: OnlineSpatialNet_SE                   # 模型注册名；实现 tasks/se/models/discriminative/online_spatialnet.py
+  args:                                # 构造参数；与顶层 stft 冲突时由 core/models/build.py 拒绝
+    n_fft: 256                         # 必须等于顶层 stft.n_fft；冲突由 core/models/build.py 拒绝
+    n_channel: 6             # 输入麦克风通道数 C；必须等于 simulation_cfg.spatial.geometry.profile 的通道数
+    ref_channel: 0                     # 输出参考通道索引；与 spatial.geometry.reference_mic 同口径
+    num_layers: 8                      # 窄带 backbone 层数（论文口径 8）
+    dim_hidden: 96                     # 隐藏维（论文口径 96）
+    dim_ffn: 192                       # FFN 中间维
+    dim_squeeze: 8                     # squeeze-excitation 压缩维
+    num_heads: 4                       # 注意力头数；仅 mhsa 分支消费，mamba/ret 分支保留但不使用
+    attention: mhsa(251)               # 窄带时序模块；mhsa(251)=论文 oSpatialNet-MSA（251 帧≈4 s@8 kHz）
+    kernel_size: [5, 3]                # 窄带/宽带卷积核尺寸 [窄带, 宽带]
+    conv_groups: [8, 8]                # 对应卷积的分组数
+    full_share: 0                      # full-band 模块跨层共享起点层索引；层 full_share 起所有层共享 layers[full_share].full；0=全部共享（上游/论文口径），num_layers-1=不共享
+    gradient_checkpointing: true         # 逐层 activation recomputation；32 s 片段可训练的关键开关（省显存、计算 +55%）
+# 数据：路由 mode + 采样率 + train/validation split + dataloader。
+data:
+  mode: dynamic                        # 数据路由字段；dynamic=训练时在线仿真 Layer A–F
+  sample_rate: 8000                    # 采样率，单位 Hz；须与 stft 口径和 SCP 资源一致
+  train:                               # 训练 split：资源路径 + Dataset lifecycle + Layer A–F 仿真
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp  # 训练 clean speech SCP（四列 uid fs length path）
+    noise_scp: data/shared/noise/filter/v2/train_noise_sources.scp   # Layer C-1 加性噪声 SCP
+    windnoise_scp: data/shared/noise/filter/v2/train_wind_noise_sources.scp   # Layer C-2 风噪 SCP；sidechain 关闭时不消费，仅登记资源
+    # 背景音乐资源（canonical music_ratio，默认 0.0，独立于 Layer C 编号）；本配方未启用，保留键名记录。
+    # music_scp: data/ss/background/music/train.scp
+    # data.train.simulation_cfg.acoustic.rir.backend=online 时不读取 RIR SCP，由在线 provider 生成（含 moving scene）。
+    rir_scp:                           # 空占位：backend=online 时不读 RIR SCP；offline 才要求提供
+    filter_min_duration: 2.0            # 源语音最短时长，单位 s；短于此值的条目被过滤
+    filter_max_duration: 30.0           # 源语音最长时长，单位 s；长于此值的条目被过滤
+    # Dataset lifecycle：固定画布长度 max_duration_seconds，短源按 repeat_to_max_duration 补齐。
+    max_duration_seconds: 32             # 训练片段长度，单位 s；决定 STFT 帧数与显存
+    repeat_to_max_duration: true        # 短源补齐到固定画布；false 时按实际长度训练
+    repeat_tile_silence_gap: true       # 补齐时在 tile 间插入静音 gap，避免拼接处能量突变
+    repeat_tile_silence_gap_range: [0.02, 0.8]   # tile 间 gap 范围，单位 s
+    simulation_cfg:                     # Layer A–F 仿真参数；分层配置不能与 flat 键混用
+      # ------------------------------------------------------------------
+      # [Layer A：clean speech 预处理；只改 clean/target，不改 observation 通道]
+      # ------------------------------------------------------------------
+      speech:
+        splice:                         # A-1 短句拼接；固定画布只用单句片段，本配方关闭
+          enabled: false                # A-1 拼接总开关；false=不做多句拼接
+          seconds: 10.0                 # 拼接目标时长，单位 s；enabled=false 时不生效
+          seconds_range: [5.0, 10.0]    # 随机目标时长范围，单位 s；设置后覆盖 splice.seconds
+          gap_range: [0.02, 1.0]        # 拼接片段间静音 gap 范围，单位 s
+          max_repeat_times: 4           # 单句重复次数上限；0=不限；enabled=false 时不生效
+          equal_volume: true            # 片段间等音量对齐；enabled=false 时不生效
+          equal_volume_range: [-6, 6]   # 等音量相对增益范围，单位 dB
+        random_start: false             # 超长语音截取起点；false=从头截取，true=随机起点
+        # A-2 变速/变调/EQ/额外静音：空间基准全部关闭，保持与论文 clean 口径一致。
+        speed:
+          prob: 0.0                     # 逐样本 Bernoulli 语速扰动概率；0.0=关闭
+          rate_range: [0.9, 1.1]        # 语速倍率范围，无量纲
+        # A-2 变调分支；空间基准关闭。
+        pitch:
+          prob: 0.0                     # 逐样本 Bernoulli 变调概率；0.0=关闭
+          semitone_range: [-1.5, 1.5]   # 变调范围，单位 semitone（半音）
+        # A-2 EQ 分支；空间基准关闭。
+        eq:
+          prob: 0.0                     # 逐样本 Bernoulli EQ 概率；0.0=关闭
+          db_range: [-5, 5]             # EQ 增益范围，单位 dB
+        extra_space_prob: 0.0           # 额外插入静音的 Bernoulli 概率；0.0=关闭（静音统一由 A-3 管理）
+        # A-3 silence pad：bimodal 口径（短/长两档静音按画布时长布局）；单源 timeline 由 gap/留白控制，prob_timeline 默认 0.0。
+        silence:
+          prob: 0.5                     # 逐样本 Bernoulli 静音 pad 概率
+          mode: bimodal                 # uniform | bimodal；bimodal=短/长两档分别抽样
+          short_ratio: 0.30             # bimodal 下抽中 short_range 的概率，无量纲
+          short_range: [0.2, 0.8]       # 短档静音时长范围，单位 s
+          long_range: [1.0, 2.0]        # 长档静音时长范围，单位 s
+          position: scene_aware         # 静音位置：random | front | back | center | turn_boundary | scene_aware
+          beta_a: 0.6                   # scene_aware 位置 Beta 分布 α
+          beta_b: 0.4                   # scene_aware 位置 Beta 分布 β
+        # A-4 高通预处理分支。
+        high_pass:
+          enabled: true                 # A-4 高通预处理开关；约 70 Hz filtfilt，去除低频漂移
+      # ------------------------------------------------------------------
+      # [Layer B：场景角色分支，逐样本 multinomial 抽样]
+      # ------------------------------------------------------------------
+      # 三路互斥：和必须=1（tasks/se/data/dynamic_dataset.py:286-291 fail-fast，abs_tol=1e-8）；三路不共现。
+      # 逐样本按 multinomial CDF 抽样；此处为 nominal 概率，realized 命中率随样本数波动。
+      # canonical prob_timeline（默认 0.0）与 timeline_mode_weights（默认五模式各 0.2）本配方未声明、不启用。
+      scene:
+        prob_target_only: 0.08          # 仅目标分支：noisy=clean_target，仍走 Layer C-0 与 D/E/F
+        prob_noise_only: 0.02           # 仅噪声分支：clean=0，noisy=Layer C-1/C-2 的噪声分量
+        prob_target_noise: 0.90         # 目标+噪声分支：noisy=完整 C-0~C-2 混合
+      # ------------------------------------------------------------------
+      # [Layer C：声学混合]
+      # ------------------------------------------------------------------
+      # 在线房间几何（canonical acoustic.gpurir_*）与 source budget/device/timeout/cache 等稳定服务默认值由 core 提供
+      # （core/data/simulation/rir_config.py），不在 YAML 重复展开。
+      acoustic:
+        # C-0b 目标电平归一化分支（canonical source_volume_*）。
+        target:
+          # C-0b post-RIR target 电平归一化：以 early target 标定 dBFS 后同步施加到 full/early/target。
+          volume:
+            enabled: true               # C-0b 目标电平归一化总开关；噪声/回声在此步骤之后混入
+            db_range: [-40, 0]          # 目标电平范围，单位 dBFS（use_rms=true 时为 RMS）
+            use_rms: true               # true=按 RMS 测电平；false=按 peak
+            distribution: uniform       # uniform | beta；beta 用 beta_a/beta_b 塑形
+            beta_a: 2.0                 # Beta 分布 α；distribution=beta 时生效
+            beta_b: 2.0                 # Beta 分布 β；distribution=beta 时生效
+        # ------------------------------------------------------------------
+        # [Layer C-0：RIR backend / 空间阵列 / static-moving policy]
+        # ------------------------------------------------------------------
+        rir:
+          backend: online               # offline | online；online 时同组 source 共用 room/mic，且不读 RIR SCP
+          reverberation_prob: 1.0       # canonical prob_reverberation：混响 Bernoulli；空间 source image 强制 1.0
+          moving_prob: 0.5              # canonical prob_moving_rir：在线 moving RIR 的逐样本 Bernoulli；0=全静态
+          source_speed_mps_range: [0.015, 0.05]   # canonical moving_source_speed_range_mps：房间内声源速度，单位 m/s；32 s 画布按 4 s 基准位移口径等比缩放（×1/8，位移上限 ≈1.6 m 可落入 3–8 m 房间）；独立于 Layer A 语速扰动
+          # 监督 target 口径：early（默认，直达声+早期反射）/ dry（无混响）/ rts（按 RT60 缩短 full RIR；需 spatial.enabled=true 且显式给出 rts_target_rt60_sec 与 rts_tail_after_max_sec）
+          target_type: early            # 仅改变监督 target，不改变声学混合几何或 SNR 参考
+          reuse: false                  # canonical reuse_rir：是否跨样本复用同一 RIR；false=逐样本重抽
+          normalize: true               # canonical rir_normalize：RIR 卷积前峰值归一化，避免增益漂移
+          early_window_sec: 0.05        # canonical early_rir_sec：early-RIR 窗长，单位 s
+        # ------------------------------------------------------------------
+        # [Layer C-1：加性噪声]
+        # ------------------------------------------------------------------
+        background:
+          noise_mix_prob: 0.2           # 逐样本 Bernoulli：是否混入噪声
+          noise_mix_ratio_range: [0.1, 1.0]   # 噪声混合比例范围，无量纲
+          snr_low: -5                   # 背景 SNR 下限，单位 dB
+          snr_high: 20                  # 背景 SNR 上限，单位 dB
+          reuse_noise: false            # 是否跨样本复用同一噪声；false=逐样本重抽
+          # canonical music_ratio 默认 0.0（core/data/simulation_configs.py:294）；本配方未启用背景音乐，故不声明。
+          # ------------------------------------------------------------------
+          # [Layer C-2：风噪 sidechain（非加性 compressor 路径）]
+          # ------------------------------------------------------------------
+          prob_wind_noise_sidechain: 0.0   # 非加性 sidechain Bernoulli；空间路径不支持，仅 mono simulation path 启用
+          wind_noise_config:            # C-2 风噪 compressor 参数组（canonical wind_noise_config）
+            threshold: [0.1, 0.3]       # 压缩阈值范围，无量纲（归一化幅值）
+            ratio: [1, 20]              # 压缩比范围，无量纲
+            attack: [5, 100]            # attack 时间范围，单位 ms
+            release: [5, 100]           # release 时间范围，单位 ms
+            sc_gain: [0.8, 1.2]         # sidechain 增益范围，无量纲
+            clipping_threshold: [0.85, 1.0]   # 截幅阈值范围，无量纲（归一化幅值）
+            clipping_chance: 0.75       # 施加截幅的 Bernoulli 概率
+            wind_noise_snr_range: [-10, 15]   # 风噪 SNR 范围，单位 dB
+          # ------------------------------------------------------------------
+          # [Layer C-3：彩色噪声]
+          # ------------------------------------------------------------------
+          prob_colored_noise: 0.2       # 逐样本 Bernoulli：是否叠加彩色噪声；spatial 路径经 BackgroundSpec 链渲染为 [C,T] 背景（SE 已开放；其他任务 spatial 仍被 capability 门禁拒绝，见 capabilities.SPATIAL_FEATURE_CAPABILITIES），mono 路径直接叠加
+          colored_noise_snr_range: [10, 50]   # 彩色噪声 SNR 范围，单位 dB
+          colored_noise_types: [white, pink, brown, equalized]   # 噪声类型全集
+      # ------------------------------------------------------------------
+      # [Layer D：post-mix amplitude conditioning；固定执行 D-normalize → D-guard]
+      # ------------------------------------------------------------------
+      post_mix:
+        # ------------------------------------------------------------------
+        # [Layer D：post-mix amplitude conditioning；固定执行 D-normalize → D-guard]
+        # ------------------------------------------------------------------
+        normalization:
+          mode: "off"                   # off | joint；off=不做 peak 归一化，joint=同一 scale 同步到所有 source/target
+      # ------------------------------------------------------------------
+      # [Layer E：URGENT2026 信道退化，仅修改 observation]
+      # ------------------------------------------------------------------
+      # 增强按 weight 归一化后抽样，四项可组合；num_augmentations 只决定每样本施加的增强个数。
+      channel:
+        enabled: true                   # Layer E 总开关（canonical prob_channel_enabled）；true=按 num_augmentations 抽增强个数
+        augmentations_name: [bandwidth_limitation, clipping, codec, packet_loss]   # 可选增强全集；runtime 当前仅实现这四项
+        num_augmentations: {0: 0.25, 1: 0.40, 2: 0.20, 3: 0.15}   # 逐样本增强个数分布（multinomial CDF），和必须=1（core/data/simulation_configs.py:788 校验）
+        augmentations:                  # 各增强的参数；weight 归一化后作为该增强的选择概率
+          bandwidth_limitation: {weight: 1.0, resample_methods: random}   # 带宽限制：resample_methods=random 时从下采样族随机
+          clipping: {weight: 1.0, clipping_min_quantile: [0.0, 0.1], clipping_max_quantile: [0.9, 1.0]}   # 信道截幅：分位数区间，无量纲分位
+          codec:                        # 编解码：config 为编码候选列表
+            weight: 1.0                 # 选择权重（与其余三项归一化比较）
+            config:                     # 每项 format/encoder/qscale
+            - {format: mp3, encoder: null, qscale: [1, 10]}            # mp3 无 encoder 选择，qscale 为质量档范围
+            - {format: ogg, encoder: [vorbis, opus], qscale: [1, 10]}  # ogg 容器，编码器 vorbis/opus 二选一
+          packet_loss: {weight: 1.0, packet_duration_ms: 20, max_continuous_packet_loss: 10, packet_loss_rate: [0.05, 0.25]}   # 丢包：20 ms/包、最多连续丢 10 包、丢包率 5%–25%
+      # ------------------------------------------------------------------
+      # [Layer F：observation/device degradation，仅作用于 noisy；总开关关闭时 F-1~F-14 全部不执行]
+      # ------------------------------------------------------------------
+      # 各 prob_* 为独立 Bernoulli 门，可同时命中（与 Layer E 的个数分布不同）；F-1 内部 clip_variant_probs 才是互斥 selector。
+      device:
+        enabled: false                  # Layer F 唯一总开关（canonical noisy_post_mix_degradations_enabled）；主线未做 Layer F 实验，保持关闭
+        prob_clip: 0.0                  # F-1 逐样本 Bernoulli：是否施加设备截幅；0.0=关闭
+        clip_variants: [hard, soft, sigmoid, sox, pedal]   # 截幅变体全集；每项权重见 clip_variant_probs
+        clip_variant_probs: {hard: 0.4, soft: 0.2, sigmoid: 0.2, sox: 0.1, pedal: 0.1}   # 变体 selector 分布，和必须=1 且键集须等于 clip_variants（core/data/simulation_configs.py:732/756 校验）
+        clip_hard_portion: 0.5          # hard 分支内 selector 的 Bernoulli 概率；命中走 rate 截幅，否则走 threshold
+        clip_hard_on_rate: true         # true=hard 分支按 clip_rate_range 抽比例截幅；false=按 clip_threshold_db_range 抽 dB 阈值
+        clip_rate_range: [0.01, 0.2]    # clip_hard_on_rate=true 时的截幅样本比例范围，无量纲
+        clip_threshold_db_range: [-20, -1]   # hard 分支 dB 阈值范围，单位 dBFS
+        clip_soft_slope_range: [1.0, 5.0]    # soft 变体软限幅斜率范围，无量纲
+        clip_sigmoid_slope_range: [1.0, 5.0] # sigmoid 变体斜率范围，无量纲
+        clip_sox_threshold_db_range: [-15, -5]   # sox 变体阈值范围，单位 dBFS
+        clip_pedal_threshold_db_range: [-15, -5] # pedal 变体阈值范围，单位 dBFS
+        prob_post_eq: 0.0               # F-2 逐样本 Bernoulli：后置均衡；0.0=关闭
+        post_eq_db_range: [-5, 5]       # F-2 均衡增益范围，单位 dB
+        prob_lowpass: 0.0               # F-3 逐样本 Bernoulli：低通滤波；0.0=关闭
+        lowpass_cutoff_range: [1000, 8000]   # F-3 截止频率范围，单位 Hz
+        lowpass_order_range: [4, 20]    # F-3 滤波器阶数范围，无量纲
+        prob_band_reject: 0.0           # F-4 逐样本 Bernoulli：陷波；0.0=关闭
+        band_reject_center_freq_range: [100, 8000]   # F-4 中心频率范围，单位 Hz
+        band_reject_freq_bw_range: [20, 500]         # F-4 带宽范围，单位 Hz
+        band_reject_use_stft: true      # F-4 true=频域实现陷波；false=时域 biquad
+        band_reject_max_n: 2            # F-4 单样本最多陷波个数，正整数
+        prob_dc_offset: 0.0             # F-5 逐样本 Bernoulli：直流偏置；0.0=关闭
+        dc_offset_range: [0.001, 0.2]   # F-5 偏置幅度范围，无量纲（归一化幅值）
+        prob_drc: 0.0                   # F-6 逐样本 Bernoulli：动态范围压缩；0.0=关闭
+        drc_threshold_db_range: [-50, 0]     # F-6 压缩阈值范围，单位 dBFS
+        drc_ratio_range: [1, 20]        # F-6 压缩比范围，无量纲
+        drc_attack_ms_range: [0.5, 5.0] # F-6 attack 时间范围，单位 ms
+        drc_release_ms_range: [50, 1000]     # F-6 release 时间范围，单位 ms
+        prob_codecs: 0.0                # F-7 逐样本 Bernoulli：有损编码；0.0=关闭
+        codecs_types: [mp3, gsm, opus, aac]  # F-7 可选编码类型全集（core 白名单）
+        prob_bit_crush: 0.0             # F-8 逐样本 Bernoulli：位深压缩；0.0=关闭
+        bit_crush_range: [4, 16]        # F-8 目标位深范围，单位 bit
+        prob_spectral_holes: 0.0        # F-9 逐样本 Bernoulli：时频挖洞；0.0=关闭
+        spectral_holes_frame_length: 1024    # F-9 挖洞 STFT 帧长，单位 samples
+        spectral_holes_hop_length: 256       # F-9 挖洞 STFT 帧移，单位 samples；必须 <= frame_length
+        spectral_holes_num_range: [1, 20]    # F-9 单样本洞数量范围
+        spectral_holes_width_freq_range: [1, 5]   # F-9 洞的频域宽度范围，单位频点
+        spectral_holes_width_time_range: [1, 5]   # F-9 洞的时域宽度范围，单位帧
+        spectral_holes_cutoff_freq: 10000    # F-9 挖洞作用上限频率，单位 Hz
+        prob_webrtc_ns: 0.0             # F-10 逐样本 Bernoulli：WebRTC 噪声抑制；0.0=关闭
+        webrtc_ns_levels: [0, 1, 2, 3]  # F-10 抑制强度档位全集（0 最弱）
+        prob_webrtc_agc: 0.0            # F-11 逐样本 Bernoulli：WebRTC 自动增益；0.0=关闭
+        webrtc_agc_target_dbfs_range: [-31, -3]   # F-11 目标电平范围，单位 dBFS
+        prob_bass_boost: 0.0            # F-12 逐样本 Bernoulli：低频增强；0.0=关闭
+        bass_boost_highpass_cutoff_range: [500, 2000]   # F-12 高通截止范围，单位 Hz
+        bass_boost_attenuation_min_db: -25   # F-12 最低衰减，单位 dB
+        prob_spectral_leakage: 0.0      # F-13 逐样本 Bernoulli：谱泄漏；0.0=关闭
+        spectral_leakage_window_lengths: [1024, 2048, 4096]   # F-13 泄漏窗长候选，单位 samples
+        spectral_leakage_max_time_shift: 20   # F-13 最大时移，单位 samples
+        prob_loudness_perturb: 0.0      # F-14 逐样本 Bernoulli：响度扰动；0.0=关闭
+        loudness_factor_range: [0.1, 10.0]    # F-14 响度因子范围，无量纲
+        loudness_max_n_intervals: 5     # F-14 单样本最大分段数，正整数
+      # ------------------------------------------------------------------
+      # [spatial：多通道空间仿真合同；observation 需 source×microphone RIR]
+      # ------------------------------------------------------------------
+      spatial:
+        enabled: true                   # 空间仿真总开关；n_channel 与 geometry 通道数在此路径校验
+        # 阵列几何：profile 决定 C 与通道顺序。
+        geometry:
+          profile: chime3_6ch_rect_100x190mm   # canonical array_profile：阵列拓扑；决定 C 与通道顺序
+          reference_mic: 0              # canonical reference_channel：参考通道索引；与 model.args.ref_channel 同口径
+        # 扩散背景相干性模型。
+        coherence:
+          policy: habets_spherical      # canonical spatial_diffuse_coherence_model：扩散背景相干性模型
+        # 阵列增广：yaw 旋转与麦克风位置抖动。
+        augmentation:
+          array_yaw_prob: 1.0           # canonical prob_array_rotation：阵列 yaw 旋转 Bernoulli（runtime 默认 0.0）
+          array_yaw_deg_range: [0.0, 360.0]   # canonical array_rotation_z_deg_range：yaw 范围，单位 deg（0–360，含边界）；runtime 在 RIR 边界转为 rad
+          mic_jitter_prob: 0.0          # canonical prob_microphone_position_jitter：麦克风位置抖动 Bernoulli（runtime 默认 0.0）
+          mic_jitter_m_range: [0.0, 0.005]   # canonical microphone_position_jitter_m_range：抖动范围，单位 m
+        # 空间背景升级：点源 RIR 与 wind 加性背景。
+        background:
+          # [共享][多通道] 空间 C-1 背景升级为同 room 点源 RIR；要求 spatial.enabled=true 且 acoustic.rir.backend=online。
+          point_source_prob: 0.8        # canonical prob_point_source_background：逐样本 Bernoulli；0.8=80% 样本背景升级为同 room 点源 RIR（noise 有方位与混响），其余保持 diffuse（runtime 默认 0.0）；要求 spatial.enabled=true 且 rir.backend=online
+          # [共享][多通道] wind 加性背景；要求 spatial.enabled=true，与非加性 sidechain 独立。
+          wind_background_prob: 0.5     # canonical prob_wind_noise_background：逐样本 Bernoulli；0.5=50% 样本把 wind 资产渲染为可分解加性空间背景（渲染 policy 由本样本 point_source 门统一决定）；非加性 compressor sidechain 仍由 prob_wind_noise_sidechain 控制、本配方保持 0（runtime 默认 0.0）
+  validation:                           # 验证 split：动态仿真，与 train 共用 Layer A–F
+    mode: dynamic                       # 与 train 同为动态仿真（多通道 observation 需 source×microphone RIR）
+    inherit_simulation: true            # 继承 data.train 仿真；本段只有数据源键与 simulation_cfg 覆盖生效
+    speech_scp: data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp   # 验证 clean speech SCP
+    noise_scp: data/shared/noise/filter/v2/val_noise_sources.scp   # 验证加性噪声 SCP
+    windnoise_scp: data/shared/noise/filter/v2/val_wind_noise_sources.scp   # 验证风噪 SCP；sidechain 关闭时不消费
+    rir_scp:                            # 空占位：backend=online 时不读 RIR SCP
+    simulation_cfg:                     # 验证覆盖段：只写与 train 不同的键
+      # 验证 Layer A 覆盖。
+      speech:
+        # 验证 A-3 静音 pad 覆盖。
+        silence:
+          prob: 0.0                     # 验证集关闭静音 pad，保证指标口径干净
+      # 验证 Layer C 覆盖。
+      acoustic:
+        # 验证背景覆盖。
+        background:
+          prob_wind_noise_sidechain: 0.0   # 验证集关闭风噪 sidechain
+  dataloader:                           # 训练/验证 loader 共享参数
+    batch_size: 2                 # 训练 batch；4 s 画布取 4，32 s 画布取 2（长序列显存）
+    num_workers: 4                      # dataloader worker 数；0 时 persistent_workers 强制 false
+    prefetch_factor: 4                  # 每 worker 预取 batch 数；num_workers=0 时不传
+    pin_memory: true                    # 锁页内存；GPU 训练建议 true
+# 损失：CompositeLoss 组件与权重；构造时按 setdefault 注入顶层 stft 上下文。
+loss:
+  type: CompositeLoss                   # 复合损失容器
+  components:                           # 组件列表；每项 type/weight/args
+  - type: GTCRNCompressedSpectralLoss   # 压缩谱损失（实虚部 + 幅度）
+    weight: 1.0                         # 组件权重，无量纲
+    args:                               # 损失超参；显式值优先于框架注入的 stft 上下文
+      compress_factor: 0.3              # 谱压缩指数，无量纲
+      lamda_ri: 30.0                    # 实虚部损失权重，无量纲
+      lamda_mag: 70.0                   # 幅度损失权重，无量纲
+  - type: GTCRNLogRatioLoss             # 对数比损失（幅度谱）
+    weight: 1.0                         # 组件权重，无量纲
+# 优化器。
+optimizer:
+  type: Adam                      # 优化器类型
+  # 优化器超参。
+  args:
+    lr: 0.001                           # 学习率，无量纲（论文 1e-3）
+# 学习率调度。
+scheduler:
+  type: ExponentialLR                   # 指数衰减调度；每 epoch 乘 gamma
+  # 调度器超参。
+  args:
+    gamma: 0.99                         # 每 epoch 衰减因子，无量纲（论文 0.99^epoch）
+# 训练器：训练/验证生命周期与在线指标。
+trainer:
+  type: SETrainer                       # SE 训练器
+  exp_path: exp/se/online_spatialnet_dynamic_mhsa_lf32s                  # 产物目录（checkpoint / 日志 / TensorBoard）
+  epochs: 5                      # 训练 epoch 数
+  gradient_clip_value: 1.0              # 梯度范数裁剪阈值，无量纲（论文 1.0）
+  accumulation_steps: 1                 # 梯度累积步数；1=不累积
+  lr_schedule_per_step: false           # false=按 epoch 调度；true=每 optimizer step 调度
+  log_interval: 100                     # 每多少 step 打一次训练日志
+  max_val_batches: 0                    # 每轮验证最多 batch 数；0=不限（跑全量验证）
+  validation_epoch_interval: 1          # 每多少 epoch 跑一次 validation
+  validation_steps_interval: 0          # 每多少 step 跑一次 validation；0=关闭 step 级验证
+  save_top_k: 3                         # 按验证指标保留的最优 checkpoint 数
+  val_metrics:                          # 在线侵入式客观指标；MOS 类指标须经 evaluate/ 离线计算
+    enabled: true                       # 在线验证指标总开关
+    metrics: [SI-SDR, PESQ, ESTOI]      # 指标集合（全枚举见 configs/README.md 的 validation metric quota 条目）
+    interval: 1                         # 每多少 epoch 计算一次指标
+    max_utterances: 2167                # 每 epoch 全局 quota 上限，单位条（按 world_size 在各 rank 均分）；取 2167 < validation SCP 2200 条【假设：具体口径未在仓库记录】
+    max_utterances_metrics: 2167        # 配置指标（SI-SDR/PESQ/ESTOI）全局 quota；省略会回退 max_utterances，显式写出避免共享上限误读
+    metrics_workers: 8                  # 指标计算进程池 worker 数
+  save_checkpoint_interval: 1           # 每多少 epoch 存一次 checkpoint
+# 分布式：DDP 后端与集合通信超时。
+distributed:
+  backend: nccl                         # 分布式后端；GPU 用 nccl
+  find_unused_parameters: false         # 单路径模型无未用参数，false 以避免每步图遍历开销
+  nccl_timeout_minutes: 10              # nccl 集合通信超时，单位 min

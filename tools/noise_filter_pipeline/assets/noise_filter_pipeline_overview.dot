@@ -1,0 +1,50 @@
+digraph noise_filter_pipeline_overview {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.28",
+    nodesep="0.38",
+    ranksep="0.55",
+    splines=ortho,
+    fontname="Noto Sans CJK SC",
+    fontcolor="#172133",
+    label="Noise Filter Pipeline · 当前执行与发布边界",
+    labelloc=t,
+    fontsize=20
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#536b87",
+    fillcolor="#eef4fb",
+    fontcolor="#172133",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    margin="0.18,0.12",
+    penwidth=1.3
+  ];
+  edge [
+    color="#426b98",
+    fontcolor="#334e6f",
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    arrowsize=0.72,
+    penwidth=1.4
+  ];
+
+  a [label="Stage A\n数据接入\nregistry → AudioRecord", fillcolor="#e7f5ff", color="#2f8fbd"];
+  b [label="Stage B\nB1 分片 → B2 静音 / DC\n→ B3 VAD → B4 策略", fillcolor="#fff4df", color="#c78827"];
+  c [label="Stage C\nC1 锁定 Noise / Babble 分支\nC2 fixed top-5 → C3 Speech MID veto", fillcolor="#f1eaff", color="#8559ba"];
+  d [label="Stage D\n私有 validated snapshot\n当前直接 D2 质检", fillcolor="#e5f8f4", color="#278f7d"];
+  completion [label="d_completion.json\nStage D 唯一完成事实", fillcolor="#e9f7e8", color="#4d9d55"];
+  strict_export [label="显式 strict JSONL v6 export\n训练清单 / 审计输出", fillcolor="#fff7d8", color="#c59c22"];
+  promote [label="显式 promote\n复验后发布", fillcolor="#fff7d8", color="#c59c22"];
+  final [label="final 噪声源库\naudio/<dataset_id>/<category>/shard/...", fillcolor="#e9f7e8", color="#4d9d55"];
+
+  a -> b -> c -> d -> completion;
+  completion -> strict_export [label="显式执行", color="#c59c22"];
+  completion -> promote [label="显式执行", color="#c59c22"];
+  promote -> final [label="原子发布", color="#4d9d55"];
+
+  { rank=same; strict_export; promote; }
+}

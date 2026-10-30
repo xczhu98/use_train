@@ -1,0 +1,36 @@
+digraph ULUNASOverview {
+  graph [rankdir=LR, bgcolor="white", pad="0.20", nodesep="0.30", ranksep="0.52",
+    splines=ortho, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=22,
+    fontcolor="#142338", labelloc=t, label="UL-UNAS｜谱进谱出模型边界与默认架构"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=12,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.6,
+    margin="0.14,0.10"];
+  edge [color="#405A75", penwidth=1.8, arrowsize=0.75];
+
+  subgraph cluster_framework {
+    label="Framework / Trainer（模型外）"; color="#B7C9DB"; fillcolor="#F4F8FB"; style="rounded,filled";
+    noisy_wav [label="noisy waveform\n[B, L]", fillcolor="#EEF3F7"];
+    stft [label="STFT", fillcolor="#EAF2FA", color="#2E6EB5"];
+    istft [label="iSTFT", fillcolor="#EAF2FA", color="#2E6EB5"];
+    enhanced_wav [label="enhanced waveform\n[B, L]", fillcolor="#EEF3F7"];
+    noisy_wav -> stft;
+    istft -> enhanced_wav;
+  }
+
+  subgraph cluster_model {
+    label="ULUNAS model（内部不含 STFT / iSTFT）"; color="#6FA4D8"; fillcolor="#F8FBFE"; style="rounded,filled";
+    input [label="noisy_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+    feature [label="log magnitude\nERB Band Merge", fillcolor="#E7F5EC", color="#388B57"];
+    encoder [label="NAS 默认 encoder\nXConv → XMB → XDWS → XMB → XDWS\nAPReLU · cTFA · grouped ops", fillcolor="#E7F5EC", color="#388B57"];
+    bottleneck [label="2 × G-DPRNN\n频率向双向 / 时间向单向", fillcolor="#FFF3D1", color="#C78300"];
+    decoder [label="对称 decoder + skip\nNAS block type / kernel / group 对齐", fillcolor="#F1E8FA", color="#7047A3"];
+    mask [label="sigmoid IRM\nERB Band Split\n幅度 mask × noisy complex", fillcolor="#FDE8EE", color="#B33A55"];
+    output [label="enhanced_spec\n[B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.1];
+    input -> feature -> encoder -> bottleneck -> decoder -> mask -> output;
+    encoder -> decoder [style=dashed, color="#6E8191", label="skip"];
+    input -> mask [style=dashed, color="#6E8191", label="noisy phase / complex"];
+  }
+
+  stft -> input;
+  output -> istft;
+}

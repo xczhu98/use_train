@@ -1,0 +1,58 @@
+# ======================================================================
+# Model: StuPASE 16 kHz inference（DeWavLM-R L24 -> 8-step CFM/DiT -> Mel vocoder）。
+# 数据管线：仅推理；data.mode=dynamic 只用于 SE 任务路由，不构造训练/验证数据集。
+# 采样率/帧移：固定 16 kHz；waveform-native（meta.allow_no_stft=true），无框架 STFT；
+#   CFM 内部 mel 前端（n_fft=1280 / hop_length=320，80 ms 窗 / 20 ms 帧移）由 CFM
+#   artifact 的 cfg 固化，iSTFT 在 Mel vocoder 内部执行。
+# 实现路径：tasks/se/models/pase_family/stupase/stupase_model.py（StuPASE）、
+#   tasks/se/models/pase_family/stupase/flow/cfm.py（CFM）、
+#   tasks/se/models/pase_family/stupase/vocos_vocoder.py（VocosVocoder）。
+# Params: not measured（本机未逐项 profile）；论文参考口径 encoder ~315.45M + CFM/DiT
+#   ~189.5M + Mel vocoder ~60.67M。
+# MACs: not measured；论文 8-step 推理链约 104 GMAC/s 仅作 reference。
+# FLOPs: not measured（未运行独立 profile）。
+# THOP: not measured（未运行）。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS/UTMOS/DNSMOS 只能对三件 artifact
+#   严格加载后的输出音频离线评估，缺任一 artifact 时不得报告 MOS。
+# Frozen: encoder/CFM/vocoder 全部冻结；Trainable: N/A；Discriminator: N/A。
+# Artifact: DeWavLM-R.pt + CFM.pt + Vocoder_Mel-16k.pt（HF cisco-ai/stupase 官方发布版本）；
+#   三者必须实际存在并严格加载，缺任一文件在构造期报错。
+# StuPASE 推理配置（官方开源权重，waveform-native，免传训练 --checkpoint）
+#
+# 官方 CFM.pt 的 state_dict 不含 mel 前端 window/filterbank：MelSpec 把
+# mel_stft.spectrogram.window 与 mel_stft.mel_scale.fb 注册为 non-persistent buffer，
+# CFM.from_pretrained 的 fail-closed 严格匹配可直接加载官方 artifact。
+#
+# 8-step ODE：sample() 固定 steps=8、cfg_strength=0.5、sway_sampling_coef=-1.0
+#   （StuPASE.forward 的默认值），与官方短音频推理一致。
+# 长音频不可分块：CFM 的 ODE 采样在全序列 mel 上做条件流匹配，块间没有可复用的因果
+#   状态；--chunk_seconds 的块边界会截断条件上下文并改变输出，因此长音频只能整段
+#   推理（显存受限时分段请单独评估），不要用分块拼接复现官方结果。
+#
+# 用法：
+#   PYTHONPATH=. python inference.py \
+#       -C configs/se/urgent2026/pase/stupase_infer.yaml \
+#       --input_dir <noisy_dir> --output_dir <out_dir>
+# ======================================================================
+
+# ---- meta：随机性 / 推理标记 ----
+meta:
+  seed: 42              # 全局随机种子；推理无训练随机性，仅为接口一致性保留
+  allow_no_stft: true   # waveform-native 模型：权重由 from_pretrained 注入，免 --checkpoint
+  inference_only: true  # 纯推理配置；无 train/validation/trainer/loss
+  deterministic: false  # false=不做确定性算法约束（默认）；inference-only 无 Trainer，此键不参与训练路径
+
+# ---- data：仅保留任务路由与固定采样率 ----
+data:
+  mode: dynamic         # 仅保留 SE 任务路由；不声明训练或验证数据
+  sample_rate: 16000    # Hz；StuPASE 固定 16 kHz 推理，非 16 kHz 输入由 inference.py 重采样
+
+# ---- model：DeWavLM-R + CFM/DiT + Mel vocoder 推理链 ----
+model:
+  type: StuPASE        # 注册名 → tasks/se/models/pase_family/stupase/stupase_model.py
+  # 推理链 artifact 路径与运行参数（显式形参；未知键在构造期 TypeError）
+  args:
+    dewavlm_ckpt_path: "tasks/se/models/pase_family/stupase/open_model_checkpoint/DeWavLM-R.pt"           # DeWavLM-R encoder artifact；缺失时构造期报错
+    cfm_ckpt_path: "tasks/se/models/pase_family/stupase/open_model_checkpoint/CFM.pt"                     # CFM/DiT flow-matching artifact；缺失时构造期报错
+    vocoder_ckpt_path: "tasks/se/models/pase_family/stupase/open_model_checkpoint/Vocoder_Mel-16k.pt"      # 16 kHz Mel vocoder artifact；缺失时构造期报错
+    output_layer: 24    # 作为 phonetic condition 的 DeWavLM-R 层号；官方权重为第 24 层

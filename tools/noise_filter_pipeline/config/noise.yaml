@@ -1,0 +1,377 @@
+# 数据集注册表（dataset registry）
+# 新增数据集只需在此添加条目，无需修改主代码。
+# path 支持绝对路径或相对于本 registry 文件（config/）所在目录的相对路径。
+# 生产模板使用仓库根 data/ 下的相对占位；data/ 已被 .gitignore 忽略，部署时请挂载、软链接
+# 或在本地覆盖配置中改写为真实数据根目录。
+#
+# 字段说明：
+#   id:           数据集唯一标识（会用于 record_id 前缀）
+#   name:         可读名称
+#   enabled:      是否启用
+#   type:         directory | json | csv | huggingface
+#   path:         数据根目录 / JSON 文件 / CSV 文件 / HuggingFace 仓库名或本地路径
+#   input_pattern: directory 类型时的文件匹配模式，如 "**/*.wav"
+#   label_source: directory 类型时标签来源：filename | directory | mapping | none
+#   label_field:  json/huggingface 类型时的标签字段名
+#   audio_field:  json/huggingface 类型时的音频字段名
+#   label_column: csv 类型时的标签列名
+#   audio_column: csv 类型时的音频路径列名
+#   label_separator: csv 多标签分隔符
+#   label_mapping: directory + mapping 时的 YAML 映射文件名
+#   splits:       [train] 或 [train, val, test]
+#   split_strategy: none | directory | ratio
+#   split_ratio:  ratio 策略时的比例，如 [0.8, 0.1, 0.1]
+#
+# ----------------------------------------------------------------------------
+# 当前项目数据集（模板中的路径为 18 个数据集的 ignored 占位）
+# ----------------------------------------------------------------------------
+# Stage A 会直接读取 enabled=true 条目；部署前请将对应数据挂载到这些相对路径，
+# 或在本地覆盖配置中改写为实际目录。
+
+datasets:
+  - id: dns5_noise
+    name: "DNS5 Fullband Noise"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/dns5_fullband/datasets_fullband/noise_fullband"
+    input_pattern: "**/*.wav"
+    label_source: filename
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "Microsoft Research License"
+    notes: "DNS5 全频带噪声，子目录按来源分组"
+
+  - id: fma_medium
+    name: "FMA Medium"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/fma/fma_medium"
+    input_pattern: "**/*.mp3"
+    label_source: directory
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "CC BY-NC-SA 4.0"
+    notes: "Free Music Archive，按数字子目录组织"
+
+  - id: esc50
+    name: "ESC-50"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/ESC-50-master/ESC50"
+    input_pattern: "**/*.wav"
+    label_source: mapping
+    label_mapping: "esc50_to_audioset.yaml"
+    splits: [train]
+    split_strategy: none
+    license: "CC BY-NC 3.0"
+    notes: "50 类环境声，通过映射文件转换为 AudioSet 标签"
+
+  - id: fsd50k
+    name: "FSD50K"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/fsd50k/FSD50K.dev_audio"
+    input_pattern: "**/*.wav"
+    label_source: filename
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "Creative Commons"
+    notes: "FSD50K 开发集音频；标签文件位于 FSD50K.ground_truth/dev.csv"
+
+  - id: wham_noise
+    name: "WHAM! Noise 48k"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/wham_noise_48k/high_res_wham"
+    input_pattern: "**/*.wav"
+    label_source: filename
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "CC BY 4.0"
+    notes: "WHAM! 48kHz 高分辨率噪声"
+
+  - id: mka
+    name: "MKA Keyboard Audio"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/MKA"
+    input_pattern: "**/*.wav"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "Unknown"
+    notes: "键盘敲击音频数据集，包含多设备原始录音与按键分段"
+
+  - id: wavcaps_audioset_sl
+    name: "WavCaps AudioSet SL"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/WavCaps/Zip_files/AudioSet_SL"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "CC BY"
+    notes: "WavCaps 子集：AudioSet 强标签音频"
+
+  - id: wavcaps_bbc_sound_effects
+    name: "WavCaps BBC Sound Effects"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/WavCaps/Zip_files/BBC_Sound_Effects"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "Remix License"
+    notes: "WavCaps 子集：BBC 音效库"
+
+  - id: wavcaps_freesound
+    name: "WavCaps FreeSound"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/WavCaps/Zip_files/FreeSound"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "CC0/BY/BY-NC"
+    notes: "WavCaps 子集：FreeSound 音频"
+
+  - id: wavcaps_soundbible
+    name: "WavCaps SoundBible"
+    enabled: true
+    type: directory
+    path: "../../../data/noise/WavCaps/Zip_files/SoundBible"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    license: "CC BY 4.0"
+    notes: "WavCaps 子集：SoundBible 音效"
+
+  # ---- 新增：DCASE 2019 环境声（3 个，都是 flac）----
+  - id: dcase2019_task1a
+    name: "DCASE 2019 Task1A Scenes"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/dcase2019_task1a/TAU-urban-acoustic-scenes-2019-development"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "DCASE 2019 Task1A 环境声 14400 段；场景标签在 meta.csv 里取不到，交给 C2 AudioTag 打标签"
+
+  - id: dcase2019_task1b_mobile
+    name: "DCASE 2019 Task1B Mobile Scenes"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/dcase2019_task1b_mobile/TAU-urban-acoustic-scenes-2019-mobile-development"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "DCASE 2019 Task1B 手机录制环境声"
+
+  - id: dcase2019_task1c_openset
+    name: "DCASE 2019 Task1C OpenSet Scenes"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/dcase2019_task1c_openset/TAU-urban-acoustic-scenes-2019-openset-development"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "DCASE 2019 Task1C OpenSet 环境声"
+
+  # ---- 新增：MUSAN / MUSDB18（音乐噪声源）----
+  - id: musan
+    name: "MUSAN"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/musan"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "MUSAN 本机只有 music + noise 两个子集（无 speech），1590 个 flac"
+
+  - id: musdb18
+    name: "MUSDB18"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/musdb18"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "MUSDB18 整曲 stems 750 个；vocals 会被 C1/C3 自动拒绝，留伴奏作为音乐噪声"
+
+  # ---- 新增：键盘鼠标自录 / 采集（4 个）----
+  - id: selfrecord_keyboard
+    name: "Self-Recorded Keyboard"
+    enabled: true
+    type: directory
+    path: "../../../data/noise_datasets/datasets/selfrecord"
+    input_pattern: "**/*.flac"
+    label_source: none
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "自录键盘敲击 1755 段，平铺无标签"
+
+  - id: bilibili_keyboard_mouse
+    name: "Bilibili Keyboard/Mouse/Typing"
+    enabled: true
+    type: directory
+    path: "../../../data/keyboard_mouse_scraper/downloads/bilibili"
+    input_pattern: "**/*.flac"
+    label_source: directory
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "B 站采集，keyboard/mouse/typing 子目录即类别"
+
+  - id: youtube_keyboard_mouse
+    name: "YouTube Keyboard/Mouse/Typing"
+    enabled: true
+    type: directory
+    path: "../../../data/keyboard_mouse_scraper/downloads/youtube"
+    input_pattern: "**/*.flac"
+    label_source: directory
+    label_mapping: null
+    splits: [train]
+    split_strategy: none
+    notes: "YouTube 采集，keyboard/mouse/typing 子目录即类别"
+
+# ----------------------------------------------------------------------------
+# 可选补充：Hive 论文中使用的 12 个弱标签数据集
+# ----------------------------------------------------------------------------
+# 若后续需要复现/扩展 Hive 单事件源库，可按以下示例追加条目并填写真实路径。
+# 这些条目默认注释掉，避免占位路径导致 validate_dataset_registry.py 报失败。
+#
+# - id: bbc_sound_effects
+#   name: "BBC Sound Effects"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/BBC_Sound_Effects"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train]
+#   license: "Remix License"
+#   notes: "专业广播级录音"
+#
+# - id: audioset
+#   name: "AudioSet"
+#   enabled: false
+#   type: huggingface
+#   path: "datasets/audioset"
+#   label_field: labels
+#   audio_field: audio
+#   splits: [train, val, test]
+#   license: "CC BY"
+#
+# - id: vggsound
+#   name: "VGGSound"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/VGGSound"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train, val, test]
+#   license: "CC BY 4.0"
+#
+# - id: music21
+#   name: "MUSIC21"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/MUSIC_dataset"
+#   input_pattern: "**/*.wav"
+#   label_source: directory
+#   splits: [train, val, test]
+#   license: "YouTube Standard"
+#
+# - id: freesound
+#   name: "FreeSound"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/FreeSound"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train]
+#   license: "CC0/BY/BY-NC"
+#
+# - id: clothov2
+#   name: "ClothoV2"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/clotho_v2"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train, val, test]
+#   license: "Non-Commercial Research"
+#
+# - id: voicebank_demand
+#   name: "Voicebank-DEMAND"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/Voicebank_DEMAND"
+#   input_pattern: "**/*.wav"
+#   label_source: directory
+#   splits: [train, val, test]
+#   license: "CC BY 4.0"
+#   notes: "语音数据集，预计大部分会被 VAD 剔除"
+#
+# - id: ave
+#   name: "AVE"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/AVE_Dataset"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train]
+#   license: "CC BY-NC-SA"
+#
+# - id: soundbible
+#   name: "SoundBible"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/SoundBible"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train]
+#   license: "CC BY 4.0"
+#
+# - id: dcase
+#   name: "DCASE"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/DCASE2024_T9"
+#   input_pattern: "**/*.wav"
+#   label_source: directory
+#   splits: [train]
+#   license: "Academic Use"
+#
+# - id: fsd50k_full
+#   name: "FSD50K (Full)"
+#   enabled: false
+#   type: directory
+#   path: "/path/to/FSD50K"
+#   input_pattern: "**/*.wav"
+#   label_source: filename
+#   splits: [train]
+#   license: "Creative Commons"

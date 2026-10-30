@@ -1,0 +1,129 @@
+# RIR generation profile: realistic_speech
+# Purpose: 普通室内语音增强训练数据
+# Backend: gpurir
+# Sample rates: 16 kHz and 32 kHz
+# Serialization: PKL
+# Generator schema: 1
+#
+# 关键语义：near/far 距离区间互斥；RT60 为共享范围；移动 RIR 使用分段 PKL。
+
+schema_version: 1
+
+# 配置 profile 名称；用于记录数据用途，不替代具体字段。
+profile: realistic_speech
+
+# 生成 backend；可选 gpurir、fram、rirgen 或 all。
+backend:
+  name: gpurir
+
+  # gpuRIR 漫射模型切换阈值，单位 dB；15 dB 是当前工程默认值。
+  gpurir:
+    diffuse_transition_db: 15.0
+    # 声源极性模式。gpuRIR 支持 omni、homni、card、hypcard、subcard、bidir。
+    # omni=全向，homni=半全向，card=心形，hypcard=超心形，
+    # subcard=次心形，bidir=双向/8 字形。
+    speaker_pattern: omni
+    # 非 omni 模式必须同时提供单位方向向量，坐标轴与房间 xyz 坐标一致。
+    # 方向向量是静态声源/麦克风的固定朝向；移动声源使用同一朝向。
+    speaker_orientation: null
+    # 麦克风极性模式；模式集合与 speaker_pattern 相同。
+    microphone_pattern: omni
+    # 非 omni 麦克风模式必须提供单位方向向量。
+    microphone_orientation: null
+
+  # FRAM 参数仅在 backend=fram 时生效，保留在同一 schema 便于切换 profile。
+  fram:
+    # image source 数量范围；单位为个；上限不包含。
+    n_image_range: [512, 2049]
+    # 反射扰动范围；无量纲。
+    reflection_perturbation_range: [-2.0, 2.0]
+    # 反射扰动的距离指数；无量纲。
+    reflection_tau: 0.25
+    # 直达声窗范围，单位 ms；相对于直达声采样点。
+    direct_window_range_ms: [-6.0, 50.0]
+    # FRAM 输出高通截止频率，单位 Hz。
+    highpass_cutoff_hz: 80.0
+
+# 目标采样率列表，单位 Hz；值必须唯一且为正整数。
+sample_rates_hz: [16000, 32000]
+
+# 输出目录；null 表示由 --output-dir 在命令行提供。
+output_dir: null
+
+# 数据数量与类别比例。
+dataset:
+  # RIR 总数量；field=both 时按 near_far_ratio 分配。
+  total_rirs: 100000
+  # 使用总数量时的近场:远场数量权重；不是自然发生概率。
+  near_far_ratio: [5.0, 5.0]
+  # gpuRIR 自动拆分时的静态:移动数量权重；当前生产 profile 关闭移动 RIR。
+  static_moving_ratio: [1.0, 0.0]
+
+scene:
+  room:
+    # 房间长度范围，单位 m；每条样本独立均匀采样。
+    length_range_m: [3.0, 8.0]
+    # 房间宽度范围，单位 m；每条样本独立均匀采样。
+    width_range_m: [3.0, 8.0]
+    # 房间高度范围，单位 m；每条样本独立均匀采样。
+    height_range_m: [2.5, 3.5]
+  geometry:
+    # 声源与麦克风的最小距离，单位 m；避免位置重合和奇异增益。
+    min_source_microphone_distance_m: 0.05
+    # 声源高度范围，单位 m；限制在常见说话人高度。
+    source_height_range_m: [1.1, 1.8]
+    # 麦克风高度范围，单位 m；避免落在地面或天花板附近。
+    microphone_height_range_m: [1.0, 1.8]
+  distance:
+    # 近场源麦距离范围，单位 m；本 profile 与 far_range 不重叠。
+    near_range_m: [0.2, 0.8]
+    # 远场源麦距离范围，单位 m；本 profile 从 1 m 开始。
+    far_range_m: [1.0, 3.0]
+    # false 要求 near/far 范围互斥；true 才允许重叠。
+    allow_overlap: false
+
+acoustics:
+  # RT60 目标范围，单位 s；近场和远场共用；上限不包含。
+  rt60_range_sec: [0.1, 1.0]
+  # 声速，单位 m/s；所有 backend 必须使用同一值。
+  sound_speed_mps: 340.0
+  # null 表示按 RT60、距离和安全余量自动计算并按 256 对齐。
+  near_rir_length_samples: null
+  far_rir_length_samples: null
+
+motion:
+  # 是否生成移动声源；false 表示当前生产 profile 只生成静态 RIR。
+  enabled: false
+  # 轨迹时间步数量范围；每个移动场景按 scene seed 采样，含首尾。
+  n_segments_range: [3, 6]
+  # 每个时间步持续时间，单位 s。
+  segment_duration_sec: 0.2
+  # 源移动速度范围，单位 m/s；按均匀分布采样。
+  speed_range_mps: [0.5, 1.5]
+  # linear、waypoint 或 both；both 表示逐场景随机选择。
+  trajectory_type: both
+
+execution:
+  # CPU backend 进程数。
+  workers: 16
+  # 每个 method/fs/mode/field 组合的 shard 数量。
+  shards: 10
+  # null 表示自动检测 GPU；也可填写 GPU token 列表。
+  gpus: null
+
+output:
+  # 生产数据推荐 PKL；保存完整 float32 和 metadata。
+  format: pkl
+  # 是否为每条 RIR 额外写 JSON metadata。
+  write_metadata_json: false
+  # 是否计算逐文件 SHA-256；大数据集默认关闭。
+  compute_sha256: false
+
+validation:
+  # 是否在发布 manifest 前执行严格校验。
+  enabled: true
+  # 静态 RIR 或移动 segment 的最小峰值；无量纲 waveform peak。
+  peak_threshold: 1.0e-6
+
+# 全局场景随机种子；相同有效配置和 seed 应生成可复现几何。
+seed: 42

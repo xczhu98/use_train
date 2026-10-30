@@ -1,0 +1,55 @@
+digraph PASEFamilyInference {
+  graph [rankdir=TB, bgcolor="white", pad="0.20", nodesep="0.30", ranksep="0.45",
+    splines=ortho, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=23,
+    fontcolor="#142338", labelloc=t, label="PASE 系列推理链路（waveform-native）"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=11,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.5,
+    margin="0.13,0.09"];
+  edge [color="#405A75", penwidth=1.7, arrowsize=0.72];
+
+  subgraph cluster_pase {
+    label="PASE"; color="#B8CDE1"; style="rounded";
+    p_in [label="noisy 16 kHz", fillcolor="#EEF3F7"];
+    p_enc [label="DeWavLM DRD\nL1 / L24 双流", fillcolor="#EAF2FA", color="#2E6EB5"];
+    p_voc [label="dual-stream Vocos", fillcolor="#E7F5EC", color="#388B57"];
+    p_out [label="enhanced 16 kHz", fillcolor="#EEF3F7"];
+    p_in -> p_enc -> p_voc -> p_out;
+  }
+
+  subgraph cluster_stu {
+    label="StuPASE"; color="#E4B07A"; style="rounded";
+    s_in [label="noisy waveform", fillcolor="#EEF3F7"];
+    s_enc [label="DeWavLM-R", fillcolor="#EAF2FA", color="#2E6EB5"];
+    s_flow [label="DiT Flow Matching\nnoisy Mel + Gaussian noise", fillcolor="#FFE8D8", color="#C85D24"];
+    s_voc [label="Mel vocoder", fillcolor="#E7F5EC", color="#388B57"];
+    s_out [label="enhanced waveform", fillcolor="#EEF3F7"];
+    s_in -> s_enc -> s_flow -> s_voc -> s_out;
+  }
+
+  subgraph cluster_uni {
+    label="UniPASE"; color="#79B88A"; style="rounded";
+    u_in [label="任意 sr 输入\n重采样到 16 kHz / PLC", fillcolor="#EEF3F7"];
+    u_enc [label="DeWavLM-Omni\nL1 声学 + L24 音素", fillcolor="#EAF2FA", color="#2E6EB5"];
+    u_adp [label="Adapter", fillcolor="#FFE8D8", color="#C85D24"];
+    u_voc [label="Vocoder → 16 kHz", fillcolor="#E7F5EC", color="#388B57"];
+    u_gate [shape=diamond, label="sr_out > 16 kHz?", fillcolor="#FFF3D1", color="#C78300"];
+    u_post [label="PostNet BWE\n→ sr_out", fillcolor="#F1E8FA", color="#7047A3"];
+    u_direct [label="重采样 / 对齐\n→ sr_out ≤ 16 kHz", fillcolor="#EEF3F7"];
+    u_out [label="enhanced waveform\n采样率 = sr_out", fillcolor="#EEF3F7", penwidth=2.0];
+    u_in -> u_enc -> u_adp -> u_voc -> u_gate;
+    u_gate -> u_post [label="是"];
+    u_gate -> u_direct [label="否"];
+    u_post -> u_out; u_direct -> u_out;
+  }
+
+  subgraph cluster_gap {
+    label="GAP-URGENet"; color="#A58AD8"; style="rounded";
+    g_in [label="任意 sr 输入\n两路均转 16 kHz", fillcolor="#EEF3F7"];
+    g_gen [label="生成支路\nDeWavLM-Omni → Adapter → Vocoder\n16 kHz → 48 kHz", fillcolor="#EAF2FA", color="#2E6EB5"];
+    g_pred [label="预测支路\nTF-GridNet Predictor\n16 kHz → 48 kHz", fillcolor="#FFF3D1", color="#C78300"];
+    g_post [label="PostNet\n双通道融合 + BWE\n48 kHz", fillcolor="#F1E8FA", color="#7047A3"];
+    g_out [label="重采样 / 对齐\n→ sr_out（默认输入 sr）", fillcolor="#EEF3F7", penwidth=2.0];
+    g_in -> g_gen; g_in -> g_pred;
+    g_gen -> g_post; g_pred -> g_post; g_post -> g_out;
+  }
+}

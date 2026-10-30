@@ -1,0 +1,86 @@
+digraph PASEReproductionValidation {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.38",
+    ranksep="0.62",
+    splines=ortho,
+    fontname="Noto Sans CJK SC",
+    fontsize=18,
+    label="PASE 系列复现验证闭环",
+    labelloc="t"
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=12,
+    color="#315B7D",
+    fillcolor="#F5F9FC",
+    fontcolor="#16324A",
+    margin="0.15,0.10"
+  ];
+  edge [
+    color="#315B7D",
+    penwidth=1.6,
+    arrowsize=0.75,
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    fontcolor="#24465F"
+  ];
+
+  subgraph cluster_inputs {
+    label="可审计输入";
+    color="#7AA6C2";
+    style="rounded";
+    official_source [label="官方源码 checkout\n（环境变量指定）"];
+    official_ckpt [label="本地官方 checkpoint\n（不随 Git 分发）"];
+    controlled_env [label="固定输入、配置与后端\n（含确定性设置）"];
+  }
+
+  subgraph cluster_parity {
+    label="组件 parity";
+    color="#2A8C82";
+    style="rounded";
+    source_component [label="官方组件\n加载同一 checkpoint", fillcolor="#EFFAF7", color="#2A8C82"];
+    local_component [label="本仓库组件\n加载同一 checkpoint", fillcolor="#EFFAF7", color="#2A8C82"];
+    compare [label="比较 key / shape / 输出\n按测试声明 atol / rtol\n或 max_abs 阈值", fillcolor="#E4F5F1", color="#18756C"];
+  }
+
+  subgraph cluster_regression {
+    label="独立回归门";
+    color="#7667A8";
+    style="rounded";
+    unit_tests [label="本地 unit / smoke\n接口、shape、finite、梯度", fillcolor="#F5F1FC", color="#7667A8"];
+    e2e_sanity [label="官方 artifact 端到端 sanity\n严格加载、非静音、无 NaN/Inf", fillcolor="#F5F1FC", color="#7667A8"];
+  }
+
+  parity_result [
+    label="声明容差内的\n组件 parity",
+    shape=ellipse,
+    fillcolor="#FFF4D8",
+    color="#C8811A",
+    penwidth=2.0,
+    fontcolor="#71430A"
+  ];
+  evidence_boundary [
+    label="证据边界\n不外推为任意环境 bit-exact\n不证明端到端质量或论文指标复现",
+    shape=note,
+    fillcolor="#FFF7F3",
+    color="#C65D3A",
+    fontcolor="#7A2F1C"
+  ];
+
+  official_source -> source_component;
+  official_ckpt -> source_component;
+  official_ckpt -> local_component;
+  controlled_env -> source_component;
+  controlled_env -> local_component;
+  source_component -> compare;
+  local_component -> compare;
+  compare -> parity_result [color="#18756C"];
+  unit_tests -> parity_result [style=dashed, color="#7667A8", label="回归证据"];
+  e2e_sanity -> parity_result [style=dashed, color="#7667A8", label="artifact 可用性"];
+  parity_result -> evidence_boundary [color="#C65D3A", label="仅在声明范围内结论成立"];
+}

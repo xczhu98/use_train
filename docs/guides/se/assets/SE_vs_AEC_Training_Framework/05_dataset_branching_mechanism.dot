@@ -1,0 +1,75 @@
+digraph dataset_branching {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.22",
+    nodesep="0.34",
+    ranksep="0.40",
+    fontname="Noto Sans CJK SC",
+    label="dynamic_aec：单样本调用链与七路分支",
+    labelloc="t",
+    fontsize=22
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#2563EB",
+    fillcolor="#EFF6FF",
+    fontname="Noto Sans CJK SC",
+    fontsize=12,
+    margin="0.16,0.10",
+    penwidth=1.3
+  ];
+  edge [
+    color="#475569",
+    fontcolor="#334155",
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    arrowsize=0.75,
+    penwidth=1.2
+  ];
+
+  getitem [label="BaseDynamicMixingDataset.__getitem__(index)"];
+  traced [label="get_sample_with_trace(index)\n创建 SimulationTrace"];
+  build [label="AEC DynamicMixingDataset._build_sample(...)\n调用仿真并执行统一时间变换"];
+  run [label="_run(...)\nLayer A–F AEC 仿真"];
+  select [shape=diamond, style="filled", color="#EA580C", fillcolor="#FFF7ED",
+          label="Layer B\n七路互斥抽样\n概率和 = 1"];
+
+  branches [
+    shape=plain,
+    label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="7" COLOR="#64748B">
+        <TR><TD BGCOLOR="#F8FAFC"><B>分支</B></TD><TD BGCOLOR="#F8FAFC"><B>场景组成</B></TD><TD BGCOLOR="#F8FAFC"><B>C-aec</B></TD></TR>
+        <TR><TD>prob_target_only</TD><TD>target</TD><TD BGCOLOR="#F5F3FF">无</TD></TR>
+        <TR><TD>prob_noise_only</TD><TD>noise</TD><TD BGCOLOR="#F5F3FF">无</TD></TR>
+        <TR><TD>prob_echo_only</TD><TD>JSON echo</TD><TD BGCOLOR="#ECFEFF">有</TD></TR>
+        <TR><TD>prob_noise_echo_only</TD><TD>noise + JSON echo</TD><TD BGCOLOR="#ECFEFF">有</TD></TR>
+        <TR><TD>prob_target_noise</TD><TD>target + noise</TD><TD BGCOLOR="#F5F3FF">无</TD></TR>
+        <TR><TD>prob_target_echo</TD><TD>target + JSON echo</TD><TD BGCOLOR="#ECFEFF">有</TD></TR>
+        <TR><TD>prob_target_noise_echo</TD><TD>target + noise + JSON echo</TD><TD BGCOLOR="#ECFEFF">有</TD></TR>
+      </TABLE>
+    >
+  ];
+
+  runout [label="_run 返回 AECRunOutput\nwaveform bundle + branch/context", color="#0891B2", fillcolor="#ECFEFF"];
+  project [label="_build_sample：target-SR / final alignment\nproject_training_tuple(...) → 当前 11/12 元组", color="#15803D", fillcolor="#F0FDF4"];
+  sealed [label="get_sample_with_trace\n封存 trace，返回 TracedSample(sample, trace)", color="#7C3AED", fillcolor="#F5F3FF"];
+  sample [label="__getitem__ 取 .sample\n返回 DataLoader", color="#7C3AED", fillcolor="#F5F3FF"];
+  collate [label="aec_collate_fn → pad/stack\nvalidate → AECBatch", color="#15803D", fillcolor="#F0FDF4"];
+
+  getitem -> traced;
+  traced -> build;
+  build -> run [label="调用"];
+  run -> select;
+  select -> branches;
+  branches -> runout [label="按所选分支合成"];
+  runout -> project [label="返回 _build_sample"];
+  project -> sealed [label="sample 返回"];
+  sealed -> sample;
+  sample -> collate [label="DataLoader 后续"];
+
+  note [shape=note, style="filled", color="#94A3B8", fillcolor="#F8FAFC",
+        label="含回声分支才读取 JSON manifest；\necho 是合成/审计内部 stem，\n不是 canonical collate 键。"];
+  branches -> note [style=dashed, arrowhead=none, color="#94A3B8"];
+}

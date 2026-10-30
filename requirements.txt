@@ -1,0 +1,160 @@
+# ============================================================
+# SE_Train / USE_Train 依赖
+# ============================================================
+# 推荐安装顺序:
+#   1. 系统依赖: 安装 ffmpeg (见下方说明)
+#   2. conda create -n use_train python=3.10 && conda activate use_train
+#   3. pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
+#        --index-url https://download.pytorch.org/whl/cu121
+#   4. pip install -r requirements.txt
+#
+# PyTorch 版本说明:
+#   torch 2.4.x (cu121) — 推荐, 支持 numpy 1.x 和 2.x
+#   torch 2.1.x (cu121) — 需要 numpy<2.0
+#
+# 系统依赖 (需单独安装，非 pip):
+#   ffmpeg — 用于 tools 下音频格式转换 (convert_audio_format)，以及
+#            DataLoader worker 内隔离 Layer E codec 的子进程后端。
+#            Windows: choco install ffmpeg; macOS: brew install ffmpeg; Linux: apt install ffmpeg
+# ============================================================
+
+# -----------------------------------------------------------------------------
+# Core（训练 / 推理必选）
+# -----------------------------------------------------------------------------
+# torch>=2.4: BaseTrainer uses torch.amp.GradScaler("cuda", ...), which requires
+# the unified torch.amp API added in 2.4 (torch 2.1-2.3 only have
+# torch.cuda.amp.GradScaler with an incompatible signature).
+torch>=2.4
+torchaudio>=2.4
+omegaconf>=2.3
+numpy>=1.23,<2.0
+scipy>=1.10
+soundfile>=0.12
+einops>=0.6
+rotary-embedding-torch>=0.3.0
+librosa>=0.10
+tqdm>=4.65
+
+# 配置与工具
+pyyaml>=6.0
+
+# Logging
+tensorboard>=2.12
+
+# EMA (optional)
+torch-ema>=0.3
+
+# AdamP optimizer (GTCRN 论文复现需要, 也可用 AdamW 替代)
+adamp>=0.3
+
+# 模型参数量与算力分析 (用于直接运行模型文件: python se/models/discriminative/gtcrn.py)
+thop>=0.1.1
+
+# 数据准备 / 脚本常用
+pandas>=1.5
+
+# 管道与监控 (noise_filter_pipeline / audio_filter_pipeline 等)
+psutil>=5.9
+
+# -----------------------------------------------------------------------------
+# 重采样 (推荐安装 soxr，比 librosa 更快)
+# -----------------------------------------------------------------------------
+soxr>=0.3
+
+# -----------------------------------------------------------------------------
+# Metrics（evaluate/ 评估管线）
+# -----------------------------------------------------------------------------
+pesq>=0.0.4
+pystoi>=0.3
+
+# 可微感知损失 (训练时可选，见 LOSS 配置)
+# pytorch-pesq>=0.0.3     # For PESQLoss
+# torch-stoi>=0.1         # For STOILoss
+# auraloss>=0.3           # For AuralossMultiResSTFTLoss, AuralossSDRLoss
+
+# -----------------------------------------------------------------------------
+# ONNX 导出与验证 (onnx/export.py, core/metrics/mos_models.py DNSMOS/SCOREQ)
+# -----------------------------------------------------------------------------
+onnx>=1.14
+onnxruntime>=1.15
+# onnxsim>=0.4   # 可选，用于 onnx/export.py --simplify
+
+# -----------------------------------------------------------------------------
+# 可选 — AEC MOS 评估 (evaluate_aec.py --aecmos)
+# -----------------------------------------------------------------------------
+# aecmos
+
+# -----------------------------------------------------------------------------
+# 可选 external runtime — TSE 评测 (evaluate/eval_pipeline_tse.py，REAL-TSE 官方口径)
+# 仅请求相应指标时使用；全部做 import guard，缺失时对应指标跳过或按实现降级，不影响训练与其余指标。
+#   pip install sherpa-onnx          # TER：Zipformer ASR 推理引擎（入口 --ter_model_dir[_zh/_en]；模型见 third_party_scripts/zipformer/README.md）
+#   pip install wespeakerruntime     # spksim：官方 spk cosine similarity（入口 --wespeaker_model_dir；模型见 third_party_scripts/wespeaker/README.md）
+#   pip install meeteval             # TER：官方错误率计算（zh=CER / en=WER）
+#   pip install whisper-normalizer   # TER：官方 hyp 文本归一化
+#   pip install opencc-python-reimplemented  # TER：可选中文文本规范化
+# timing：入口 --fireredasr2s_root / --timing_gt_json_base_dir；FireRedASR2S 本地工作副本与其 FireRedVAD 资产不是 pip 依赖。
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 可选 — WandB
+# -----------------------------------------------------------------------------
+# wandb
+
+# ============================================================
+# 按功能安装（按需取消注释）
+# ============================================================
+#
+# 动态仿真 (se/data/post_augment, se/data/simulation):
+#   torchaudio>=2.1 已含 codec (MP3/OGG/Opus) 支持；wind_noise 侧链压缩为内存 numpy 实现，无需 ffmpeg。
+#   pip install pedalboard   # 可选：post_augment 中 DRC、MP3/GSM 等（缺则跳过）
+#
+# 数据准备 — DNS3 离线生成 (tools/prepare_data_tools/generators/se/generate_dns3_offline_dataset.py):
+#   已含: pandas, numpy, scipy, soundfile。需准备 clean/noise/rir CSV 或目录。
+#
+# AEC 训练实时 VAD mask（dynamic_dataset.py）:
+#   pip install silero-vad            # MIT, 32ms 分辨率
+#   pip install git+https://github.com/TEN-framework/ten-vad.git  # Apache 2.0（含附加条款）, 10ms 分辨率
+#
+# Noise/Audio Filter Pipeline 完整 VAD/分类器:
+#   pip install webrtcvad fireredvad "fireredvad[gpu]"  # VAD
+#   pip install funasr modelscope     # FunASR VAD
+#   Stage C 当前流程为 C1 Qwen、C2 AudioTag、C3 final admission。
+#   Qwen-Omni 与 main pipeline 使用同一环境；icefall AudioTag 可使用独立 runtime。
+#   安装方式与可选依赖见 tools/noise_filter_pipeline/README.md 的“环境安装”。
+#
+# URGENT2026 评估 (evaluate_urgent.py):
+#   pip install espnet espnet_model_zoo Levenshtein transformers
+#   pip install discrete-speech-metrics iso639
+#   # emotion2vec: git clone https://github.com/ftshijt/emotion2vec && pip install -e emotion2vec/
+#
+# 仅跑 Noise Filter Pipeline 时也可用子目录依赖:
+#   pip install -r tools/noise_filter_pipeline/requirements.txt
+# ============================================================
+
+# ============================================================
+# 开发 / 测试依赖
+# ============================================================
+pytest>=8
+pytest-timeout>=2
+
+# ============================================================
+# 可选 — Mamba 模型 (mamba-ssm / causal-conv1d)
+# ============================================================
+# 仅 configs/se/gan/{mambattention_metricgan_dynamic,rwsa_mamba_unet_metricgan_dynamic}.yaml 需要。
+# mamba-ssm / causal-conv1d 需编译 CUDA kernel，须预装 CUDA toolkit 及兼容的 torch (>=2.4)。
+# mamba-ssm 锁定 2.2.4：2.3.x 会强制升级 torch 到 2.14 + CUDA 13，与 torch 2.4/cu121 环境冲突。
+# pip install mamba-ssm==2.2.4 causal-conv1d>=1.4.0
+# mamba-ssm==2.2.4
+# causal-conv1d>=1.4.0
+
+# ============================================================
+# PASE / StuPASE (se/models/pase_family/) dependencies
+# ============================================================
+# torchdiffeq   -- StuPASE CFM.sample() ODE integrator (Euler method).
+# x-transformers -- StuPASE DiT's RotaryEmbedding / apply_rotary_pos_emb.
+#   2.14.2 -> 2.17.10：仅 StuPASE flow（dit.py/modules.py）消费该依赖；
+#   2.14.2 时代训练的 StuPASE checkpoint 重训时 RoPE 数值可能有微小差，其余任务家族不受影响。
+# huggingface_hub -- official PASE/StuPASE pretrained checkpoint download (cisco-ai/pase).
+torchdiffeq==0.2.5
+x-transformers==2.17.10
+huggingface_hub>=0.20

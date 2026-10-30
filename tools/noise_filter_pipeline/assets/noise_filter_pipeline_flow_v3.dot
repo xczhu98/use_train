@@ -1,0 +1,66 @@
+digraph noise_filter_pipeline_flow_v3 {
+  graph [
+    rankdir=LR,
+    bgcolor="#08111f",
+    pad="0.35",
+    nodesep="0.32",
+    ranksep="0.62",
+    splines=ortho,
+    fontname="Noto Sans CJK SC",
+    fontcolor="#e8f0ff",
+    label="Noise Filter Pipeline · 当前 Stage A–D 与显式后处理链",
+    labelloc=t,
+    fontsize=22
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#4f6b88",
+    fillcolor="#122238",
+    fontcolor="#eef6ff",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    margin="0.16,0.10"
+  ];
+  edge [
+    color="#72d7ff",
+    fontcolor="#cfeeff",
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    arrowsize=0.72,
+    penwidth=1.4
+  ];
+
+  source [label="原始音频\nregistry → AudioRecord", fillcolor="#102b42", color="#45bce8"];
+  b1 [label="B1 · adaptive 分片\n10 s chunk；尾段 < 2 s 丢弃"];
+  b2 [label="B2 · 静音 / DC 过滤\n静音比例、DC offset、时长门禁"];
+  b34 [label="B3 / B4 · 多模型 VAD + 策略\n技术失败或 fail_count≥2 → rejected\nfail_count=1 → suspected\nfail_count=0 → noise", fillcolor="#2b223b", color="#b283e8"];
+  reject_b [label="B rejected", fillcolor="#401e28", color="#ef7082"];
+
+  c1 [label="C1 · Qwen 三分类\nSpeech / Babble / Noise", fillcolor="#2b223b", color="#b283e8"];
+  reject_c1 [label="C1 reject\nSpeech 或不可解析", fillcolor="#401e28", color="#ef7082"];
+  c2 [label="C2 · AudioTag\n527 类仅内部排序\n持久化 fixed top-5", fillcolor="#2b223b", color="#b283e8"];
+  c3 [label="C3 · speech-only veto\n任一 Speech MID → reject\n否则保持 C1 分支", fillcolor="#2b223b", color="#b283e8"];
+  reject_c3 [label="C3 reject", fillcolor="#401e28", color="#ef7082"];
+
+  d [label="Stage D · 私有 validated snapshot\n当前 skip_d1=true：直接 D2\n响度归一化 + 时长 / 峰值质检", fillcolor="#123643", color="#4ad9bf"];
+  completion [label="d_completion.json\n原子绑定 final_stage、exact manifests\n与 d_stats.json 指纹", fillcolor="#173928", color="#79db83"];
+  strict_export [label="显式 strict JSONL v6 export\n发布 / 审计训练清单", fillcolor="#3b3318", color="#f1c75b"];
+  promote [label="显式 promote\n复验 completion 与发布身份", fillcolor="#3b3318", color="#f1c75b"];
+  final [label="final 噪声源库\naudio/<dataset_id>/<category>/\nshard_<5位>/<4位>.flac", fillcolor="#173928", color="#79db83"];
+
+  source -> b1 -> b2 -> b34;
+  b34 -> reject_b [label="拒绝", color="#ef7082", fontcolor="#ffb0ba"];
+  b34 -> c1 [label="suspected / noise"];
+  c1 -> reject_c1 [label="Speech / 解析失败", color="#ef7082", fontcolor="#ffb0ba"];
+  c1 -> c2 [label="Noise / Babble"];
+  c2 -> c3 [label="fixed top-5"];
+  c3 -> reject_c3 [label="存在 Speech MID", color="#ef7082", fontcolor="#ffb0ba"];
+  c3 -> d [label="accept_noise / accept_babble"];
+  d -> completion [label="Stage D 成功"];
+  completion -> strict_export [label="显式执行", color="#f1c75b", fontcolor="#ffe39b"];
+  completion -> promote [label="显式执行", color="#f1c75b", fontcolor="#ffe39b"];
+  promote -> final [label="原子发布", color="#79db83", fontcolor="#aaf2b1"];
+
+  { rank=same; strict_export; promote; }
+}

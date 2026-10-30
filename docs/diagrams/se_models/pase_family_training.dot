@@ -1,0 +1,35 @@
+digraph PASEFamilyTraining {
+  graph [rankdir=LR, bgcolor="white", pad="0.20", nodesep="0.30", ranksep="0.60",
+    splines=polyline, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=23,
+    fontcolor="#142338", labelloc=t, label="UniPASE staged training｜训练顺序与冻结依赖"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=11,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.6,
+    margin="0.14,0.10"];
+  edge [fontname="Noto Sans CJK SC", fontsize=10, color="#1F2937", fontcolor="#405A75",
+    penwidth=1.8, arrowsize=0.72];
+
+  order [shape=note, label="本仓库配置训练顺序\nS1 DeWavLM → S2 Vocoder → S3 Adapter → S4 PostNet", fillcolor="#EEF3F7", color="#6E8191"];
+
+  s1 [label="S1｜DeWavLM-Omni\n退化输入 student 对齐 clean teacher\n训练：DeWavLM student\n冻结：teacher", fillcolor="#EAF2FA", color="#2E6EB5", penwidth=2.0];
+  s2 [label="S2｜Vocoder\nclean acoustic representation → 16 kHz wav\n独立训练，不依赖 S1 权重", fillcolor="#E7F5EC", color="#388B57", penwidth=2.0];
+  s3 [label="S3｜Adapter + MRRD\ndegraded R_A + enhanced R_P → enhanced R_A\n训练：Adapter / discriminator\n冻结：S1 DeWavLM", fillcolor="#FFE8D8", color="#C85D24", penwidth=2.0];
+  s4 [label="S4｜PostNet\n16 kHz output → high-rate BWE\n训练：PostNet / discriminator\n冻结：DeWavLM + Adapter + Vocoder", fillcolor="#F1E8FA", color="#7047A3", penwidth=2.0];
+
+  order -> s1 [style=dotted, arrowhead=none, color="#6E8191"];
+  s1 -> s2 [label="配置执行顺序", color="#1F2937"];
+  s2 -> s3 [label="配置执行顺序", color="#1F2937"];
+  s3 -> s4 [label="配置执行顺序", color="#1F2937"];
+
+  s1 -> s3 [style=dashed, color="#2E6EB5", label="冻结特征依赖"];
+  s1 -> s4 [style=dashed, color="#6E8191", label="冻结"];
+  s2 -> s4 [style=dashed, color="#388B57", label="冻结"];
+  s3 -> s4 [style=dashed, color="#C85D24", label="冻结 Adapter"];
+
+  legend [shape=plain, label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="7" COLOR="#B7C9DB">
+      <TR><TD><B>实线</B>：训练配置执行顺序</TD><TD><B>虚线</B>：后续阶段加载并冻结的依赖</TD></TR>
+      <TR><TD COLSPAN="2">S2 Vocoder 可独立训练；顺序不等于 S1→S2 的权重依赖。</TD></TR>
+    </TABLE>
+  >];
+  s2 -> legend [style=invis];
+}

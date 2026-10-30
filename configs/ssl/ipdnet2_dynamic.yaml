@@ -1,0 +1,84 @@
+# ============================================================
+# IPDnet2 近场合同配置（模板；source distance 只用于 target/mapping）
+# Params: not measured（Mamba/OnlineSpatialNet 接入完成后记录）
+# MACs: not measured（Mamba/OnlineSpatialNet 接入完成后记录）
+# FLOPs: not measured（Mamba/OnlineSpatialNet 接入完成后记录）
+# Trainer MOS boundary: not applicable（SSL 不计算波形 MOS）
+# ============================================================
+base_config: fixed_array_ipdnet_dynamic_moving.yaml
+
+meta:
+  task: ssl
+  ssl_profile: ipdnet2_official
+  ssl_version: ipdnet2_contract_v1
+  inference_only: false
+
+model:
+  type: IPDNet2
+  # 模型超参：均为 IPDNet2.__init__ 的显式形参，未知键会抛 TypeError。
+  args:
+    # 输入口径 = C-1（非参考麦数）；模型内部换算 dim_input=2C。2 通道阵 → 1。
+    input_size: 1
+    # 官方 OnlineSpatialNet 隐层宽度。
+    hidden_size: 96
+    max_track: 2
+    n_fft: 512
+    # 官方删 DC 后的频点数 256；必须与 ssl.exclude_dc=true 配套。
+    num_freqs: 256
+    # 官方时间压缩倍数（layer0 后 AvgPool(5,1)）。
+    stride: 5
+    causal: true
+    # 官方 8 层结构、注意力与频率压缩配置。
+    num_layers: 8
+    num_heads: 4
+    dim_squeeze: 8
+    attention: mamba(16,4)
+    fre_compression_ratio: 16
+    time_compression_ratio: 5
+    time_compression_layer: 0
+    reference_channel: 0
+    # 官方幅度递归归一化由数据侧 ssl.normalization 承担，模型内关闭以避免双重归一化。
+    forgetting_norm_sample_length: null
+
+model_spec:
+  model_type: IPDNet2
+  feature_contract: multichannel_stft_real_imag
+  target_contract: dpipd_pair
+  # 官方为 reference-to-all 联合输出（ch_mode='M'），非 pair-batched。
+  pair_layout: reference_to_all
+  geometry_mode: variable_array
+  field_mode: near_field
+  reduction: mamba_time_pool
+  causal: true
+  mapping: near_field_doa_range_grid
+  target_layout: trailing_ri
+
+ssl:
+  input_representation: multichannel_stft_real_imag
+  target_representation: dpipd_near_field
+  mapping: near_field_doa_range_grid
+  pair_layout: reference_to_all
+  time_stride: 5
+  exclude_dc: true
+  normalization: forgetting_laplace
+  # 官方 RecordData.py 的递推长度；必须与数据侧 forgetting norm 显式一致。
+  forgetting_norm_sample_length: 249
+  phase_sign: 1.0  # +1 与 projection 的 others*conj(ref) target 相位约定一致；-1 会落到镜像方位（round-trip 校准结论）
+  coordinate_frame: room_xyz_m
+  time_reduction: mamba_time_pool
+  source_distance_input: false
+  model_inputs: [multichannel_stft_real_imag]
+
+data:
+  train:
+    freqs: 256
+  validation:
+    freqs: 256
+
+loss:
+  type: SSLDPIPDPITLoss
+  # 清除父配置中仅供 SSLSpatialMSELoss 使用的参数；PIT 容量与 DOA 权重采用构造器默认值。
+  args: null
+
+trainer:
+  exp_path: exp/ssl/ipdnet2_dynamic

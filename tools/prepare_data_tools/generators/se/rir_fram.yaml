@@ -1,0 +1,97 @@
+# RIR generation profile: realistic_speech
+# Purpose: 使用 FRAM-RIR 生成普通室内语音增强训练数据
+# Backend: fram
+# Sample rates: 16 kHz and 32 kHz
+#
+# 其余字段与同目录的 gpurir production profile 使用同一完整 schema。
+
+schema_version: 1
+profile: realistic_speech
+backend:
+  name: fram
+  gpurir:
+    diffuse_transition_db: 15.0
+    speaker_pattern: omni
+    speaker_orientation: null
+    microphone_pattern: omni
+    microphone_orientation: null
+  fram:
+    n_image_range:
+    - 512
+    - 2049
+    reflection_perturbation_range:
+    - -2.0
+    - 2.0
+    reflection_tau: 0.25
+    direct_window_range_ms:
+    - -6.0
+    - 50.0
+    highpass_cutoff_hz: 80.0
+sample_rates_hz:
+- 16000
+- 32000
+output_dir: null
+dataset:
+  total_rirs: 100000
+  near_far_ratio:
+  - 5.0
+  - 5.0
+  static_moving_ratio:
+  - 1.0
+  - 0.0
+scene:
+  room:
+    length_range_m:
+    - 3.0
+    - 8.0
+    width_range_m:
+    - 3.0
+    - 8.0
+    height_range_m:
+    - 2.5
+    - 3.5
+  geometry:
+    min_source_microphone_distance_m: 0.05
+    source_height_range_m:
+    - 1.1
+    - 1.8
+    microphone_height_range_m:
+    - 1.0
+    - 1.8
+  distance:
+    near_range_m:
+    - 0.2
+    - 0.8
+    far_range_m:
+    - 1.0
+    - 3.0
+    allow_overlap: false
+acoustics:
+  rt60_range_sec:
+  - 0.1
+  - 1.0
+  sound_speed_mps: 340.0
+  near_rir_length_samples: null
+  far_rir_length_samples: null
+motion:
+  enabled: false
+  n_segments_range:
+  - 3
+  - 6
+  segment_duration_sec: 0.2
+  speed_range_mps:
+  - 0.5
+  - 1.5
+  trajectory_type: both
+execution:
+  workers: 16
+  shards: 10
+  gpus: null
+output:
+  format: pkl
+  write_metadata_json: false
+  compute_sha256: false
+validation:
+  enabled: true
+  peak_threshold: 1.0e-06
+seed: 42

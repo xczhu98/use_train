@@ -1,0 +1,118 @@
+digraph AECModelFamilyOverview {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="white",
+    size="16,9!",
+    ratio=fill,
+    pad="0.22",
+    margin="0.05",
+    nodesep="0.32",
+    ranksep="0.42",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Noto Sans CJK SC",
+    fontsize=26,
+    fontcolor="#17324D",
+    label="AEC 代表模型：统一 canonical dict ABI，不同内部实现路径",
+    labelloc=t,
+    labeljust=l
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=13,
+    color="#A9B8C6",
+    fontcolor="#17324D",
+    penwidth=1.6,
+    margin="0.17,0.11"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    color="#536B80",
+    fontcolor="#40586D",
+    penwidth=1.8,
+    arrowsize=0.78
+  ];
+
+  frontend [
+    width=2.5,
+    fillcolor="#E8F1F8",
+    color="#3978A8",
+    label=<<B>Framework / Trainer</B><BR/><FONT POINT-SIZE="11">波形 → STFT<BR/>模型外持有时频变换</FONT>>
+  ];
+  abi_in [
+    width=3.1,
+    fillcolor="#DCECF7",
+    color="#2D70A3",
+    label=<<B>canonical dict 输入</B><BR ALIGN="LEFT"/><FONT FACE="monospace" POINT-SIZE="11">mic_spectra<BR/>farend_spectra</FONT><BR/><FONT POINT-SIZE="10">可选：error_spectra / error_mask</FONT>>
+  ];
+  abi_out [
+    width=3.2,
+    fillcolor="#DCECF7",
+    color="#2D70A3",
+    label=<<B>canonical dict 输出</B><BR/><FONT FACE="monospace" POINT-SIZE="11">nearend_estimate_spectra</FONT><BR/><FONT POINT-SIZE="10">部分模型可附加 state_probs 等字段</FONT>>
+  ];
+  istft [
+    width=2.6,
+    fillcolor="#E8F1F8",
+    color="#3978A8",
+    label=<<B>Framework / Trainer</B><BR/><FONT POINT-SIZE="11">iSTFT → near-end 波形</FONT>>
+  ];
+
+  { rank=same; frontend; abi_in; }
+  { rank=same; abi_out; istft; }
+
+  subgraph cluster_cagcrn {
+    label="CAGCRN";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#A65100";
+    color="#E9A253";
+    fillcolor="#FFF8EE";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=14;
+
+    cag_front [label="ERB + sub-band\nfeature extraction", fillcolor="#FFF0D8", color="#D8872A"];
+    cag_align [label="CATA\n固定 11 帧参考窗口", fillcolor="#FFE8C2", color="#D8872A"];
+    cag_core [label="TFGRU ×3", fillcolor="#FFF0D8", color="#D8872A"];
+    cag_head [label="complex mask\n+ TFAG", fillcolor="#FFF0D8", color="#D8872A"];
+    { rank=same; cag_front; cag_align; cag_core; cag_head; }
+    cag_front -> cag_align -> cag_core -> cag_head [color="#D8872A"];
+  }
+
+  subgraph cluster_deepvqe {
+    label="DeepVQE";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#6640A3";
+    color="#A88BD3";
+    fillcolor="#FAF7FE";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=14;
+
+    deep_front [label="mic / far 双分支\nEncoder", fillcolor="#EEE5F8", color="#8662B8"];
+    deep_align [label="AlignBlock\nsoft delay alignment", fillcolor="#E5D9F3", color="#8662B8"];
+    deep_core [label="GRU bottleneck", fillcolor="#EEE5F8", color="#8662B8"];
+    deep_head [label="Decoder + CCM", fillcolor="#EEE5F8", color="#8662B8"];
+    { rank=same; deep_front; deep_align; deep_core; deep_head; }
+    deep_front -> deep_align -> deep_core -> deep_head [color="#8662B8"];
+  }
+
+
+  frontend -> abi_in [color="#2D70A3"];
+  abi_in -> cag_front [color="#D8872A"];
+  abi_in -> deep_front [color="#8662B8"];
+  cag_head -> abi_out [color="#D8872A"];
+  deep_head -> abi_out [color="#8662B8"];
+  abi_out -> istft [color="#2D70A3"];
+}

@@ -1,0 +1,116 @@
+# ======================================================================
+# 实验配置：TF-SkiMNet，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：TFSkiMNet（inplace Local/Global TF + hidden/cell skipping memory）
+# Params：local 0.495842M total/trainable（本仓 6 blocks、hidden 32 构建实测）；paper/reference 0.49M
+# MACs：not measured（paper/reference 2.70G，但数据长度与 profiler 口径未在本仓复核）
+# FLOPs：not measured（未运行独立 FLOPs profiler，不以 MACs 乘系数替代）
+# Trainer MOS boundary：Trainer、模型 profile 与复杂度审计均不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文：TF-SkiMNet, Interspeech 2025；官方仓库无训练代码、checkpoint、评估代码与许可证
+# 本配置仅接入模型级移植，不声称复现论文 STOI/PESQ/RTF 或其他数值。
+# 当前 MagnitudePlusComplexL1Loss 在框架重建波形上重算 STFT，是可用的 consistency surrogate；
+# 它不等同于论文逐项的 RI L1 + 2×magnitude L1，因此不是 strict loss recipe 复现。
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/tf_skimnet_causal_offline_mag_complex_l1.yaml
+# 模型实现：tasks/se/models/discriminative/tf_skimnet.py（backbone 在 tasks/se/models/modules/tf_skimnet_impl.py）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  use_amp: false         # 关闭 AMP：Global-T LSTM 状态在 BF16 下未验证，本配置保持 FP32
+  use_ema: false         # 关闭 EMA 权重：官方未发布训练代码与 EMA 口径，避免额外显存与 eval 分支
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；谱进谱出模型只消费本段几何 ----
+stft:
+  n_fft: 320             # FFT 长度（采样点），16 kHz 下 20 ms；决定频率轴 F = n_fft//2+1 = 161
+  hop_length: 160        # 帧移（采样点），16 kHz 下 10 ms；= n_fft/2，与模型默认几何一致
+  win_length: 320        # 窗长（采样点），16 kHz 下 20 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hann           # 分析窗类型
+  center: true           # 居中补齐；带来 win_length//2 = 160 samples lookahead，与论文因果口徑的差异在此显式保留
+  normalized: false      # 关闭正交归一化（torch.stft normalized=false）：保持论文/官方默认能量口径，开启会改变谱幅度标度
+
+# ---- model：TFSkiMNet（tasks/se/models/discriminative/tf_skimnet.py）----
+model:
+  type: TFSkiMNet        # registry 名称（@MODEL_REGISTRY.register("TFSkiMNet")）
+  # n_fft/hop_length/win_length/window/center/normalized 由 build_model 从顶层 stft 注入；args 只放模型自身超参
+  args:
+    num_blocks: 6        # TF-SkiM block 数（论文/官方默认 6）；控制 block 循环与相邻 block 间的 state transition 次数
+    hidden_size: 32      # 隐藏通道数（论文/官方默认 32）；必须能被 local_temporal_groups 整除
+    encoder_kernel_size: 5          # encoder/decoder 的 causal Conv1d kernel（必须为正奇数）
+    local_frequency_kernel: 5       # Local-F 邻频卷积 kernel（必须为正奇数）
+    local_temporal_kernel: 5        # Local-T causal Conv1d kernel（必须为正奇数）
+    local_temporal_groups: 2        # Local-T grouped convolution 的 groups（正整数，需整除 hidden_size）
+    use_hidden_state_memory: true   # 用单向 Global-T LSTM 处理 hidden state；false 时该状态不经时间 LSTM 仍向下传播
+    use_cell_state_memory: true     # 用单向 Global-T LSTM 处理 cell state；false 时同上
+    use_global_temporal: true       # 把当前 block 的 hidden/cell 传给下一 block（block 间全局时间建模）
+    use_local_temporal: true        # 启用 Local-T 分支（块内局部时间卷积）
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；四列 SCP 的 fs 必须一致
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    max_duration: 64000               # 64000 样本，即 4 s @ 16 kHz；超长样本按 clean/noisy 同步随机裁切
+    repeat_to_max_duration: true      # 短样本 tile/repeat 到 max_duration（不是 collate pad），批内等长
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile，保持原始时长与官方评测口径一致
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 32       # 单卡 batch（假设：未做吞吐扫描；模型 0.50M 参数、4 s 画布下取 32）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：幅度 L1 + 复谱 L1（core/losses/freq_domain.py），在框架重建波形上重算 STFT ----
+loss:
+  type: MagnitudePlusComplexL1Loss  # 公式 (1/(T*F))·Σ(|S|-|Ŝ| + |S-Ŝ|)；consistency surrogate，非论文逐项 RI+magnitude 配方
+  args: {}               # 无显式参数；STFT 几何由顶层 stft 按构造器声明的键 setdefault 注入
+
+# ---- optimizer：Adam ----
+optimizer:
+  type: Adam             # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.Adam
+    lr: 0.001            # 初始学习率（无量纲）；未设 eps 即取 torch 默认 1e-8，未设 weight_decay 即 0.0
+
+# ---- scheduler：按验证 loss 平台期衰减（core/optim/scheduler.py 的 _Plateau）----
+scheduler:
+  type: ReduceLROnPlateau  # torch 原生；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.ReduceLROnPlateau
+    mode: min            # 监控 mean val loss，越低越好
+    factor: 0.5          # 触发后 lr 乘 0.5（无量纲）
+    patience: 3          # 连续 3 次 validation 无改善才衰减（单位：validation 次数）
+    min_lr: 0.00000001   # lr 下限 1e-8；达到后不再下降
+
+# ---- trainer：SETrainer（单优化器、无 GAN）----
+trainer:
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/tf_skimnet_causal_offline_mag_complex_l1   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 300            # 训练轮数；未声明 max_steps，故按 epoch 跑满
+  gradient_clip_value: 2.0   # 梯度范数裁剪阈值（无量纲，假设：未统计梯度范数）；skipping memory 跨 block 回传，取比通用 5.0 更紧的 2.0
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: false  # 调度器按 epoch step 一次（与 ReduceLROnPlateau 配套）
+  log_interval: 50           # 每 N 个 optimizer step 打一条训练日志
+  max_val_batches: 0         # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证（0 = 关闭）
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0（互斥语义见 core/trainer/base_trainer.py）
+  save_top_k: 3                  # 保留 val_loss 最低的 top-k checkpoint（步级验证场景使用）
+  # 客观指标（SI-SDR/PESQ/STOI）；interval 表示每 N 次 validation 计算一次
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, STOI]  # 指标枚举；均需 clean 参考
+    interval: 5          # 每 5 次 validation 计算一次指标（loss 仍每次验证都算）
+    max_utterances: 872              # 全局指标上限；各 rank 均分（当前 val SCP 实际 824 条，故最多评估 824 条）
+    max_utterances_metrics: 872  # 显式声明：省略时回退 max_utterances，避免“共享上限”误读
+    metrics_workers: 2   # 每个 rank 的侵入式指标进程池大小；0 = 自动（受 CPU 数限制）
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest 与 model_{epoch}.pth
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

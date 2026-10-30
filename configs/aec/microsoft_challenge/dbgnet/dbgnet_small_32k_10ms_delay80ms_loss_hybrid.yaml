@@ -1,0 +1,494 @@
+# ============================================================
+# 实验配置：DBGNet-Small 32 kHz + 80 ms 会议硬件随机延迟增强 + canonical aec_frontend
+# 数据管线：dynamic_aec（Acoustic Echo Cancellation）
+# Model: DBGNet Small（mic=[16,32,48,64]，far=[8,16,24,32]；关闭 state head）
+#   F-GRU：每方向 mic[-1]+far[-1] = 96（论文 Table I 规则，双向输出 192）；
+#   T-GRU 输入 192。
+# Params: 0.576 M total / 0.538 M trainable（关闭 state head；论文规则 F-GRU=mic[-1]+far[-1]=96）
+# MACs: 1.348 G（1,348,265,265；THOP partial/unverified；统一口径 B=1、1 秒 mic+farend、
+#   32 kHz、F=321、T=101；仅统计谱域 forward，图外 STFT/iSTFT 不计）
+# THOP: 已运行（结果 partial/unverified，可能漏计 functional/custom 算子）
+# FLOPs: 2.195G @ 1 s / 32 kHz（FlopCounterMode；B=1，F=321，T=101；仅模型前向）
+# RTF: not measured（无量纲 realtime factor；待在目标硬件、固定线程与部署路径实测）
+# Trainer MOS boundary: AECTrainer 在线验证不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等
+#   通过 evaluate/ 在 checkpoint 推理产物上离线评估。
+# ============================================================
+# 本配置仅定义 32 kHz 合同，复用 Small 结构并仅使用显式 GTCRN 两分量损失；模型和训练代码
+# 不因本配置修改。Params、MACs、FLOPs 与 RTF 仍须在实际 checkpoint/目标设备上 profile。
+# 推荐入口：python train.py -C configs/aec/microsoft_challenge/dbgnet/dbgnet_small_32k_10ms_delay80ms_loss_hybrid.yaml
+# 实现：tasks/aec/models/discriminative/dbgnet.py
+# 数据资产：data/... 为相对仓库根的在线仿真清单（SCP/JSON）；dynamic_aec 不消费离线
+#   GenerationManifest，因此本配置不声明 generator version。
+# ============================================================
+
+# ----------------------------------------------------------------------
+# meta：全局训练超参（随机种子、混合精度、cuDNN 行为）
+# ----------------------------------------------------------------------
+meta:
+  seed: 42                          # 全局随机种子；validation seed 由 Trainer 派生，划分可复现
+  use_amp: false                    # 关闭 AMP，保持 FP32；AEC 未验证 AMP 的数值稳定与收益
+  use_ema: false                    # 关闭 EMA；在线验证与导出直接用当前权重，不维护 shadow 参数
+  deterministic: false              # 关闭 cuDNN 确定性；换吞吐，代价是逐 run 非 bit-exact
+  amp_dtype: float16                # 仅 use_amp=true 时生效的 AMP 精度（本配置不使用）
+  ema_decay: 0.999                  # use_ema=true 时的 EMA 衰减系数，无量纲（本配置不使用）
+  cudnn_benchmark: true             # 允许 cuDNN 自动选最快卷积算法；输入形状固定时收益最大
+  allow_tf32: false                 # 关闭 TF32，保持 FP32 数值，避免与论文/导出结果偏差
+  compile_model: false              # 关闭 torch.compile；未在目标硬件与部署路径实测
+  gradient_checkpointing: false     # 关闭梯度检查点；模型显存不高，重算开销大于收益
+
+# ----------------------------------------------------------------------
+# stft：分析综合窗；注入需频域一致的模型参数
+# ----------------------------------------------------------------------
+# 32 kHz 下 640/320/640：n_fft//2+1 = 321 频点，hop=320 对应 10 ms 帧移。
+# center=True 是训练谱定义的一部分；部署端需按同一前端契约处理额外 10 ms lookahead。
+stft:
+  n_fft: 640            # FFT 长度（samples），32 kHz 下 20 ms；n_fft//2+1 = 321 频点
+  hop_length: 320       # 帧移（samples），32 kHz 下 10 ms；决定训练谱的帧率
+  win_length: 640       # 分析窗长（samples）；等于 n_fft，无零填充
+  window: hann          # 分析窗类型；Hann 满足 COLA，重叠相加可精确重建
+  center: true          # 帧中心对齐、两端补零；部署端需按同一前端契约处理额外 10 ms lookahead
+
+# ----------------------------------------------------------------------
+# model：DBGNet（tasks/aec/models/discriminative/dbgnet.py）；关闭 state head
+# ----------------------------------------------------------------------
+# 当前仅使用显式 GTCRN 两分量损失；如恢复非零权重的 StateCrossEntropyLoss，须同步将 use_state_detector 设为 true。
+model:
+  type: DBGNet                        # registry 模型名；实现见 tasks/aec/models/discriminative/dbgnet.py
+  args:                               # 模型构造参数；未知键抛 TypeError，不静默吞掉拼写错误
+    sample_rate: 32000                  # Hz；须与 data.sample_rate 一致
+    erb_low_bins: 81                    # 低频原始 bins 数；81 + 80 = 161（质量优先 baseline）
+    erb_bands: 80                       # 高频 240 bins 压成的 ERB bands 数
+    mic_channels: [16, 32, 48, 64]      # 各层 mic 分支通道数
+    far_channels: [8, 16, 24, 32]       # 各层 farend 分支通道数
+    use_state_detector: false           # 是否启用帧级 state head
+    state_nclass: 3                     # state head 类别数；关闭时仅占位
+
+# ----------------------------------------------------------------------
+# aec_frontend：顶层 canonical 部署前端配置（Trainer/Inference 在 STFT 前消费）
+# ----------------------------------------------------------------------
+# 关闭 AECDeploymentFrontend 的 Streaming GCC-PHAT delay alignment，input_routing=mic_farend；
+# 训练侧 0–80 ms 纯 Beta(2,4) delay 与 sudden_jump 均非论文分布（论文为 16 kHz、p=0.5、最长 1 s、Beta(1,3)）。
+aec_frontend:
+  delay_alignment:                 # 部署前端子段；enabled=false 时整段仅登记配置
+    enabled: false                 # 关闭前端对齐；模型依靠 FTG 建模远端时序
+  input_routing: mic_farend        # 模型输入 = 原始 mic + farend
+
+# ----------------------------------------------------------------------
+# data：mode=dynamic_aec 时构建 DynamicMixingDataset
+# ----------------------------------------------------------------------
+data:
+  mode: dynamic_aec                 # 路由 DynamicMixingDataset；必填，缺失/非法值 fail-fast
+  sample_rate: 32000                # Hz；须与 model.args.sample_rate 及各 SCP 采样率一致
+  task: joint                       # joint = AEC+SE（默认）；aec = 仅回声消除
+
+  train:                            # 训练 split：数据源清单 + split 级 Dataset 参数
+    # 干净近端语音源（canonical 四列 SCP：uid fs length path）。
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_32k_train.scp"
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"  # 加性噪声源 SCP
+    # music_scp（可选）：Layer C-3 背景音乐源；路径属本 split，不能放进 simulation_cfg。
+    # music_scp: data/ss/background/music/train.scp
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪源 SCP（Layer C-2）
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs32000/train_rirs.scp"    # RIR SCP
+    # 真实录制 ref/echo 预对齐 pair 清单；旧目录名不表示已验证原生全频数据。
+    real_farend_echo_pair_json: "data/aec/echo/echo_prealign_32k/real_farend_echo_pair_train.json"
+    filter_min_duration: 2.0   # s；过滤短于该时长的样本
+    filter_max_duration: 30.0  # s；过滤长于该时长的样本
+    # 帧级 state label 与模型 STFT 帧对齐（int64 [T]）；presence 由预加重 + 峰值归一化后的
+    # 相对 RMS 阈值（dB）判定，不是绝对 dBFS。
+    # fst_dt_nst（3 类：0=FST 有 echo 无 near / 1=DT / 2=NST 无 echo）或 scenario（8 类：near*4+echo*2+noise）。
+    state_detector_label_type: fst_dt_nst
+    state_detector_near_threshold_db: -40.0     # near presence 阈值，dB
+    state_detector_echo_threshold_db: -50.0     # echo presence 阈值，dB
+    state_detector_noise_threshold_db: -40.0    # 仅 scenario 路径消费；fst_dt_nst 不检查 noise
+    state_detector_hangover_frames: 3           # 帧；填补 active 区间内不超过该长度的短静音间隙
+    state_detector_smoothing_window_frames: 3   # 帧；滑窗众数滤波，1=关闭平滑
+    state_detector_absolute_floor: 1.0e-4       # 峰值归一化后的 RMS 绝对下限（线性幅度）
+    state_detector_pre_emphasis: 0.97           # 一阶预加重系数，无量纲；0=关闭
+
+    # ------------------------------------------------------------------
+    # A-3 模式 A 对齐；split 级 Dataset 参数，不能放进 simulation_cfg
+    # ------------------------------------------------------------------
+    # max_duration_seconds：s；固定画布上限（模式 B 的 silence canvas 长度）
+    max_duration_seconds: 10.0
+    repeat_to_max_duration: true                # 短于画布时是否 tile/补零到 max_duration_seconds
+    repeat_tile_silence_gap: true               # tile 段之间是否插入静音间隔
+    repeat_tile_silence_gap_range: [0.02, 0.8]  # s；静音间隔抽样区间
+    # 仿真固定顺序：A → B → C（含 C-aec）→ pre-finite → D-normalize → D-guard → E → F
+    # → task-post-EF → final-guard → post-finite；仅 AEC 的 aec_frontend 在 STFT 前由 Trainer 执行。
+    simulation_cfg:
+      # ------------------------------------------------------------------
+      # Layer A：干净语音预处理（scene_aware fixed silence canvas）
+      # ------------------------------------------------------------------
+      # 模式在加载 extra 前预判：模式 A（未命中 speech.silence.prob）保留 splice/tile；
+      # 模式 B（命中）只加载单 utterance，不拼接 extra，超长时只连续 crop 一次。
+      speech:
+        splice:                             # 模式 A：多段拼接成固定画布；模式 B 不进入此段
+          enabled: true                     # 启用多段 splice；模式 B 命中时只加载单 utterance
+          seconds: 10.0                     # s；splice 目标总长
+          seconds_range: [5.0, 10.0]        # s；目标总长随机抽样区间；给定后覆盖 seconds
+          gap_range: [0.02, 1.0]            # s；句间静音间隔；仅模式 A splice 使用
+          max_repeat_times: 4               # 最多加载的 extra 句数；仅模式 A
+          equal_volume: true                # 是否对 extra 句做等响度对齐
+          equal_volume_range: [-6, 6]       # dB；等响度增益区间
+        random_start: true                  # 超长时是否随机起点连续 crop
+
+        # A-2 语音增强（当前全部关闭：会议近端保持原始语速/音高/频响，避免与 AEC 目标失配）
+        speed:
+          prob: 0.0                         # 语速扰动概率；伯努利门，与 pitch/eq 可共现；0=关闭
+          rate_range: [0.9, 1.1]            # 语速倍率范围（无量纲）
+        pitch:                            # A-2 音高扰动（关闭）
+          prob: 0.0                         # 音高扰动概率；伯努利门，与 speed/eq 可共现；0=关闭
+          semitone_range: [-1.5, 1.5]       # 半音范围
+        eq:                               # A-2 均衡扰动（关闭）
+          prob: 0.0                         # 均衡扰动概率；伯努利门，与 speed/pitch 可共现；0=关闭
+          db_range: [-5, 5]                 # 增益范围（dB）
+        # 模式 A（splice.enabled=true）下本键被自动 skip；此处显式登记为禁用值
+        extra_space_prob: 0.0
+
+        # 模式 B（speech.silence.prob 命中）在 Layer A 建固定 10 s canvas 只放置一次；
+        # 最终对齐的 tile/补零键见 data.train.repeat_to_max_duration / repeat_tile_silence_gap。
+        silence:
+          prob: 0.5                  # 命中后走模式 B：固定 canvas 只放置一次
+          mode: "bimodal"            # uniform | bimodal；fixed canvas 下 range 不控制最终总静音
+          short_ratio: 0.30          # bimodal 分支取 short_range 的概率
+          short_range: [0.2, 0.8]    # s；short 分支静音区间
+          long_range: [1.0, 5.0]     # s；long 分支静音区间
+          position: "scene_aware"    # random | front | back | center | turn_boundary | scene_aware
+          beta_a: 0.6                # scene_aware 位置 Beta α
+          beta_b: 0.4                # scene_aware 位置 Beta β
+
+        high_pass:                       # A-4 高通滤波（去除 DC 与低频隆隆声）
+          enabled: true              # ~70 Hz 高通滤波（filtfilt）
+
+      # ------------------------------------------------------------------
+      # Layer B：场景角色抽样（prob_* 七项之和须 = 1.0，否则 fail-fast）
+      # ------------------------------------------------------------------
+      # 各分支决定 C-aec（清单回声 + SER）是否执行以及 noisy/clean 的组装方式；
+      # scene.timeline.prob / overlap_ratio_range 保持 core 默认（0 / [0.1, 0.5]）。
+      # 抽样方式：每条样本用一次 u~Uniform[0,1) 做 cumulative-CDF 选择（等价 multinomial），
+      # 七项互斥、不可共现；runtime 在 tasks/aec/data/dynamic_dataset.py 对 |Σprob−1|>1e-9 fail-fast。
+      # 未在 YAML 声明而取 runtime 默认 0.0 的概率字段（core/data/simulation_configs.py:147-294）：
+      # scene.timeline.prob、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter —— 本配置为单通道会议场景，全部保持 0。
+      scene:
+        prob_target_only: 0.05          # 仅近端
+        prob_noise_only: 0.05           # 仅噪声
+        prob_echo_only: 0.05            # 仅 echo
+        prob_noise_echo_only: 0.05      # 噪声 + echo
+        prob_target_noise: 0.2          # 近端 + 噪声
+        prob_target_echo: 0.2           # 近端 + echo
+        prob_target_noise_echo: 0.4     # 近端 + 噪声 + echo
+
+      # ------------------------------------------------------------------
+      # Layer C：声学混合（C-0 RIR → C-1 噪声 → C-2 风噪 → C-3 彩色噪声 → C-aec）
+      # ------------------------------------------------------------------
+      # C-0：acoustic.rir.backend 与 gpurir_*（room/rt60/距离/高度）保持 core 默认值（offline 后端），
+      # source budget/device/omni/timeout/cache 同样由 core 提供，不在 YAML 重复。
+      acoustic:                        # Layer C 声学混合段（C-0 RIR、C-1 噪声、C-2/C-3 见 background）
+        target:                        # 近端目标源子段
+          volume:                      # C-0b 目标音量标定
+            # C-0b：以 early target 标定音量，full/early/target 共用 gain（与 DeepVQE meeting 对齐）。
+            enabled: true
+            db_range: [-48, -12]        # dBFS；target 音量标定区间
+            use_rms: true               # 以 RMS 而非峰值计算音量
+            distribution: beta          # uniform | beta；Beta(2.0,1.5) 轻度偏向区间高端
+            beta_a: 2.0                 # Beta 分布 a 参数
+            beta_b: 1.5                 # Beta 分布 b 参数
+
+        # C-aec：far-end 与 echo 的 ERL 电平耦合；ERL = far_db - echo_db（dB），故 far_db = echo_db + ERL。
+        # 废弃的 farend_random_volume / farend_volume_db_range 会 fail-fast，两条路径不得混用。
+        rir:
+          reverberation_prob: 0.5     # 近端混响概率
+          moving_prob: 0.0            # 在线 moving RIR 概率；0=全静态（本模板配方保持关闭，非框架限制）
+          # segment_sec 仅用于离线 mono moving PKL 分段卷积；在线 moving 的分段由 trajectory timebase hop 决定。
+          target_type: early          # early | dry | rts；joint target=early-RIR clean，task=aec nearend 直通
+          reuse: false                # 是否在样本间复用同一 RIR
+          # shared full-peak：static full/early 共用 full peak；moving 全 sequence/early 共用 full-sequence peak。
+          normalize: true             # 是否做 shared full-peak 归一化
+          early_window_sec: 0.05      # s；clean_target 取 early RIR，noisy 取 full RIR
+
+        background:                     # C-1 加性噪声（SNR 抽样 + 可选第二段噪声混合）
+          noise_mix_prob: 0.25              # C-1b 第二段噪声混合概率
+          noise_mix_ratio_range: [0.1, 1.0] # 第二段噪声相对第一段的功率比区间
+          snr_low: -10                      # dB；加性噪声 SNR 下限
+          snr_high: 25                      # dB；加性噪声 SNR 上限
+          reuse_noise: false                # 是否在样本间复用同一噪声段
+
+          prob_wind_noise_sidechain: 0.02   # C-2 风噪 sidechain 概率（非加性；伯努利门，独立于 C-1/C-3）
+
+          wind_noise_config:                # C-2 风噪合成参数（区间为 min/max 抽样）
+            threshold: [0.1, 0.3]           # 压缩阈值区间（线性幅度，非 dB）
+            ratio: [1, 20]                  # 压缩比区间（无量纲）
+            attack: [5, 100]                # 起振时间区间（ms）
+            release: [5, 100]               # 释放时间区间（ms）
+            sc_gain: [0.8, 1.2]             # 侧链增益区间（线性，ffmpeg level_sc）
+            clipping_threshold: [0.85, 1.0] # 风噪截幅阈值区间（线性 0–1）
+            clipping_chance: 0.75           # 施加风噪截幅的概率（伯努利，无量纲）
+            wind_noise_snr_range: [-10, 25] # dB；风噪 SNR 区间
+
+          # C-3 彩色噪声：white / pink / brown / equalized，SNR 基准 = 干净近端语音，归入 noise stem。
+          prob_colored_noise: 0.15
+          colored_noise_snr_range: [10, 50]         # dB；彩色噪声 SNR 区间
+          colored_noise_types: [white, pink, brown, equalized]  # 噪声类型枚举（等概率抽取）
+      # Layer D：post-mix 幅度处理（normalize → guard），无 YAML 键；D-guard 在任一 mic-related stem 峰值
+      # 越界时触发，五路 AEC coupled bundle 共用同一确定性安全 scale；设备/ADC 饱和统一由 Layer F 建模。
+      # ------------------------------------------------------------------
+      # Layer E：固定会议麦克风输入链路，不启用随机信道退化
+      # ------------------------------------------------------------------
+      # 不对模型输入随机重采样、编解码或丢包；这些不属于 ADC 前的原始 PCM 路径。
+      channel:
+        enabled: false                  # Layer E 总开关
+        augmentations_name: [bandwidth_limitation]           # 可用退化项名单
+        num_augmentations: {0: 1.0, 1: 0.0, 2: 0.0, 3: 0.0}  # 抽取退化数量的分布；此处恒为 0 项
+        augmentations:                    # 退化项实现表；enabled=false 时仅登记，不生效
+          bandwidth_limitation: {weight: 1.0, resample_methods: random}  # 禁用：固定 32 kHz ADC 无重采样链路
+
+      # ------------------------------------------------------------------
+      # Layer F: observation/device clipping 权威位置
+      # ------------------------------------------------------------------
+      # 以 0.15 概率先施加 0–9 dB pre-drive，再在固定 ±1.0 rail 做设备/ADC 截幅；
+      # 另保留 post_eq(0.15)。论文未披露目标硬件规格，此处是工程对齐。
+      device:
+        enabled: true                 # Layer F 总开关；false 时整层跳过（本配置开启设备/ADC 截幅）
+
+        # F-1 设备/ADC 截幅：先按 pre-drive 增益抬升，再在固定 ±1.0 rail 截幅
+        prob_clip: 0.15               # 截幅触发概率（伯努利门，与 F-2 post_eq 可共现）
+        clip_variants: [fixed_rail]   # 截幅变体枚举（fixed_rail/hard/soft/sigmoid/sox/pedal）
+        clip_variant_probs: {fixed_rail: 1.0}  # 变体权重；权重和须为 1.0（runtime 校验）
+        clip_pre_drive_db_range: [0.0, 9.0]    # 截幅前驱动增益区间（dB）
+        clip_rate_range: [0.01, 0.2]           # hard 变体按采样比例截幅（无量纲；本配置未选用）
+        clip_threshold_db_range: [-20, -1]     # hard 变体按阈值截幅（dB；本配置未选用）
+        clip_soft_slope_range: [1.0, 5.0]      # soft 变体斜率（无量纲；本配置未选用）
+        clip_sigmoid_slope_range: [1.0, 5.0]   # sigmoid 变体斜率（无量纲；本配置未选用）
+        clip_sox_threshold_db_range: [-15, -5] # sox 变体阈值（dB；本配置未选用）
+
+        # F-2 后处理 EQ：模拟麦克风/腔体/模拟前端频响差异
+        prob_post_eq: 0.15            # EQ 施加概率（伯努利门，与 F-1 可共现）
+        post_eq_db_range: [-3, 3]     # EQ 增益区间（dB）
+
+        # F-3 低通滤波：与 Layer E bandwidth_limitation 重复，保持关闭
+        prob_lowpass: 0.0             # 低通触发概率；0=关闭
+        lowpass_cutoff_range: [1000, 8000]  # 截止频率区间（Hz；关闭时仅登记）
+        lowpass_order_range: [4, 20]        # 滤波器阶数区间（关闭时仅登记）
+
+        # F-4 带阻/陷波：反馈抑制等场景，会议不典型，保持关闭
+        prob_band_reject: 0.0         # 陷波触发概率；0=关闭
+        band_reject_center_freq_range: [100, 8000]  # 中心频率区间（Hz）
+        band_reject_freq_bw_range: [20, 500]        # 带宽区间（Hz）
+        band_reject_use_stft: true                  # 在 STFT 域施加（关闭时仅登记）
+        band_reject_max_n: 2                        # 最多陷波个数
+
+        # F-5 DC 偏移：现代设备通常已滤除，保持关闭
+        prob_dc_offset: 0.0           # DC 偏移触发概率；0=关闭
+        dc_offset_range: [0.001, 0.2] # DC 偏移幅度（无量纲）
+
+        # F-6 DRC/AGC：已关闭。Layer F 的 DRC 仅作用于 noisy；在支持对 clean target 同步施加同一 DRC 前保持关闭，避免判别式训练的 scale 失配。
+        prob_drc: 0.0                 # DRC 触发概率；0=关闭
+        drc_threshold_db_range: [-50, 0]     # 压缩阈值区间（dB）
+        drc_ratio_range: [1, 20]             # 压缩比区间（无量纲）
+        drc_attack_ms_range: [0.5, 5.0]      # 起振时间区间（ms）
+        drc_release_ms_range: [50, 1000]     # 释放时间区间（ms）
+
+        # F-7 编解码：上行链路位于模型输出之后，不作用于输入，保持关闭
+        prob_codecs: 0.0              # 编解码退化触发概率；0=关闭
+        codecs_types: [mp3, gsm, opus, aac]  # 编解码格式枚举
+
+        # F-8 比特压缩：罕见，保持关闭
+        prob_bit_crush: 0.0           # 位深压缩触发概率；0=关闭
+        bit_crush_range: [4, 16]      # 量化位深区间（bit）
+
+        # F-9 频谱洞：偏无线衰落，会议不典型，保持关闭
+        prob_spectral_holes: 0.0      # 频谱洞触发概率；0=关闭
+        spectral_holes_frame_length: 1024        # STFT 帧长（samples）
+        spectral_holes_hop_length: 256           # STFT 帧移（samples）
+        spectral_holes_num_range: [1, 20]        # 洞个数区间
+        spectral_holes_width_freq_range: [1, 5]  # 频率方向宽度（bin）
+        spectral_holes_width_time_range: [1, 5]  # 时间方向宽度（帧）
+        spectral_holes_cutoff_freq: 10000        # 作用频率上限（Hz）
+
+        # F-10/F-11 WebRTC NS/AGC：假设 DBGNet 为主处理模块，保持关闭
+        prob_webrtc_ns: 0.0           # WebRTC 噪声抑制触发概率；0=关闭
+        webrtc_ns_levels: [0, 1, 2, 3]  # NS 等级枚举
+        prob_webrtc_agc: 0.0          # WebRTC AGC 触发概率；0=关闭
+        webrtc_agc_target_dbfs_range: [-31, -3]  # AGC 目标电平区间（dBFS）
+
+        # F-12 bass_boost：保留低频、衰减 cutoff 以上，形成相对 bass emphasis，保持关闭
+        prob_bass_boost: 0.0          # bass_boost 触发概率；0=关闭
+        bass_boost_highpass_cutoff_range: [500, 2000]  # 高通截止频率区间（Hz）
+        bass_boost_attenuation_min_db: -25             # cutoff 以上最小衰减（dB）
+
+        # F-13 频谱泄漏：不是真实声学场景，保持关闭
+        prob_spectral_leakage: 0.0    # 频谱泄漏触发概率；0=关闭
+        spectral_leakage_window_lengths: [1024, 2048, 4096]  # STFT 窗长枚举（samples）
+        spectral_leakage_max_time_shift: 20                  # 最大时移（samples）
+
+        # F-14 响度扰动：保持关闭，范围仍与会议配置一致，作为禁用参数保留
+        prob_loudness_perturb: 0.0    # 响度扰动触发概率；0=关闭
+        loudness_factor_range: [0.3, 3.0]  # 响度倍率区间（无量纲）
+        loudness_max_n_intervals: 5        # 最大分段数
+
+      # Layer C-aec：远端参考电平与 echo 的 ERL 耦合（五路 AEC coupled bundle 的一部分）。
+      aec:
+        far_db_range: [-42, -12]  # dBFS RMS；与 DeepVQE meeting 对齐的参考信号物理范围
+        erl_range: [-20, 40]      # dB；ERL = far_db - echo_db（正值表示 echo 比参考更弱）
+        erl_distribution: beta    # uniform | beta
+        erl_beta_a: 1.5           # Beta 分布 a 参数（无量纲）
+        erl_beta_b: 1.5           # Beta 分布 b 参数（无量纲）
+
+        # ------------------------------------------------------------------
+        # Layer C-aec：离线预对齐 ref/echo + 随机延迟增强
+        # ------------------------------------------------------------------
+        # 主体是 0–80 ms 纯 Beta(2,4) delay（会议硬件工程策略，非论文分布）；sudden_jump 仅作极偶发
+        # route/buffer 突跳压力桶，不是主体 delay、drift 或周期 jitter。
+        # aec_ref_echo_fine_gcc_align=false：清单已离线对齐；在线 GCC 会改变已物化 pair 时序且非只读质量门。
+        aec_ref_echo_fine_gcc_align: false
+        # GCC 参数在 fine_gcc_align=false 时不参与 waveform 变换，仅作原始语料回退参数。
+        aec_ref_echo_gcc_farend_pad_policy: apply     # farend 补零策略
+        aec_ref_echo_gcc_max_tau_seconds: 0.3         # s；GCC 搜索的最大时延
+        aec_ref_echo_gcc_max_pad_seconds: 0.3         # s；farend 最大补零长度
+        aec_ref_echo_gcc_peak_threshold: 0.05         # 归一化互相关峰值门限，无量纲
+        aec_ref_echo_random_delay_prob: 1.0           # 施加随机延迟的概率
+        aec_ref_echo_random_delay_mode: echo_only     # 延迟只施加到 echo，ref 保持不动
+        # 会议硬件工程策略（非论文分布）：0–80 ms 纯 Beta(2,4)。
+        aec_ref_echo_random_delay_distribution: beta  # uniform | beta
+        aec_ref_echo_random_delay_beta_a: 2.0         # Beta 分布 a 参数
+        aec_ref_echo_random_delay_beta_b: 4.0         # Beta 分布 b 参数
+        aec_ref_echo_random_delay_uniform_prob: 0.0   # π；(1-π)·Beta + π·Uniform[min,max] 的混合权重
+        aec_ref_echo_delay_range_ms: [0.0, 80.0]      # ms；延迟抽样区间
+        # 纯 sudden_jump 极偶发 route/buffer 压力桶；保留完整合同但不配置 jitter_type_probs。
+        aec_time_delay_jitter:
+          enabled: true                      # 总开关
+          prob: 0.03                         # 命中概率
+          jitter_type: sudden_jump           # sudden_jump | gradual_drift | periodic_jitter | mixed
+          jitter_rate: [0.02, 0.10]          # events/s；跳变发生率区间
+          jitter_corr_length: [100.0, 500.0] # ms；相关长度区间
+          jitter_max_ms: 20.0                # ms；单次事件幅度上限
+          jump_ms_range: [-20.0, 20.0]       # ms；跳变幅度区间
+          min_segment_ms: 1000.0             # ms；分段最短时长
+          transition_ms: 0.0                 # ms；跳变过渡时长
+          edge_mode: nearest                 # constant | nearest
+        ser_range: [-20, 20]                 # dB；SER 抽样区间
+
+        # ------------------------------------------------------------------
+        # 回声设备 EQ（C-aec，在 SER / aec_echo_clipping 之前，只对 echo 生效）
+        # ------------------------------------------------------------------
+        # 近似播放设备线性着色（random_eq -> post_augment.post_eq 与 bass_boost）；房间/摆位效应由 RIR 建模，
+        # reference tap 位于播放着色之前，因此 farend 不带该 EQ。
+        aec_echo_device_eq:
+          enabled: true                 # 总开关
+          prob: 0.25                    # 施加概率
+          variant_probs: {random_eq: 0.75, bass_boost: 0.25}   # 变体权重；和须为 1.0（runtime 校验）
+          random_eq_db_range: [-6.0, 6.0]                       # dB；随机 EQ 增益区间
+          bass_boost_highpass_cutoff_range: [200.0, 2000.0]     # Hz；高通 cutoff 区间
+          bass_boost_attenuation_min_db: -12.0                  # dB；cutoff 以上最小衰减
+
+        # ------------------------------------------------------------------
+        # 回声非线性失真（C-aec，混入 mic 之前）；设计见 docs/guides/aec/AEC_Data_Simulation.md
+        # ------------------------------------------------------------------
+        # 三条互斥路径，触发后按 path_probs 选一条：post_ser_distortion 按 echo 自身峰值比例截幅；
+        # pre_ser_overload 跳过 SER 直接 boost 后按固定 dBFS rail 截幅；synced_ref_clip 对 echo/farend 同步 rail。
+        # path_probs 与各 paths.*.variant_probs 均为互斥权重组，和须为 1.0；runtime 在
+        # tasks/aec/data/dynamic_dataset.py 的权重校验中 fail-fast（容差 1e-9）。
+        aec_echo_clipping:
+          enabled: true              # 总开关
+          prob: 0.15                 # 含 echo 的样本中触发上述路径之一的概率
+          path_probs: {post_ser_distortion: 0.80, pre_ser_overload: 0.15, synced_ref_clip: 0.05}  # 三条互斥路径权重，和须为 1.0
+          paths:                     # 各路径参数子表；未命中路径的参数不参与波形变换
+            post_ser_distortion:     # SER 之后按 echo 自身峰值比例截幅
+              variant_probs: {tanh: 0.35, hard: 0.65}       # 变体权重，和须为 1.0（tanh 软削波 / hard 硬截幅）
+              peak_relative_threshold_range: [0.90, 0.99]   # 相对 echo 自身峰值的阈值区间
+            pre_ser_overload:        # 跳过 SER，先 boost 再按固定 dBFS rail 截幅
+              variant_probs: {fixed_rail: 0.80, tanh: 0.20} # 变体权重，和须为 1.0
+              overload_boost_db_range: [0.0, 6.0]           # dB；boost 区间
+              rail_dbfs_range: [-3.0, -0.5]                 # dBFS；固定截幅 rail
+            synced_ref_clip:         # 对 echo 与 farend 同步施加同一固定 rail 截幅
+              variant_probs: {fixed_rail: 0.95, tanh: 0.05} # 变体权重，和须为 1.0
+              rail_dbfs_range: [-3.0, -0.5]                 # dBFS；固定截幅 rail
+  validation:                        # 验证 split：结构与 train 同源，inherit_simulation 复用其 simulation_cfg
+    inherit_simulation: true   # 继承 train 的 simulation_cfg，仅覆盖数据源键
+    # 验证集干净近端语音 SCP（canonical 四列；各轨 uid 集合须与 train 一致）。
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_32k_val.scp"
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs32000/val_rirs.scp"    # 验证集 RIR SCP
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"          # 验证集噪声源 SCP
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp"  # 验证集风噪源 SCP
+    # 真实录制 ref/echo 预对齐 pair 清单；旧目录名不表示已验证原生全频数据。
+    real_farend_echo_pair_json: "data/aec/echo/echo_prealign_32k/real_farend_echo_pair_val.json"
+    filter_min_duration: 2.0   # s；过滤短于该时长的样本
+    filter_max_duration: 30.0  # s；过滤长于该时长的样本
+
+  dataloader:                        # train/val loader 配置（共享项 + val 侧独立限流）
+    batch_size: 16                   # 每个 rank 的 batch size
+    num_workers: 4                   # 每个 rank 的 train worker 进程数（CPU bound 仿真）
+    val_num_workers: 1               # validation worker 数；0 时该侧强制 persistent_workers=false
+    prefetch_factor: 2               # 每个 worker 预取的 batch 数
+    pin_memory: true                 # 启用 CPU→GPU pinned-memory 传输
+    timeout: 120                     # s；worker 取数超时后抛 TimeoutError
+    persistent_workers: true         # train worker 跨 epoch 常驻
+    val_persistent_workers: false    # validation worker 每轮回收
+
+# ----------------------------------------------------------------------
+# loss：GTCRN 压缩谱损失与 log-ratio 项显式组合（不含 StateCrossEntropyLoss）
+# ----------------------------------------------------------------------
+# 压缩谱分量继承顶层 STFT 几何（win_length=640、window=hann、center=true）；GTCRNLogRatioLoss 计算
+# -log10(||s_target||²/||e_noise||²+eps)，不是标准 SI-SNR/SI-SDR 的 -10*log10 dB 数值形式。
+loss:
+  type: CompositeLoss                # 组合损失；子项按 components 顺序执行
+  components:                       # 子项列表；每项只接受 type/weight/args/name/enable_ss_undesired_energy
+  - type: GTCRNCompressedSpectralLoss  # 压缩幅度/复数谱 MSE
+    weight: 1.0                     # 权重，无量纲
+    args:                           # 该 loss 的构造参数
+      compress_factor: 0.3          # 幅度压缩指数 γ，无量纲
+      lamda_ri: 30.0                # 复数谱（RI）项权重
+      lamda_mag: 70.0               # 幅度谱项权重
+  - type: GTCRNLogRatioLoss          # 压缩谱 log-ratio 项（非标准 SI-SNR 数值形式）
+    weight: 1.0                     # 权重，无量纲
+
+# --- Optimizer ---
+optimizer:
+  type: AdamW                        # 优化器类型
+  args:                              # 优化器参数
+    lr: 0.001                        # 初始学习率（无量纲）
+    weight_decay: 0.01               # 权重衰减（无量纲）
+
+# --- Scheduler ---
+scheduler:
+  type: LinearWarmupCosineAnnealing  # 线性 warmup + cosine 退火
+  args:                              # 调度器参数
+    max_lr: 1.0e-3                   # 峰值学习率（须与 optimizer.args.lr 一致）
+    min_lr: 1.0e-6                   # 退火终点学习率
+
+# --- Trainer ---
+trainer:
+  type: AECTrainer                   # AEC 任务 Trainer；train.py 按 data.mode 路由
+  exp_path: exp/aec/dbgnet_small_32k_10ms_delay80ms_loss_hybrid  # 实验根目录（checkpoint、日志、曲线）
+
+  epochs: 60                         # 训练总 epoch 数
+  gradient_clip_value: 1.0           # 梯度范数裁剪阈值（无量纲）
+  strict_checks: false               # false = 跳过 loss/配置收敛前置检查
+  accumulation_steps: 1              # 梯度累积步数；1 = 每个 batch 更新一次
+  lr_schedule_per_step: true         # true = 每个 optimizer step 步进 LR（本配置 scheduler 按 step）
+  log_interval: 100                  # 每 N 个 optimizer step 打印一次训练日志
+
+  max_val_batches: 0           # 0=不限制，覆盖时长过滤后的全部有效验证样本
+  validation_epoch_interval: 1     # 每 N 个 epoch 末验证；0=关闭
+  validation_steps_interval: 0     # 关闭步级验证
+  save_top_k: 0                # 仅 step-level 验证时生效；当前由 best_model.tar 记录 epoch best
+
+  val_metrics:                     # 在线客观指标配置（与 evaluate/ 离线 MOS 无关）
+    enabled: true              # 是否在验证时计算客观指标
+    metrics: [SI-SDR, ESTOI, ERLE]  # 指标名单；AEC 须显式列出 ERLE，否则不计算 ERLE
+    interval: 1                # 每 N 次验证计算一次
+    # validation 目标与原始 SCP 均为 2200 条；valid metrics 仍可能因有效性过滤而更少（全局，各 rank 均分）。
+    max_utterances: 2200       # 全部验证样本的全局 quota
+    # 显式声明：metrics 与 ERLE 各自独立 quota（省略时均回退 max_utterances）。
+    max_utterances_metrics: 2200   # SI-SDR/ESTOI 等指标的全局 quota
+    max_utterances_erle: 2200      # ERLE 的独立全局 quota
+    metrics_workers: 2         # 每个 rank 的隔离指标进程数
+
+  save_checkpoint_interval: 1      # 每 N 个 epoch 写一次 latest 与 model_{epoch}.pth
+
+# --- Distributed ---
+distributed:
+  backend: nccl                      # 分布式后端
+  find_unused_parameters: false      # 单路径前向无未使用参数；置 true 会显著拖慢 DDP
+  nccl_timeout_minutes: 30           # NCCL 通信超时（min）

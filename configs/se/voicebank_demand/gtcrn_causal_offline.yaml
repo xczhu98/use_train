@@ -1,0 +1,158 @@
+# ============================================================
+# 实验配置：GTCRN，VoiceBank-Demand，离线预混（16 kHz）
+# ============================================================
+# 模型：GTCRN（因果复谱掩码，固定 16 kHz ERB 前端）
+# Params：local 0.0482M total / 0.0237M trainable；paper/reference 0.0237M trainable
+# 1 秒输入 MACs：local 0.0341G @ 16 kHz（THOP，partial/unverified；通常不计 STFT/iSTFT）；paper/reference 0.0396G
+# 独立 FLOPs：not measured（本地审计仅统计 MACs，不用 2×MACs 冒充独立测量）
+# Trainer MOS boundary：Trainer 只计算侵入式客观指标；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文/参考："GTCRN: A Speech Enhancement Model Requiring Ultralow Computational Resources"（ICASSP 2024）
+# 本地口径：当前 YAML 经 tools/model_tools/audit_metrics.py 按 1 秒输入复核；固定 ERB 权重计入 total Params
+# 数据：VCTK-DEMAND（Valentini-Botinhao et al. 2016）；监督为配对 noisy/clean，无在线仿真随机性。
+# 模型实现：tasks/se/models/discriminative/gtcrn.py（GTCRN 类）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ============================================================
+# Diff vs DNS3 示例配置（本文件与 dns_challenge3 示例对齐项):
+#   batch_size:   4 (VB) vs 16 (DNS3)
+#   max_duration: 本文件 train 用 128000 样本（8 s @ 16 kHz）；DNS3 示例同为 128000
+#   data_source:  VoiceBank 预混 offline vs DNS3 由脚本生成的 offline SCP
+#   snr_range:    由各自数据集/生成脚本决定，不在此重复
+#   其余 (model / loss / optimizer 等) 可按论文或需求与 DNS3 示例对齐。
+# ============================================================
+#
+# Train:
+#   python train.py -C configs/se/voicebank_demand/gtcrn_causal_offline.yaml
+#
+# Evaluate:
+#   python evaluate/eval_pipeline_se.py -C configs/se/voicebank_demand/gtcrn_causal_offline.yaml \
+#       --checkpoint exp/se/gtcrn_causal_offline/checkpoints/<run-id>/best_model.tar
+#
+# 数据准备：单目录模式扫描完整目录，-o 为输出文件前缀；生成路径与 data.*_scp 精确一致。
+#   python tools/prepare_data_tools/scp/prepare_scp.py \
+#       data/se/voicebank_demand/clean_trainset_wav \
+#       -o data/se/voicebank_demand/voicebank_clean_train
+#   python tools/prepare_data_tools/scp/prepare_scp.py \
+#       data/se/voicebank_demand/noisy_trainset_wav \
+#       -o data/se/voicebank_demand/voicebank_noisy_train
+#   python tools/prepare_data_tools/scp/prepare_scp.py \
+#       data/se/voicebank_demand/clean_testset_wav/clean_testset_wav \
+#       -o data/se/voicebank_demand/voicebank_clean_val
+#   python tools/prepare_data_tools/scp/prepare_scp.py \
+#       data/se/voicebank_demand/noisy_testset_wav/noisy_testset_wav \
+#       -o data/se/voicebank_demand/voicebank_noisy_val
+
+# --- Meta ---
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  # 性能开关均为全局可调项：meta.amp_dtype / meta.compile_model / meta.gradient_checkpointing /
+  # meta.cudnn_benchmark 与 trainer.accumulation_steps；本配置保持 FP32 兼容默认值，启用 AMP/BF16 前先确认 GPU 能力。
+  use_amp: false         # 关闭 AMP：本模型极小（0.05M），FP32 已足够快，BF16 收益与数值风险不匹配
+  use_ema: false         # 关闭 EMA 权重：上游未使用 EMA，避免额外显存与 eval 分支
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- STFT（框架负责 wav <-> spec；谱进谱出模型使用本段几何）----
+stft:
+  n_fft: 512             # FFT 长度（采样点），16 kHz 下 32 ms；决定频率轴 F = n_fft//2+1 = 257
+  hop_length: 256        # 帧移（采样点），16 kHz 下 16 ms；= n_fft/2，官方 GTCRN 16 ms 帧移口径
+  win_length: 512        # 窗长（采样点），16 kHz 下 32 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hann           # 分析窗类型；上游 GTCRN 默认
+  center: true           # 居中补齐（框架默认值，此处显式化）；带来 win_length//2 = 256 samples lookahead
+
+# ---- Model（GTCRN 论文固定结构）----
+# n_fft/hop_length/win_length 由 build_model 从上方 stft 段注入
+model:
+  type: GTCRN            # registry 名称（@MODEL_REGISTRY.register("GTCRN")）
+  # GTCRN 无自身超参：n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入，
+  # target_fs 取构造器默认 16000；ERB 滤波器组固定 fs=16000/high_lim=8000，非 16 kHz 会静默错分频带
+  args: {}
+
+# ---- Data（离线预混配对）----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；与 SCP 内嵌 fs 一致
+
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    max_duration: 128000              # 128000 样本，即 8 s @ 16 kHz；超长样本按 clean/noisy 同步随机裁切
+    repeat_to_max_duration: true      # 长样本随机裁切到 max_duration；短样本 tile/repeat 到 max_duration（非 collate pad）
+
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False，
+  # 即验证集不裁切、不 tile，保持原始时长与官方评测口径一致
+  validation:            # 验证 split：824 条测试集配对
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 与 noisy_scp 逐条配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对，uid 一一对应
+
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 4         # 论文 Section 3.2：VCTK-DEMAND 的 batch size = 4
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- Loss：显式 CompositeLoss（GTCRN 压缩频谱 + log-ratio）----
+# 上游 gtcrn-main/loss.py；公式 30*L_ri + 70*L_mag - log10(ratio+eps)，STFT 几何由顶层 stft 注入
+loss:
+  type: CompositeLoss    # 组合损失容器；顶层仅接受 type/components/strict/enable_ss_undesired_energy
+  components:            # 每个 component 仅接受 type/weight/args/name/enable_ss_undesired_energy
+    - type: GTCRNCompressedSpectralLoss  # 压缩 RI + magnitude 损失，支持直谱路径（core/losses/hybrid.py）
+      weight: 1.0        # 该组件在总损失中的权重（无量纲）
+      args:              # 组件参数；STFT 相关键由 runtime 按构造器声明从顶层 stft 注入
+        compress_factor: 0.3   # paper: c = 0.3（来源为上游 GTCRN checkout）；幅度压缩指数（0 < c <= 1，无量纲）
+        lamda_ri: 30.0         # 30*(L_real + L_imag)；压缩实虚部损失权重（无量纲，>= 0）
+        lamda_mag: 70.0        # 70*L_mag；压缩幅度损失权重（无量纲，>= 0）
+    - type: GTCRNLogRatioLoss  # 尺度投影 log-ratio 损失；仅对有效 speech 参考生效（core/losses/hybrid.py）
+      weight: 1.0        # 该组件权重（无量纲）；与上一组件等权，合计为论文总损失的项目实现
+
+# ---- Optimizer（论文 Section 3.2：Adam，lr=0.001）----
+optimizer:
+  type: Adam             # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.Adam
+    lr: 0.001            # 论文：初始 learning rate = 0.001；未设 eps 即 torch 默认 1e-8，未设 weight_decay 即 0.0
+
+# ---- Scheduler（论文：val loss 连续 5 个 epoch 无改善时 lr 减半）----
+scheduler:
+  type: ReduceLROnPlateau  # torch 原生；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.ReduceLROnPlateau
+    mode: min            # monitor mean val loss (lower is better)
+    factor: 0.5          # paper: "halved"；触发后 lr 乘 0.5（无量纲）
+    patience: 5          # paper: "5 consecutive epochs"；连续 5 次 validation 无改善才衰减
+    min_lr: 0.00001      # lr 下限 1e-5；达到后不再下降
+
+# ---- Trainer ----
+trainer:
+  # 类型与实验目标
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/gtcrn_causal_offline   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+
+  # 训练规模与日志
+  epochs: 200            # 训练轮数；未声明 max_steps，故按 epoch 跑满
+  gradient_clip_value: 5.0   # 梯度范数裁剪阈值（无量纲）
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: false # ReduceLROnPlateau 按 epoch 调度
+  log_interval: 50           # 每 N 个 optimizer step 打一条训练日志
+
+  # 验证（全局）
+  max_val_batches: 0          # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  # validation_epoch_interval 与 validation_steps_interval 的互斥语义见 core/trainer/base_trainer.py。
+  # 当 validation_steps_interval > 0、save_top_k > 0 且 validation_epoch_interval > 0 时，关闭 epoch 末验证。
+  validation_epoch_interval: 1
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0
+  save_top_k: 3                  # 步级验证保留 val_loss 最低的 top-k checkpoint
+  # 客观指标（SI-SDR/PESQ/STOI）；interval 表示每 N 次 validation 计算一次。
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, STOI]  # 指标枚举；均需 clean 参考
+    interval: 5          # 每 5 次 validation 计算一次指标（loss 仍每次验证都算）
+    max_utterances: 872      # 全局指标上限；当前 SCP 实际 824 条，因此最多评估 824 条（各 rank 均分）
+    max_utterances_metrics: 872  # 显式声明：省略时回退 max_utterances
+    metrics_workers: 2       # 每个 rank 的侵入式指标进程数；0 = 自动
+
+  # save_curve_interval: 1   # 可选：每 N 次 validation 写 loss/指标曲线；1=每次
+  # early_stop_patience: 0   # 可选：连续 N 次 validation 无改进即停；0=关闭
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest、model_{epoch}.pth
+
+# --- Distributed (DDP) ---
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

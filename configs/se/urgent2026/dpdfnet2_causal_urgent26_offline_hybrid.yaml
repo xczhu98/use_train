@@ -1,0 +1,199 @@
+# ======================================================================
+# 实验配置：DPDFNet-2，离线预混数据，显式 CompositeLoss（近因果，16 kHz）
+# ======================================================================
+# 模型：DPDFNet-2（当前活动参数为 dprnn_num_blocks=2、Concat、全频 ERB mask）
+# 实时边界：df_lookahead=2、conv_lookahead=2 固定保留 2 帧前瞻；cache 支持逐帧处理但不能消除前瞻。
+# 16 kHz、hop_length=160 时，每帧 10 ms，固定算法前瞻约 20 ms。
+# Params：local 2.4980M total；paper/reference 2.49M
+# 1 秒输入 MACs：local 1.3530G @ 16 kHz（THOP，partial/unverified；通常不计 STFT/iSTFT）；paper/reference 1.35G
+# 独立 FLOPs：not measured（本地审计与论文表均仅给 MACs，未运行独立 FLOPs profiler）
+# Trainer MOS boundary：Trainer 只计算侵入式客观指标；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文/参考：DPDFNet-2 表项 2.49M Params/1.35G MACs；DF2/DF3/DPDFNet-4/8 仅为可选变体参考
+# 本地口径：当前 YAML 经 tools/model_tools/audit_metrics.py 按 1 秒输入复核；当前 Composite 组件未启用论文 LSNR/over-attenuation 组合目标
+# 目的：在固定 clean/noisy 对上训练，排除动态仿真随机性，便于与 dynamic 配置做消融对照。
+#
+# | 参考变体          | enc_concat | enc_lin_groups | lin_groups | erb_apply_above_bins | dprnn_num_blocks | gru_variant | 采样 | Params/MACs reference |
+# |-------------------|------------|----------------|------------|----------------------|------------------|-------------|------|-----------------------|
+# | DeepFilterNet2    | true       | 8              | 8          | null（全频 ERB）     | 0                | squeezed    | 16k  | 论文约 2.31M/0.36G    |
+# | DeepFilterNet3    | false      | 32             | 16         | 96（仅高频约 4.8kHz+）| 0               | squeezed_s  | 48k  | 约 2.14M/0.35G；STFT 960/480 |
+# | DPDFNet-2/4/8     | true       | 32             | 16         | null                 | 2/4/8            | squeezed_s  | 16k  | 2.49/2.84/3.54M；1.35/2.36/4.37G |
+# 数据：使用 data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/ 下配对的四列 URGENT2026 clean/noisy SCP。
+# 数据管线：data.mode=offline，直接读预混 clean/noisy 对，不运行 Layer A–F 在线仿真（无 simulation_cfg）。
+# 复杂度测量口径：B=1、1 s、16 kHz、幅度 [-1,1] waveform（F=161、T=100 帧）；仅计模型前向，图外 STFT/iSTFT 不计。
+# RTF：not measured（未在本机测量实时因子；流式逐帧 cache 路径见实现文件）。
+# 实现路径：tasks/se/models/discriminative/deepfilternet.py（接口层）→ tasks/se/models/modules/deepfilternet_impl.py
+# 训练：python train.py -C configs/se/urgent2026/dpdfnet2_causal_urgent26_offline_hybrid.yaml
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# 全局：随机种子、混合精度、EMA
+# ----------------------------------------------------------------------
+meta:
+  seed: 42   # 全局随机种子；固定后数据读取顺序与 DataLoader worker 序列可复现
+  use_amp: false   # 混合精度开关；false = FP32；改 true 时须同时设置 amp_dtype（推荐 bfloat16）
+  use_ema: false   # 是否维护 EMA 权重；false = 只用原始权重
+  # false = 保留 cudnn.benchmark 默认 true（按 shape 自动选最快 kernel，速度优先）；
+  # true = 强制 cudnn.benchmark=false 并启用确定性算法，牺牲吞吐换跨运行可复现
+  deterministic: false
+
+# ----------------------------------------------------------------------
+# stft：与 DeepFilterNet 16 kHz 常用 320/160/320 一致；build_model 注入 model.args
+# ----------------------------------------------------------------------
+stft:
+  n_fft: 320        # FFT 点数；16 kHz 下 20 ms 窗，F = n_fft/2+1 = 161
+  hop_length: 160   # 帧移，单位 sample；16 kHz 下 10 ms/帧
+  win_length: 320   # 窗长，单位 sample（与 n_fft 相同）
+  window: hann      # 分析窗类型；枚举 hann | hamming；DeepFilterNet 按 hann 设计
+
+# ----------------------------------------------------------------------
+# model：DeepFilterNet；完整参数见 deepfilternet_impl.DeepFilterNet
+# ----------------------------------------------------------------------
+model:
+  type: DeepFilterNet     # 注册名；未知 type 由 registry 拒绝；未知 args kwargs 由模型构造抛 TypeError
+  args:                   # 构造参数；与 deepfilternet_impl.DeepFilterNet.__init__ 形参一一对应
+    samplerate: 16000          # 固定 16 kHz，与 STFT 设计一致；不随 data.sample_rate 变化
+    enc_concat: true           # true = 拼接 ERB 与线性编码路径（DPDFNet 口径）；false = 仅 ERB（DFN3）
+    enc_lin_groups: 32         # 编码线性层分组数
+    lin_groups: 16             # 解码线性层分组数
+    erb_apply_above_bins: ~    # ~ = 全频应用 ERB mask；DeepFilterNet3 常用 96（仅高频段走 ERB）
+    dprnn_num_blocks: 2        # DPRNN 块数：0 = DFN2/3；2/4/8 = DPDFNet-2/4/8
+    # gru_variant: "squeezed_s"  # 可选枚举：squeezed | squeezed_s；未声明 = 取模型默认 squeezed_s
+    freq_df: 4800              # DeepFilter 路径截止频率，单位 Hz
+    nb_erb: 32                 # ERB 频带数
+    min_nb_freqs: 1            # 每个 ERB band 的最少频点数
+    erb_to_db: true            # 是否把 ERB 特征转换为 dB 尺度
+    conv_ch: 64                # 编码卷积通道数
+    enc_gru_dim: 256           # 编码 GRU 维度
+    erb_dec_gru_dim: 256       # ERB 解码 GRU 维度
+    df_dec_gru_dim: 256        # DF 解码 GRU 维度
+    df_lookahead: 2            # 固定 2 帧 DF 前瞻；流式 cache 不能消除该前瞻
+    conv_lookahead: 2          # 固定 2 帧卷积前瞻；流式 cache 不能消除该前瞻
+    emb_num_layers: 2          # embedding 层数
+    df_num_layers: 2           # DF 层数
+    mask_method: "before_df"   # 掩码应用位置，枚举：before_df | after_df
+    upsample_conv_type: "subpixel"  # 上采样实现，枚举：subpixel | transpose
+    # ----- 以下参数与 deepfilternet_impl.DeepFilterNet.__init__ 默认值一致，显式写出以固定复现 -----
+    alpha_norm: 0.98           # ERB 归一化 EMA 系数
+    conv_kernel_inp: [3, 3]    # 输入卷积核 [time, frequency]
+    conv_kernel: [1, 3]        # 编码卷积核 [time, frequency]
+    convt_kernel: [1, 3]       # 解码转置卷积核 [time, frequency]
+    emb_gru_skip_enc: "none"   # embedding GRU skip，枚举 none = 不启用
+    df_order: 5                # Deep Filter 阶数
+    df_pathway_kernel_size_t: 5  # DF 路径时间维卷积核大小
+    df_gru_skip: "groupedlinear" # DF GRU skip 类型
+    stateful: false            # 是否启用 stateful 流式状态；训练关闭，推理走 streaming session seam
+    erb_dynamic_var: false     # 是否启用 ERB 动态方差估计
+    norm_stateful: false       # 归一化是否保留流式状态
+    group_linear_type: "loop"  # 分组线性实现，枚举：loop | einsum
+    point_wise_type: "cnn"     # 逐点层实现，枚举：cnn | linear
+    group_gru: 1               # GRU 分组数
+    separable_first_conv: true # 首层是否使用可分离卷积
+    lsnr_min: -15.0            # 网络侧 LSNR 嵌入下限，单位 dB（不进入本 loss）
+    lsnr_max: 35.0             # 网络侧 LSNR 嵌入上限，单位 dB（不进入本 loss）
+
+# ----------------------------------------------------------------------
+# 数据：离线预混（clean/noisy 已事先生成）；data.mode=offline，train 为训练集 split
+# ----------------------------------------------------------------------
+data:
+  mode: offline      # 数据路由字段：offline = 读预混配对，不运行 Layer A–F 在线仿真（无 simulation_cfg）
+  sample_rate: 16000 # Hz；clean/noisy 加载后统一重采样到该采样率
+
+  # train split：split 级资源键（*_scp / filter_* / max_duration_* / repeat_*）只能写在这里，不能放进 simulation_cfg
+  train:
+    # clean/noisy 两轨均使用完整四列 uid/fs/length/path。
+    clean_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_train.scp"  # 训练 clean 语音四列 SCP
+    noisy_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_noisy_train.scp"  # 训练 noisy 四列 SCP（与 clean 逐条配对）
+    filter_min_duration: 2.0   # 过滤短于 2 s 的 clean 语音，单位 s
+    filter_max_duration: 30.0  # 过滤长于 30 s 的 clean 语音，单位 s
+    # 单条样本长度上限，单位 s；offline 预混对读盘后 clean/noisy 同步裁到上限，可选 repeat tile 齐长（无动态仿真 Layer A/B）
+    max_duration_seconds: 6     # 16 kHz × 6 s，即 96000 sample
+    repeat_to_max_duration: false  # false: 短句不齐长由 collate pad；true: 同步 tile 到 max_duration_seconds
+    repeat_tile_silence_gap: false  # true: 齐长时在每段重复之间插入静音, 接缝更平滑、减轻 tile 边界阶跃; 默认关
+    # 静音间隔 [min_sec, max_sec]。仅在 repeat_tile_silence_gap: true 且 repeat_to_max_duration: true 时生效
+    repeat_tile_silence_gap_range: [0.02, 0.2]  # tile 间 gap 范围，单位 s
+
+  # validation split：OfflineDataset，沿用 data.sample_rate=16000；短样本由 collate 按 batch 补零
+  validation:
+    clean_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_val.scp"  # 验证 clean 语音四列 SCP
+    noisy_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_noisy_val.scp"  # 验证 noisy 四列 SCP（与 clean 逐条配对）
+    max_duration_seconds: 6        # 限制单条长度，单位 s
+    repeat_to_max_duration: false   # 同 train：false 不齐长由 collate pad；true 同步 tile 到 max_duration_seconds
+    repeat_tile_silence_gap: false  # 齐长时在重复段间插静音，仅 repeat_to_max_duration=true 时生效
+    repeat_tile_silence_gap_range: [0.02, 0.2]  # tile 间 gap 范围，单位 s
+    # 可选：validation 专用 target_sr；不设则沿用顶层 data.sample_rate=16000（本配置未启用）
+    filter_min_duration: 2.0   # 过滤短于 2 s 的 clean 语音，单位 s
+    filter_max_duration: 30.0  # 过滤长于 30 s 的 clean 语音，单位 s
+
+  # dataloader：SE offline 标准 collate；batch 内长度不一致时按 batch 补零
+  dataloader:
+    batch_size: 32        # 单卡 batch 大小
+    num_workers: 4        # 每 rank 的数据加载进程数
+    prefetch_factor: 4    # 建议 4~8，配合 num_workers 预取
+    pin_memory: true      # 固定内存加速 H2D 拷贝
+
+# ----------------------------------------------------------------------
+# loss：显式 CompositeLoss（GTCRN 压缩频谱 + log-ratio）；STFT 几何由顶层 stft 注入
+# ----------------------------------------------------------------------
+loss:
+  type: CompositeLoss          # 复合损失；顶层只接受 type/components/strict/enable_ss_undesired_energy
+  components:                  # 组件列表；每项只接受 type/weight/args/name/enable_ss_undesired_energy
+    - type: GTCRNCompressedSpectralLoss   # 压缩谱损失（实/虚部 + 幅度）
+      weight: 1.0              # 组件总权重（无量纲）
+      args:                    # 组件参数；未知键在 loss 构造前报错
+        compress_factor: 0.3   # 幅度压缩因子, 论文 c=0.3
+        lamda_ri: 30.0         # 实部/虚部损失权重
+        lamda_mag: 70.0        # 幅度损失权重
+    - type: GTCRNLogRatioLoss  # 压缩谱 log-ratio 损失（幅度域）
+      weight: 1.0              # 组件总权重（无量纲）
+
+# ----------------------------------------------------------------------
+# optimizer
+# ----------------------------------------------------------------------
+optimizer:
+  type: Adam                   # 优化器类型；未知类型在构造期 fail-fast
+  args:                        # 优化器参数；未知键在构造期报错
+    lr: 0.001                  # 学习率（无量纲）
+# ----------------------------------------------------------------------
+# scheduler：线性 warmup + 余弦退火；decay_until_step 宜等于总优化步数
+# ----------------------------------------------------------------------
+scheduler:
+  type: LinearWarmupCosineAnnealing   # 线性 warmup + 余弦退火；按 optimizer step 计步
+  args:                        # 调度器参数；未知键在构造期报错
+    warmup_steps: 5000         # 线性 warmup 步数，单位 optimizer step
+    decay_until_step: 100000   # 余弦退火终止步；应等于总优化步数
+    max_lr: 1.0e-3             # warmup 后峰值学习率
+    min_lr: 1.0e-6             # 退火终点学习率
+# ----------------------------------------------------------------------
+# trainer：SETrainer；验证/存盘语义见 core/trainer/base_trainer.py
+# ----------------------------------------------------------------------
+trainer:
+  type: SETrainer                # 训练器类型；由 entry 路由到 tasks/se/trainer/se_trainer.py
+  exp_path: exp/se/dpdfnet2_causal_urgent26_offline_hybrid  # 日志/checkpoint 输出目录（相对仓库根）
+
+  epochs: 60                     # 训练总 epoch 数
+  gradient_clip_value: 5.0       # 梯度范数裁剪阈值（无量纲；0 = 不裁剪）
+  accumulation_steps: 1          # 梯度累积步数；DDP 中间步由 no_sync() 跳过 AllReduce
+  lr_schedule_per_step: true     # true = 调度器按 optimizer step 更新；false = 按 epoch
+  log_interval: 100              # 每 N 个 optimizer step 记录一次日志
+
+  max_val_batches: 0             # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0
+  save_top_k: 3                  # 步级验证保留 val_loss 最低的 top-k checkpoint
+
+  # 客观指标（侵入式 SI-SDR/PESQ/ESTOI）；MOS 类指标须走 evaluate/ 离线计算
+  val_metrics:
+    enabled: true                # true = 在线计算 val_metrics.metrics 列出的指标
+    metrics: [SI-SDR, PESQ, ESTOI]  # 指标集合；每项按固定顺序在所有 rank 聚合
+    interval: 1                  # 每 N 次 validation 计算一次指标（1 = 每次）
+    max_utterances: 2167     # 原始 SCP 2200 条；2–30 s 过滤后为 2167 条，即全局指标上限（各 rank 均分）
+    max_utterances_metrics: 2167  # 显式声明：省略时回退 max_utterances
+    metrics_workers: 8           # 每个 rank 的侵入式指标进程池大小
+
+  save_checkpoint_interval: 1    # epoch 末写盘间隔；save_curve_interval 默认 1、early_stop_patience 默认 0
+
+# ---- Distributed：DDP 后端与未使用参数策略 ----
+distributed:
+  backend: nccl                  # DDP 通信后端；单机 GPU 用 nccl
+  find_unused_parameters: false  # DeepFilterNet 单采样率, 前向无未用参数; 设为 true 会触发 DDP 警告并多一次 autograd 遍历
+  nccl_timeout_minutes: 10       # nccl 集合通信超时，单位分钟；超时即中止训练

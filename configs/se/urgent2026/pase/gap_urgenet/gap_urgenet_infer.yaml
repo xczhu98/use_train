@@ -1,0 +1,67 @@
+# ======================================================================
+# Model: GAP-URGENet inference（UniPASE 生成支路 + Predictor -> 48 kHz PostNet 融合）。
+# 数据管线：仅推理；data.mode=dynamic 只用于 SE 任务路由，不构造训练/验证数据集。
+# 采样率/帧移：输入可为任意采样率（内部重采样到 16 kHz 供双支路处理），PostNet 固定
+#   48 kHz 融合，最终再重采样到 model.args.sr_out；waveform-native
+#   （meta.allow_no_stft=true），无框架 STFT，iSTFT 在各支路内部。
+# 实现路径：tasks/se/models/pase_family/gap_urgenet/gap_urgenet_model.py（GAP_URGENet）、
+#   tasks/se/models/pase_family/gap_urgenet/postnet/tfgrid_cws.py（48 kHz PostNet）、
+#   tasks/se/models/pase_family/gap_urgenet/predictor/tfgridnet.py（Predictor）。
+# Params: not measured（五件官方 artifact 均缺失，无法实例化完整链）；论文完整链
+#   567.76 M 仅作 reference，不能视为当前配置或权重的实测结果。
+# MACs: not measured（未执行完整 inference profile）。
+# THOP: not measured（未运行）。
+# 1 秒复杂度输入/范围: profile 应固定 B=1、1 秒 source waveform、标称幅度
+#   [-1, 1]，并记录 source sample rate；双支路内部为 16 kHz，融合固定为 48 kHz。
+# FLOPs: not measured；encoder/adapter/vocoder/Predictor/PostNet 均无独立 profile；
+#   论文完整链 472.84 GMAC/s 仅作 reference，未提供本配置的组件拆分。
+# Trainer MOS boundary: inference-only，无 Trainer；MOS 只能对五件 artifact 严格加载后
+#   的完整输出音频离线评估，缺任一 artifact 时不得报告 MOS。
+# Frozen: 全部 inference modules；Trainable: N/A；Discriminator: N/A。
+# Artifact: DeWavLM-Omni.pt + Adapter.pt + Vocoder.pt + Predictor.pt + PostNet.pt；
+# 完整 inference chain 即上述生成/预测双支路与 48 kHz 融合链。
+# GAP-URGENet 推理配置（官方开源权重，waveform-native，无需训练 --checkpoint 参数）。
+#
+# 权重位于仓库内 tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/；配置内五个 artifact
+# 必须实际存在并严格加载。无需传入训练 checkpoint 参数，不等于可以无权重运行。
+# 数值 parity 需官方源码 checkout 与对应权重；tests/test_gap_urgenet_official_parity.py
+# 在 CPU 上断言 diff=0，在 CUDA 上使用 diff < 1e-6 的容差。
+#
+# 用法：
+#   PYTHONPATH=. python inference.py \
+#       -C configs/se/urgent2026/pase/gap_urgenet/gap_urgenet_infer.yaml \
+#       --input_dir <noisy_dir> --output_dir <out_dir>
+#
+# 说明：
+# - sr_out: null → 输出采样率等于输入；显式正整数表示输出采样率，单位 Hz。
+# - enable_plc: true → 启用丢包补偿（20 ms 全零包检测 + mask_emb 替换）。
+# - 输入先重采样到 16 kHz 供生成/预测双支路处理，PostNet 固定在 48 kHz 融合，
+#   最终再重采样到 sr_out；输入输出采样率可变不代表内部采样率可变。
+# ======================================================================
+
+# ---- meta：随机性 / 推理标记 ----
+meta:
+  seed: 42              # 全局随机种子；推理无训练随机性，仅为接口一致性保留
+  allow_no_stft: true   # waveform-native 模型：权重由 from_pretrained 注入，无框架 STFT
+  inference_only: true  # 纯推理配置：无 train/validation/trainer/loss
+  deterministic: false  # false=不做确定性算法约束（默认）；inference-only 无 Trainer，此键不参与训练路径
+
+# ---- data：仅保留任务路由字段 ----
+data:
+  mode: dynamic         # 仅保留 SE 任务路由；不构造训练或验证数据集
+
+# ---- model：五模块 48 kHz 融合推理链 ----
+model:
+  type: GAP_URGENet      # 注册名 → tasks/se/models/pase_family/gap_urgenet/gap_urgenet_model.py
+  # 推理链 artifact 路径与运行参数（显式形参；未知键在构造期 TypeError）
+  args:
+    dewavlm_ckpt_path: "tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/DeWavLM-Omni.pt"  # 生成支路 encoder；仓库内官方权重，缺失时构造期报错
+    adapter_ckpt_path: "tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/Adapter.pt"       # 生成支路 adapter；仓库内官方权重，缺失时构造期报错
+    vocoder_ckpt_path: "tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/Vocoder.pt"       # 生成支路 vocoder；仓库内官方权重，缺失时构造期报错
+    predictor_ckpt_path: "tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/Predictor.pt"   # 预测支路 Predictor；仓库内官方权重，缺失时构造期报错
+    postnet_ckpt_path: "tasks/se/models/pase_family/gap_urgenet/open_model_checkpoint/PostNet.pt"       # 48 kHz 融合 PostNet；仓库内官方权重，缺失时构造期报错
+    sr_out: ~            # ~ = 与输入同采样率；显式正整数表示输出采样率，单位 Hz
+    enable_plc: true     # 启用丢包补偿（20 ms 全零包检测 + mask_emb 替换）
+    # 单次前向最长音频秒数：超出直接报错（PostNet/Predictor 的 T×T 自注意力
+    # 显存随长度平方增长），长音频请用 --chunk_seconds 分块推理
+    max_forward_seconds: 60.0

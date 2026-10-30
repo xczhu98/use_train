@@ -1,0 +1,112 @@
+# ======================================================================
+# 实验配置：MTFAA-Net 风格模型，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：MTFAANet（Phase Encoder + multi-scale TFCM + axial attention + 两阶段 MTFAA mask）
+# Params：local 2.1488M total/trainable（当前 YAML build 后逐参数 numel 实测）；paper/reference not claimed
+# MACs：not measured（当前移植尚未运行 THOP 或其他 MACs profiler）
+# FLOPs：not measured（未用 MACs 倍数冒充独立 FLOPs 测量）
+# Trainer MOS boundary：Trainer 与模型 profile 均不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 参考：echocatzh/MTFAA-Net commit eb3b1f33d7c5178f238076938c99acaec9e2e904（非官方实现）
+# 风险：上游明确声明实现细节可能与论文不一致；本配置不声称继承论文或上游指标
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/mtfaa_net_causal_offline.yaml
+# 模型实现：tasks/se/models/discriminative/mtfaa_net.py（backbone 在 tasks/se/models/modules/mtfaa_impl.py）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  use_amp: false         # 关闭 AMP：axial attention 的 softmax 与复谱算子在 BF16 下未验证，本配置保持 FP32
+  use_ema: false         # 关闭 EMA 权重：上游未使用 EMA，避免额外显存与 eval 分支
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；谱进谱出模型只消费本段几何 ----
+stft:
+  n_fft: 512             # FFT 长度（采样点），16 kHz 下 32 ms；决定频率轴 F = n_fft//2+1 = 257
+  hop_length: 128        # 帧移（采样点），16 kHz 下 8 ms
+  win_length: 512        # 窗长（采样点），16 kHz 下 32 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hann           # 分析窗类型
+  center: true           # 居中补齐；带来 win_length//2 = 256 samples lookahead，与模型 causal=true 的时间卷积不同层面
+
+# ---- model：MTFAANet（tasks/se/models/discriminative/mtfaa_net.py）----
+model:
+  type: MTFAANet         # registry 名称（@MODEL_REGISTRY.register("MTFAANet")）
+  # n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入；args 只放模型自身超参
+  args:
+    sample_rate: 16000   # 模型预期采样率 Hz；与 data.sample_rate 重复声明，forward 传入 fs 时必须一致，否则报错
+    phase_channels: 4    # Phase Encoder 输出复通道数；当前实现固定为 4，改值会与 mask head 不匹配
+    channels: [48, 96, 192]  # 三层 encoder 的通道数（自浅到深），长度必须为 3
+    filter_bands: 64     # 线性 filter bank 的频带数（正整数）
+    bottleneck_layers: 2 # bottleneck stage 数量（正整数）
+    tfcm_layers: 6       # 每个 TFCM 的膨胀卷积层数（正整数）
+    causal: true         # 使用因果时间卷积与因果时间注意力（低延迟部署口径）；false 则用非因果上下文
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；四列 SCP 的 fs 必须一致
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    max_duration: 128000              # 128000 样本，即 8 s @ 16 kHz；超长样本按 clean/noisy 同步随机裁切
+    repeat_to_max_duration: true      # 短样本 tile/repeat 到 max_duration（不是 collate pad），批内等长
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile，保持原始时长与官方评测口径一致
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 2        # 单卡 batch（假设：未做显存扫描，按 8 s 画布与 axial attention 规模估计取值）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：幅度 L1 + 复谱 L1（core/losses/freq_domain.py），在框架重建波形上重算 STFT ----
+loss:
+  type: MagnitudePlusComplexL1Loss  # 公式 (1/(T*F))·Σ(|S|-|Ŝ| + |S-Ŝ|)；上游未发布训练代码，此处为可用 surrogate
+  args: {}               # 无显式参数；STFT 几何由顶层 stft 按构造器声明的键 setdefault 注入
+
+# ---- optimizer：Adam ----
+optimizer:
+  type: Adam             # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.Adam
+    lr: 0.001            # 初始学习率（无量纲）
+    eps: 0.00000001      # 数值稳定项 1e-8（无量纲）；未设 weight_decay 即 0.0
+
+# ---- scheduler：按验证 loss 平台期衰减（core/optim/scheduler.py 的 _Plateau）----
+scheduler:
+  type: ReduceLROnPlateau  # torch 原生；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.ReduceLROnPlateau
+    mode: min            # 监控 mean val loss，越低越好
+    factor: 0.5          # 触发后 lr 乘 0.5（无量纲）
+    patience: 3          # 连续 3 次 validation 无改善才衰减（单位：validation 次数）
+    cooldown: 1          # 衰减后冷却 1 次 validation 才重新计数，避免连续触发
+    min_lr: 0.000000001  # lr 下限 1e-9；达到后不再下降
+
+# ---- trainer：SETrainer（单优化器、无 GAN）----
+trainer:
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/mtfaa_net_causal_offline   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 300            # 训练轮数；未声明 max_steps，故按 epoch 跑满
+  gradient_clip_value: 5.0   # 梯度范数裁剪阈值（无量纲）
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: false  # 调度器按 epoch step 一次（与 ReduceLROnPlateau 配套）
+  log_interval: 50           # 每 N 个 optimizer step 打一条训练日志
+  max_val_batches: 0         # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证（0 = 关闭）
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0（互斥语义见 core/trainer/base_trainer.py）
+  save_top_k: 3                  # 保留 val_loss 最低的 top-k checkpoint（步级验证场景使用）
+  # 客观指标（SI-SDR/PESQ/STOI）；interval 表示每 N 次 validation 计算一次
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, STOI]  # 指标枚举；均需 clean 参考
+    interval: 5          # 每 5 次 validation 计算一次指标（loss 仍每次验证都算）
+    max_utterances: 872              # 全局指标上限；各 rank 均分（当前 val SCP 实际 824 条，故最多评估 824 条）
+    max_utterances_metrics: 872  # 显式声明：省略时回退 max_utterances，避免“共享上限”误读
+    metrics_workers: 2   # 每个 rank 的侵入式指标进程池大小；0 = 自动（受 CPU 数限制）
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest 与 model_{epoch}.pth
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

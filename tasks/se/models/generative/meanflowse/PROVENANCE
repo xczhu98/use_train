@@ -1,0 +1,30 @@
+MeanFlowSE 第三方来源与项目适配边界
+
+本目录实现参考以下固定版本，但为适配本仓库的 complex-STFT 模型接口重新组织；未复制上游的 Lightning、data、metrics、SciPy ODE、CUDA/C++ extension 或 checkpoint loader。
+
+MeanFlowSE
+
+- 仓库：https://github.com/liduojia1/MeanFlowSE
+- 固定 commit：6e0fe649e9916046ca1147343fb4a2fb69f87e19
+- 参考内容：spectral transform、Flow Matching path、MeanFlow objective、FD-JVP、euler_mf
+- 许可证：MIT
+- Copyright (c) 2025 liduojia1
+- 完整条款：同目录 LICENSE-MIT-MeanFlowSE
+
+score_sde_pytorch / NCSN++
+
+- 仓库：https://github.com/yang-song/score_sde_pytorch
+- 上游 MeanFlowSE 声明的参考 commit：1618ddea340f3e4a2ed7852a0694a809775cf8d0
+- 参考内容：NCSN++ 的时间条件残差 U-Net 组织方式
+- 许可证：Apache License 2.0
+- Copyright 2020 Google LLC
+- 完整条款：同目录 LICENSE-Apache-2.0-score-sde
+
+项目适配边界
+
+- 本目录使用标准 PyTorch 层重新实现 NCSN++ 风格 backbone，不包含原项目 fused CUDA 算子，也不声明结构或 checkpoint 兼容。
+- 推理 prior 使用配置中的 `inference_seed`，每次调用都新建设备匹配的本地 `torch.Generator`。这是为保证同一 artifact/input/shape 不受调用历史影响而增加的项目确定性适配；Gaussian prior 分布不变，但不保证与官方实现产生相同随机轨迹。训练 objective 仍使用全局 RNG。
+- 上游训练数据代码把短样本对称零补齐到固定 32640 samples，并以 noisy peak 联合归一化 clean/noisy。当前仓库的通用 offline dataset 在 repeat_to_max_duration=false 时保留短样本，通用 collate 仅按 batch 最长样本右补零；因此 MeanFlowSETrainer 使用有效 lengths 重建固定长度的对称零画布，再执行 noisy peak joint normalization。这是保持上游数据语义的 task-local 项目适配，不是通用 dataset 契约。
+- 上游对零 noisy peak 没有显式保护；本适配使用 scale=1 避免静音对产生除零，这是数值安全差异。
+- 验证仍使用本仓库全长 utterance 与统一客观指标骨架，不复刻上游固定 256-frame validation crop；因此验证指标不可视为官方 recipe 的逐样本数值复现。
+- 官方 checkpoint 未取得实物并执行参数名、shape 或数值核验。任何后续兼容加载都必须使用本仓库安全 loader，并执行严格、fail-closed 的 state 校验。

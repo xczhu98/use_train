@@ -1,0 +1,130 @@
+# ======================================================================
+# 实验配置：MeanSE，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：MeanSE（Wang et al. Mean Flows 路线的 NCSN++ 风格 backbone，项目自研复现）
+# Params：not measured（本地项目适配结构尚未运行独立参数审计）
+# MACs：not measured（尚未对论文 1022/320 STFT 输入运行可靠 profiler）
+# FLOPs：not measured（未运行独立 FLOPs profiler，禁止由 MACs 推算）
+# Trainer MOS boundary：Trainer、模型 profile 和复杂度审计均不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文：Wang et al., MeanSE, arXiv:2509.21214；官方仓库 Twinkzzzzz/MeanSE@a4ced60cf3aa365c481319632e8ea762d178922b
+# 本模型与仓库已有 MeanFlowSE（Li et al., arXiv:2509.14858）不是同一论文或实现。
+# 许可证尚未确认，且无公开 checkpoint；本配置不声明官方结构或 checkpoint 数值兼容。
+# 这是 max_interval=1.0 的最终 curriculum stage。论文复现需先训练 FlowSE，再依次以
+# max_interval=0.2/0.4/0.6/0.8/1.0 串联 checkpoint；本配置不伪造缺失的前置资产。
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/meanse_ncsnpp_offline.yaml
+# 模型实现：tasks/se/models/generative/meanse/model.py（MeanSE 类）
+# Trainer 实现：tasks/se/trainer/meanflowse_trainer.py（MeanFlowSETrainer，复用生成式双谱 objective）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）+ MeanFlowSETrainer 的固定画布后处理
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、EMA、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  use_amp: false         # 关闭 AMP：MeanFlow 的 mean-velocity 回归在 BF16 下未验证，本配置保持 FP32
+  use_ema: true          # 开启 EMA：生成式长训练下 EMA 权重更稳，与 MeanFlowSE 配方保持一致
+  ema_decay: 0.999       # EMA 衰减系数（无量纲，仅 use_ema=true 生效）；越高越平滑、跟踪越慢
+  compile_model: false   # 关闭 torch.compile：NCSN++ 的 F.interpolate/cat 路径易产生 graph breaks，收益未实测
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；MeanSE 只处理复谱 ----
+stft:
+  n_fft: 1022            # FFT 长度（采样点），16 kHz 下 63.875 ms；论文 1022/320/1022 preset，频率轴 F = 512
+  hop_length: 320        # 帧移（采样点），16 kHz 下 20 ms；论文 preset
+  win_length: 1022       # 窗长（采样点）；模型要求 win_length == n_fft，否则构造期报错
+  window: hann           # 分析窗类型；模型仅接受 hann，其他窗名直接报错
+  center: true           # 居中补齐；模型要求 center=True，否则构造期报错；带来 511 samples lookahead
+
+# ---- model：MeanSE（tasks/se/models/generative/meanse/model.py）----
+model:
+  type: MeanSE           # registry 名称（@MODEL_REGISTRY.register("MeanSE")）
+  # n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入；args 只放模型自身超参
+  args:
+    # 校验顶层 stft 必须为论文 1022/320/1022 + hann + center=True，偏离即报错
+    strict_preset: true  # 开启论文 STFT preset 硬校验；false 时只做几何/窗名的通用校验
+    spec_factor: 0.065   # 谱压缩线性因子（> 0，无量纲）；与 spec_abs_exponent 组成幅度归一化
+    spec_abs_exponent: 0.667  # 谱压缩指数（> 0，无量纲）；论文 2/3 次幂压缩
+    sigma: 0.5           # 噪声调度尺度（>= 0，无量纲）；MeanFlow 插值路径上的噪声幅度
+    t_eps: 0.0           # 时间下界（无量纲）；须满足 0 <= t_eps < t_max <= 1；0 表示积分下界到零
+    t_max: 1.0           # 时间上界（无量纲）；推理起点 t = t_max
+    flow_ratio: 0.75     # 训练中 mean-flow 采样比例（[0,1]，无量纲）；0.75 = 75% 样本走 flow 分支
+    max_interval: 1.0    # 时间间隔上界（(0,1]，无量纲）；curriculum 关键量，1.0 = 本配置的最终 stage
+    loss_type: adaptive_l2  # 回归损失枚举：mse / mae / adaptive_l2；本配置取论文的 adaptive_l2
+    adaptive_l2_c: 0.001 # adaptive_l2 的尺度常数 c（> 0，无量纲）；用于按预测幅度自适应加权
+    sampling_steps: 1    # 推理采样步数（>= 1，单位：步）；MeanFlow 单步即可出结果
+    inference_seed: 42   # 推理期先验/采样随机种子（非负整数）；影响可复现的推理 artifact 身份
+    nf: 128              # NCSN++ 基础通道数（>= 4 且为偶数）；ch_mult 各项乘以它得到各层通道
+    ch_mult: [1, 1, 2, 2, 2, 2, 2]  # 7 层通道倍率（均为正整数）；长度决定 pad_multiple = 2^(len-1) = 64
+    num_res_blocks: 2    # 每层残差块数（>= 1）
+    dropout: 0.0         # 残差块 dropout 概率（[0,1)，无量纲）；0 = 关闭
+    fourier_scale: 16.0  # 高斯傅里叶时间嵌入的尺度（无量纲）；正数
+    attention_heads: 4   # bottleneck 空间自注意力头数（正整数）；必须整除该层通道数
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；与 SCP 内嵌 fs 一致
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    # 官方 train_meanflow.sh 使用 40000 samples；复用的 MeanFlowSETrainer
+    # 负责固定画布的对称零补齐和 noisy-peak joint normalization。
+    max_duration: 40000  # 固定画布样本数，即 2.5 s @ 16 kHz；超长样本同步随机裁切
+    repeat_to_max_duration: false  # 关闭 tile/repeat：官方语义是零补齐，tile 会引入周期性伪影
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile，保持原始时长
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 2        # 单卡 batch（假设：未做显存扫描；1022-point FFT、F=512 帧面下取 2）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：objective 由 MeanSE training forward 直接计算；该 loss 只满足统一配置契约 ----
+loss:
+  type: ScalarPassthroughLoss  # 直接透传模型返回的 scalar（core/losses/scalar_passthrough.py）；真实目标函数在 MeanSE.forward 内完成，故本段无 args
+
+# ---- optimizer：AdamW ----
+optimizer:
+  type: AdamW            # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.AdamW
+    lr: 0.00001          # 初始学习率（无量纲，假设：许可证未确认、无法核对论文附录；curriculum 末段用极小 lr 微调，取 1e-5）
+    weight_decay: 0.000001  # 权重衰减 1e-6（无量纲）；仅作用于非归一化层参数组
+    eps: 0.00000001      # 数值稳定项 1e-8（无量纲）
+
+# ---- scheduler：每 epoch 阶梯衰减（core/optim/scheduler.py 的 _StepLR）----
+scheduler:
+  type: StepLR           # torch 原生 StepLR；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.StepLR
+    step_size: 1         # 每 1 个 epoch 衰减一次（单位：epoch）
+    gamma: 0.85          # 每次衰减乘 0.85（无量纲）；40 epoch 后 lr 约降至初始的 0.15%
+
+# ---- trainer：MeanFlowSETrainer（复用生成式双谱 objective，单优化器）----
+trainer:
+  # 复用现有生成式双谱 objective / 谱域采样接线，不新增 Trainer。
+  type: MeanFlowSETrainer   # 同时负责固定画布零补齐与 noisy-peak 联合归一化
+  exp_path: exp/se/meanse_ncsnpp_offline   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 40             # 训练轮数；curriculum 末段只做短程微调，故远小于 MeanFlowSE 的 150
+  gradient_clip_value: 0.5   # 梯度范数裁剪阈值（无量纲，假设：未统计梯度范数）；微调阶段取更紧的 0.5，避免破坏已收敛权重
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: false  # 调度器按 epoch step 一次（与 StepLR 配套）
+  log_interval: 10           # 每 N 个 optimizer step 打一条训练日志；单 epoch 步数少，故取 10
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证（0 = 关闭）
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0（互斥语义见 core/trainer/base_trainer.py）
+  max_val_batches: 0         # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  # 客观指标（SI-SDR/PESQ/STOI）；interval 表示每 N 次 validation 计算一次
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, STOI]  # 指标枚举；均需 clean 参考
+    interval: 1          # 每次 validation 都算指标（40 epoch 短训练，需要密集观测）
+    max_utterances: 100              # 全局指标上限；各 rank 均分（假设：未做耗时测量；生成式推理慢，故比判别式配置更小）
+    max_utterances_metrics: 100  # 显式声明：省略时回退 max_utterances，避免“共享上限”误读
+    metrics_workers: 2   # 每个 rank 的侵入式指标进程池大小；0 = 自动（受 CPU 数限制）
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest 与 model_{epoch}.pth
+  save_top_k: 3                  # 保留 val_loss 最低的 top-k checkpoint（步级验证场景使用）
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

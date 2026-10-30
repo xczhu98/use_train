@@ -1,0 +1,289 @@
+# ============================================================
+# SSL/DOA 固定 2 轨移动声源训练配方
+# ------------------------------------------------------------
+# 任务：ssl（Spatial Sound Localization，空间声源定位）
+# 数据管线 mode：dynamic_ssl（SSL 仅此一种合法 mode，路由到 tasks/ssl/trainer/entry.py）
+# 模型：FixedArrayIPDNet（输出 2 轨空间谱）
+# 采样率 / 帧移：16 kHz；STFT n_fft=512 / hop_length=256 / win_length=512，即 32 ms 窗、16 ms 帧移
+# 输入阵列：linear_2ch_80mm（2 通道线性阵，间距 80 mm），C=2 → 特征维度 C-1=1
+# 数据来源：共享 Layer A–F 仿真 seam + 在线 gpuRIR moving scene（trajectory_points=50）。
+#   运行前必须提供 data.train / data.validation 的 speech/noise SCP：本机
+#   data/ssl/speech/*.scp 与 data/ssl/noise/*.scp 由 SSL 清单生成器从本机
+#   LibriSpeech/HQ noise 资产整理；音频本体保留在原始 data 树，不复制到 data/ssl。
+#   当前 noise 清单明确标注为本地 HQ noise 子集，不冒充官方 Noise92；资源缺失时
+#   strict_load 直接报错，不生成缺监督的 placeholder。
+# 与同目录变体的区别：configs/ssl/spatial/fixed_array_ipdnet_dynamic_wind.yaml 使用真实
+#   speech/noise/wind SCP 并显式声明 nested spatial.background.wind_background_prob；
+#   本文件保持 canonical prob_wind_noise_background 与旁链关闭。
+# Params: 0.026628M total / 0.026628M trainable（PyTorch parameter count）
+# MACs: 0.446G @ 1 s / 16 kHz（THOP；测量口径 B=1、时长 1 s、采样率 16 kHz、F=257、T=63；
+#   仅模型前向，图外 STFT 与数据仿真不计）
+# FLOPs: 0.837G @ 1 s / 16 kHz（torch.utils.flop_counter.FlopCounterMode；同样仅模型前向，
+#   不含 STFT 与数据仿真）
+# RTF: not measured（本机未做实时率测量）
+# Trainer MOS boundary: not applicable（空间定位任务；trainer 不计算 DNSMOS/NISQA/UTMOS/SCOREQ，
+#   这些指标只由 evaluate/ 离线流程产出；SSL 无公开文件推理入口）
+# 推荐入口：python train.py -C configs/ssl/fixed_array_ipdnet_dynamic_moving.yaml
+# 实现路径：模型 tasks/ssl/models/ipdnet.py；数据集 tasks/ssl/data/dynamic_dataset.py；
+#   loss tasks/ssl/losses.py；entry tasks/ssl/trainer/entry.py
+# 枚举键取值参考（本文件所用键的合法集合；括号内为本文件当前取值）：
+#   meta.task：se / aec / tse / ss / ssl（ssl）
+#   data.mode：dynamic / offline / dynamic_aec / offline_aec / dynamic_tse / offline_tse /
+#     dynamic_ss / offline_ss / dynamic_ssl（dynamic_ssl）
+#   model.type：任务模型注册名，见 tasks/ssl/models/__init__.py（FixedArrayIPDNet）
+#   stft.window：hann / hamming（hamming）
+#   loss.type：任务 loss 注册名（SSLSpatialMSELoss）
+#   optimizer.type：torch.optim 类名（Adam / AdamW / SGD 等），另可回退 adamp 同名类（Adam）
+#   scheduler.type：LinearWarmupCosineAnnealing / CosineAnnealingWarmupRestarts /
+#     ExponentialDecrease / ExponentialLR / StepLR / CosineAnnealingLR / ReduceLROnPlateau
+#     （ExponentialLR）
+# ============================================================
+# 运行元信息：任务名、复现种子、确定性开关与免 STFT 标记。
+meta:
+  # 任务路由短名；与 tasks/descriptors.py 的 TaskDescriptor.name 一致。
+  task: ssl
+  # 仅被测试断言消费的标记键（tests/test_configs.py::test_ssl_moving_config_resource_gate）；
+  # runtime 不读取，用于标识本配方为 moving_shared_simulation 口径。
+  ssl_profile: moving_shared_simulation
+  # 同为测试断言消费的标记键（v2_mobile = 移动动态配方版本）；runtime 不读取。
+  ssl_version: v2_mobile
+  # 复现种子；同时驱动 train/validation 场景抽样与 DataLoader worker 的 epoch 状态。
+  seed: 42
+  # true 时启用确定性算法（base_trainer 会同时关闭 cudnn.benchmark）；本配置保持 false 换取速度。
+  deterministic: false
+  # 纯推理标记；false 表示这是训练配置（纯推理配置须命名 *_infer.yaml）。
+  inference_only: false
+  # waveform-native 免 STFT 标记：本模型不挂 STFT 前端，帧特征由 Dataset 产出。
+  # core/trainer/entry.py 在缺少 stft section 时要求该键为 true；loss 侧另需 loss.args.allow_no_stft。
+  allow_no_stft: true
+# STFT 参数：Dataset 侧特征提取口径（F=n_fft//2+1=257）。
+stft:
+  # 分析窗长，单位 samples；F = n_fft//2+1 = 257，须与 data.*.freqs、model.args.n_fft 一致。
+  n_fft: 512
+  # 帧移，单位 samples；16 kHz 下等于 16 ms。
+  hop_length: 256
+  # 窗长，单位 samples；等于 n_fft 表示不补零。
+  win_length: 512
+  # 窗函数；可选 hann | hamming，当前为 hamming。
+  window: hamming
+  # 是否两端补零对齐；false = 不补 padding，帧数按实际样本数计算。
+  center: false
+# 模型段：type 为注册表名，args 为模型 __init__ 的显式形参。
+model:
+  # 注册表模型名；对应 tasks/ssl/models/ipdnet.py::FixedArrayIPDNet。
+  type: FixedArrayIPDNet
+  # 模型超参：均为 FixedArrayIPDNet.__init__ 的显式形参，未知键会抛 TypeError。
+  args:
+    # 输入特征维度 = C-1（非参考麦克风数）；2 通道阵 → 1。Dataset fail-fast 要求等于 C-1。
+    input_size: 1
+    # GRU 隐层宽度；双向后时间特征维度为 2×hidden_size=128。
+    hidden_size: 64
+    # 输出最大轨数；必须等于 data.train.tracks（Dataset fail-fast "max_track must match tracks"）。
+    max_track: 2
+    # 模型侧频点数口径（F=n_fft//2+1=257）；与顶层 stft.n_fft 重复，以 stft 为准，
+    # 二者不一致时前向会因 feature 频点数不匹配而报错。
+    n_fft: 512
+# 数据段：mode 为路由字段，train/validation 各自独立声明 split 与仿真配置。
+data:
+  # 数据管线模式；dynamic_ssl 是 SSL 唯一合法 mode，缺失或非法值在 builder 处 fail-fast。
+  mode: dynamic_ssl
+  # 目标采样率，单位 Hz；Dataset 把清单音频重采样到该值后再做仿真与特征提取。
+  sample_rate: 16000
+  # DataLoader 参数（train/validation 共享；如需单独限流可用 val_num_workers）。
+  dataloader:
+    # 每批样本数；当前为小规模调试口径（2 条 4.5 s 片段）。
+    batch_size: 2
+    # 训练 loader worker 数；0 = 主进程内加载（便于调试；worker 为 0 时 persistent_workers 强制 false）。
+    num_workers: 0
+  # 训练 split：清单路径、画布长度与 Layer A–F 仿真配置在此声明。
+  train:
+    # 训练语音清单（4 列 SCP）；由 tools/prepare_data_tools/generators/ssl/prepare_manifests.py 生成。
+    speech_scp: data/ssl/speech/train.scp
+    # 训练噪声清单；本地 HQ noise 确定性子集，官方 Noise92 需独立下载/转换。
+    noise_scp: data/ssl/noise/train.scp
+    # 空间 non-decomposable wind sidechain 的显式 wind 池（split 级路径）；默认关闭，
+    # 仅当 nested spatial.background.wind_sidechain_prob>0
+    # （canonical prob_wind_noise_sidechain）时必须提供非空清单。
+    # windnoise_scp: data/ssl/wind/train.scp
+    # 训练片段时长，单位 s；Dataset 固定画布样本数 = segment_seconds×sample_rate。
+    segment_seconds: 4.5
+    # 同时定位的声源轨数；必须与 model.args.max_track 一致。
+    tracks: 2
+    # 频点数；等于 stft.n_fft//2+1=257，须与 Dataset 实际产出的 F 一致。
+    freqs: 257
+    # 在线 moving 轨迹采样点数，取值范围 [1,128]；>1 时要求 acoustic.rir.backend=online，
+    # 且 acoustic.rir.moving_prob>0 时必须 >=2。
+    trajectory_points: 50
+    # 单条轨迹相对初始位置的最大位移，单位 m；须为正有限值。
+    max_displacement_m: 0.25
+    # Layer A–F 共享仿真合同；未显式声明的键取 canonical 默认值。
+    simulation_cfg:
+      # Layer A–F 分层字段，不与 flat 键混用；未显式声明的 Layer A/B 增广概率取 canonical
+      # 默认 0.0（core/data/simulation_configs.py:147/149/151/180/199/201/304/426），零随机数消耗。
+      acoustic:
+        # 声学混合 Layer C：RIR/reverb 与加性背景 SNR。
+        rir:
+          # RIR 生成后端；online = 在线 gpuRIR（moving 与 trajectory_points>1 的必要条件）。
+          backend: online
+          # 混响概率；SSL 空间监督要求恒为 1.0，否则 Dataset fail-fast "requires prob_reverberation=1"。
+          reverberation_prob: 1.0
+          # 在线 moving RIR 概率（canonical 名 prob_moving_rir）；独立逐样本伯努利门，
+          # 1.0 = 全部样本走 moving 轨迹；与其它概率门可共现，不与 reverberation_prob 求和。
+          moving_prob: 1.0
+        # 加性背景：SNR 参考与范围。
+        background:
+          # 背景 SNR 参考（primary | all_speech）；当前相对所有 full-RIR 语音之和。
+          snr_reference: all_speech
+          # 背景 SNR 下限，单位 dB（active-power SNR）。
+          snr_low: -5.0
+          # 背景 SNR 上限，单位 dB。
+          snr_high: 15.0
+      # Layer D：post-mix 幅度条件化（固定 D-normalize → D-guard）。
+      post_mix:
+        # 幅度归一化子配置。
+        normalization:
+          # Layer D post-mix 幅度归一化模式；SSL 只允许 off（不改变幅度），D-guard 仍执行。
+          mode: "off"
+      # Layer E：channel clipping 层。
+      channel:
+        # Layer E（channel clipping）总开关；false = 关闭该层，仅影响 mixture。
+        enabled: false
+      # Layer F：observation/device degradation 层（CPU-only）。
+      device:
+        # Layer F（observation/device degradation）总开关；false = 整层跳过，不控制 D/E。
+        enabled: false
+      # 空间多通道 observation：阵列几何、相干模型与背景概率。
+      spatial:
+        # 空间多通道 observation 总开关；SSL 固定阵列监督要求 true。
+        enabled: true
+        # 阵列几何：profile 或 custom 二选一。
+        geometry:
+          # canonical 物理阵列 profile；linear_2ch_80mm = 2 通道线性阵、间距 80 mm。
+          profile: linear_2ch_80mm
+          # 参考麦克风下标；0 对应 model.args.input_size=C-1=1。
+          reference_mic: 0
+        # 漫射背景空间相干模型。
+        coherence:
+          # 空间漫射相干模型；habets_spherical 为当前 canonical 策略。
+          policy: habets_spherical
+        # 空间背景概率：三项均为独立伯努利门，可共现。
+        background:
+          # 点源背景升级概率（canonical 名 prob_point_source_background）；独立逐样本伯努利门，
+          # 命中后生成同 room、同阵列的真实相干干扰源；要求 spatial.enabled=true 且 backend=online。
+          # 与下面两项 wind 门相互独立、可同时命中，不是互斥分组、不需要和为 1。
+          point_source_prob: 0.3
+          # 可分解 wind 加性背景概率（canonical 名 prob_wind_noise_background）；独立门，
+          # 0.0 = 关闭；开启时必须有非空 windnoise_scp，否则在 core/data/dynamic_dataset_base.py:1238 fail-fast。
+          wind_background_prob: 0.0
+          # 非加性 wind sidechain 概率（canonical 名 prob_wind_noise_sidechain）；独立门，
+          # 0.0 = 关闭；开启时必须提供 split 级 windnoise_scp。
+          wind_sidechain_prob: 0.0
+  # 验证 split：结构同 train，独立声明以避免隐式继承。
+  validation:
+    # 验证语音清单（4 列 SCP）；由 SSL 清单生成器生成。
+    speech_scp: data/ssl/speech/validation.scp
+    # 验证噪声清单；本地 HQ noise 确定性子集。
+    noise_scp: data/ssl/noise/validation.scp
+    # validation 的 wind 池；与 train 同一合同，开启 sidechain 时必须提供该 split 清单。
+    # windnoise_scp: data/ssl/wind/validation.scp
+    # 验证片段时长，单位 s；与 train 一致，避免 train/val 分布差异。
+    segment_seconds: 4.5
+    # 验证轨数；与 train 及 model.args.max_track 一致。
+    tracks: 2
+    # 验证频点数；与 train 一致。
+    freqs: 257
+    # 验证轨迹采样点数；与 train 一致（保持 moving 语义）。
+    trajectory_points: 50
+    # 验证最大位移，单位 m；与 train 一致。
+    max_displacement_m: 0.25
+    # validation 仿真配置：与 train 同结构、同取值，独立写出。
+    simulation_cfg:
+      # validation 独立声明同一组 Layer A–F 取值，不做隐式继承。
+      acoustic:
+        # 同 train：RIR 与背景 SNR。
+        rir:
+          # 同 train：在线 gpuRIR。
+          backend: online
+          # 同 train：SSL 要求恒为 1.0。
+          reverberation_prob: 1.0
+          # 同 train：moving 概率 1.0。
+          moving_prob: 1.0
+        # 同 train：加性背景 SNR 范围。
+        background:
+          # 同 train：相对所有 full-RIR 语音之和。
+          snr_reference: all_speech
+          # 同 train，单位 dB。
+          snr_low: -5.0
+          # 同 train，单位 dB。
+          snr_high: 15.0
+      # 同 train：Layer D 幅度条件化。
+      post_mix:
+        # 同 train：幅度归一化子配置。
+        normalization:
+          # 同 train：off。
+          mode: "off"
+      # 同 train：Layer E。
+      channel:
+        # 同 train：Layer E 关闭。
+        enabled: false
+      # 同 train：Layer F。
+      device:
+        # 同 train：Layer F 关闭。
+        enabled: false
+      # 同 train：空间 observation。
+      spatial:
+        # 同 train：启用空间 observation。
+        enabled: true
+        # 同 train：阵列几何。
+        geometry:
+          # 同 train：2 通道线性阵。
+          profile: linear_2ch_80mm
+          # 同 train：参考通道 0。
+          reference_mic: 0
+        # 同 train：相干模型。
+        coherence:
+          # 同 train：habets_spherical。
+          policy: habets_spherical
+        # 同 train：空间背景概率。
+        background:
+          # 同 train：独立点源背景门。
+          point_source_prob: 0.3
+          # 同 train：wind 加性背景关闭。
+          wind_background_prob: 0.0
+          # 同 train：wind sidechain 关闭。
+          wind_sidechain_prob: 0.0
+# 损失段：type 与 args。
+loss:
+  # loss 类型；SSLSpatialMSELoss 直接消费 IPD feature/target，不使用 STFT。
+  type: SSLSpatialMSELoss
+  # loss 构造参数。
+  args:
+    # 声明 loss 不依赖 STFT；SSLSpatialMSELoss 在该键为 false 时直接报错。
+    allow_no_stft: true
+# 优化器段：type 与 args。
+optimizer:
+  # 优化器类型；Adam。
+  type: Adam
+  # 优化器参数。
+  args:
+    # 学习率，无量纲；论文 SSL 基线口径 1e-3。
+    lr: 0.001
+# 学习率调度段：type 与 args。
+scheduler:
+  # 调度器类型；用已注册的 ExponentialLR 表达“不调度”，不使用不存在的 type=none。
+  type: ExponentialLR
+  # 调度器参数。
+  args:
+    # 每个 epoch 的衰减系数，无量纲；1.0 = 学习率恒定。
+    gamma: 1.0
+# 有意不声明 trainer.val_metrics（缺省即关闭在线指标）：SSL 帧特征不是 waveform，
+# 不能计算 PESQ/SI-SDR 等音频指标；configs/README.md 要求 SSL 的 val_metrics.enabled 必须为 false。
+trainer:
+  # Trainer 类名；对应 tasks/ssl/trainer/。
+  type: SSLTrainer
+  # 实验输出目录（checkpoint / 日志 / TensorBoard）。
+  exp_path: exp/ssl/fixed_array_ipdnet_dynamic_moving
+# 分布式段：多卡训练后端。
+distributed:
+  # 分布式后端；单卡与多卡统一 nccl；其余分布式键（如 find_unused_parameters）取 runtime 默认。
+  backend: nccl

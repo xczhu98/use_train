@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 测试 / 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / 编辑器
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 运行产物 / 临时文件
+*.log
+temp_audio/
+temp/
+*.tmp
+
+# 自动生成的 HTML 报告（由 analyze_filter_outputs.py 等运行时生成）
+audio_filter_pipeline.html
+
+# 常见本地输出目录（运行脚本时由用户指定，不应入版本库；若项目内存在同名示例目录请删除此行）
+output/
+
+# 上级仓库忽略 *.md；pipeline 文档属于版本化契约，必须允许纳入版本控制
+!docs/**/*.md

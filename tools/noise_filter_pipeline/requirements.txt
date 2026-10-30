@@ -1,0 +1,66 @@
+# ============================================================
+# Noise Filter Pipeline 依赖
+# ============================================================
+# 安装: pip install -r requirements.txt
+# 必选: 核心音频与 pipeline；VAD/分类器按需安装对应可选依赖。
+#
+# 系统依赖 (需单独安装):
+#   ffmpeg — 用于音频格式转换 (convert_audio_format)。
+#            Windows: choco install ffmpeg; macOS: brew install ffmpeg; Linux: apt install ffmpeg
+#   sox    — 用于高质量音频重采样 (resample_audio，优先使用；不可用时 fallback 到 soxr)。
+#            Linux: apt install sox libsox-fmt-all; macOS: brew install sox
+# ============================================================
+
+# -----------------------------------------------------------------------------
+# 核心（必选）
+# -----------------------------------------------------------------------------
+numpy>=1.21.0
+soundfile>=0.12.0
+pyyaml>=6.0
+torch>=2.0.0
+torchaudio>=2.0.0
+librosa>=0.10.0
+scipy>=1.10.0
+soxr>=0.3.2
+tqdm
+
+# -----------------------------------------------------------------------------
+# VAD：至少安装一种（推荐 FireRedVAD）
+# -----------------------------------------------------------------------------
+# FireRedVAD（推荐）: https://github.com/FireRedTeam/FireRedVAD
+fireredvad
+# GPU 环境推荐: pip install "fireredvad[gpu]"
+
+# WebRTC VAD（轻量）
+webrtcvad
+
+# NeMo ONNX VAD（可选，需 onnxruntime）
+onnxruntime>=1.15.0
+
+# FunASR VAD（可选）
+funasr>=1.0.0
+modelscope>=1.9.0
+
+# 模型自动下载 (FireRedVAD 等)
+huggingface-hub>=0.17.0
+
+# -----------------------------------------------------------------------------
+# Stage C1 Qwen-Omni（单事件候选分类）
+# -----------------------------------------------------------------------------
+# C1 Qwen worker 与 main 使用同一 Python 环境，以下依赖必须安装在 main 环境：
+#   accelerate>=0.26.0        # device_map="auto" 必需，缺了 from_pretrained 会报错
+#   pip install "qwen-omni-utils[decord]" -U
+# C3 不运行 Qwen，仅负责 admission policy；只有 C2 AudioTag subprocess_daemon 可通过 python_path 使用独立 runtime（见 README「环境安装」章节）。
+# Qwen2_5Omni* 类按官方 Qwen2.5-Omni README 固定使用此版本，避免版本漂移
+transformers==4.52.3
+
+# -----------------------------------------------------------------------------
+# 测试（README 中的独立环境 pytest 命令需要）
+# -----------------------------------------------------------------------------
+pytest>=8
+pytest-timeout>=2
+
+# -----------------------------------------------------------------------------
+# 可选 — 运维脚本
+# -----------------------------------------------------------------------------
+# pypinyin                # scripts/rename_paths_replace_spaces.py 处理中文文件名时需要（脚本内懒加载）

@@ -1,0 +1,16 @@
+# Normalize line endings: let Git decide text vs binary, checkout native, commit LF.
+* text=auto
+
+# Binary assets — never apply text/EOL normalization or diffing.
+*.wav binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.obj binary
+*.lib binary
+*.exp binary
+*.pyd binary
+*.so binary
+*.dll binary
+*.npy binary
+*.npz binary

@@ -1,0 +1,30 @@
+digraph aec_trainer_flow {
+  graph [rankdir=TB, bgcolor="white", pad="0.22", nodesep="0.30", ranksep="0.34", splines=ortho, fontname="Noto Sans CJK SC", label="AECTrainer：从 dynamic_aec 波形到训练 step", labelloc=t, fontsize=22, fontcolor="#17324D"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=11, color="#416984", fontcolor="#17324D", penwidth=1.4, margin="0.15,0.09"];
+  edge [fontname="Noto Sans CJK SC", fontsize=9, color="#53758C", fontcolor="#35566D", penwidth=1.4, arrowsize=0.7];
+
+  train [label="python train.py -C <config>\n统一入口：detect_task → AECTrainingEntry", fillcolor="#E9F2FF", color="#2469B3"];
+  dataset [label="DynamicMixingDataset._run\nDataset Layer A–F + C-aec\n输出 waveform sample", fillcolor="#FFF2E3", color="#C86A19"];
+  sample [label="样本字段\nnearend · mic · farend · error\nflags · optional state", fillcolor="#FFF7ED", color="#C86A19"];
+  collate [label="aec_collate_fn\npad/stack + validate", fillcolor="#FFF7ED", color="#C86A19"];
+  batch [label="AECBatch\n具名波形、flags 与 lengths", fillcolor="#EEF5FB"];
+  device [label="_batch_to_device\n训练设备迁移与输入检查", fillcolor="#EEF5FB"];
+  frontend [label="AECDeploymentFrontend（波形域）\n可选 Streaming GCC-PHAT\n→ 可选 LinearAEC / input routing", fillcolor="#E6F7F5", color="#16837E"];
+  stft [label="trainer STFT\nmodel_mic / aligned_farend\nnearend / optional error → *_spectra", fillcolor="#F1ECFF", color="#6F4EB5"];
+  model [label="model(data)\ndict 谱输入 → nearend_estimate_spectra", fillcolor="#E6F7F5", color="#16837E"];
+  istft [label="trainer iSTFT\n→ nearend_estimate waveform", fillcolor="#F1ECFF", color="#6F4EB5"];
+  loss [label="loss_fn(nearend_estimate, nearend, lengths, …)\nCompositeLoss 或其他 build_loss 模块", fillcolor="#E9F7E9", color="#388B42"];
+  step [label="optimizer step\nAMP · accumulation · DDP", fillcolor="#E9F7E9", color="#388B42"];
+  epoch [label="epoch / validation / checkpoint", fillcolor="#E9F7E9", color="#388B42"];
+  objective [label="objective metrics（共享路径）\n(nearend, nearend_estimate)\nSI-SDR / PESQ / STOI / ESTOI …", fillcolor="#F4F7F9", color="#6F7F89"];
+  erle [label="AEC-specific ERLE（专用路径）\n(mic, nearend, nearend_estimate, farend[, echo])", fillcolor="#FFF4D9", color="#C17A00"];
+  boundary [label="关键边界\nDataset 只负责 A–F 仿真；\nAECDeploymentFrontend 位于 collate 后、STFT 前；\nSTFT / iSTFT 由 trainer 管理。", fillcolor="#FFFFFF", color="#7B8791", style="rounded,dashed,filled"];
+
+  train -> dataset -> sample -> collate -> batch -> device -> frontend -> stft -> model -> istft -> loss -> step -> epoch;
+  istft -> objective [xlabel="validation", color="#6F7F89"];
+  istft -> erle [xlabel="estimate", color="#C17A00"];
+  batch -> erle [style=dashed, xlabel="mic / nearend / farend / flags", color="#C17A00", constraint=false];
+  objective -> epoch [color="#6F7F89"];
+  erle -> epoch [color="#C17A00"];
+  frontend -> boundary [style=dashed, arrowhead=none, color="#7B8791", constraint=false];
+}

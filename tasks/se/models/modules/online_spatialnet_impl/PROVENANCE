@@ -1,0 +1,21 @@
+# OnlineSpatialNet 来源说明
+
+本目录的因果骨干与窄带分支基于论文官方仓库重写：
+
+- 论文：
+  - Changsheng Quan, Xiaofei Li. *SpatialNet: Extensively Learning Spatial Information for Multichannel Joint Speech Separation, Denoising and Dereverberation*. IEEE/ACM TASLP, 2024.
+  - Changsheng Quan, Xiaofei Li. *Multichannel Long-Term Streaming Neural Speech Enhancement for Static and Moving Speakers*. IEEE Signal Processing Letters, 2024.
+- 官方仓库：<https://github.com/Audio-WestlakeU/NBSS>
+- 固定 commit：`cc42fc8`（2025-01-01，本地 checkout HEAD）
+- 上游路径：`models/arch/OnlineSpatialNet.py`、`models/arch/base/retention.py`、`configs/onlineSpatialNet.yaml`
+- 许可证：MIT，Copyright (c) 2024 Changsheng Quan；`retention.py` 另含 Copyright (c) 2022 Microsoft 与 Copyright (c) 2023 quancs@westlake.edu.cn，完整文本见本目录 `LICENSE`
+
+本项目未原样复制上游文件，而是按本仓谱进谱出、类型标注和中文注释约定重写：
+
+- 去掉 STFT/iSTFT 与 Lightning 训练外壳，只保留 encoder + 交错 cross-band/narrow-band block + decoder；
+- retention 只保留 recurrent（显式增量状态）路径，并修正上游 `recurrent_forward` 中
+  `view(num_heads, 1, 1)` 在 batch>1 时失效的缩放写法；
+- mamba 分支用 `CausalMamba` 封装 mamba_ssm 的 `Mamba`：整段前向在 CUDA 上走官方内核，
+  CPU/无内核环境与逐帧 step 走同一套纯 PyTorch 参考更新，state 显式为 `conv_state`/`ssm_state`；
+- T-ConvFFN 的 GroupNorm 改为按时间帧独立统计，避免整段前向跨帧池化破坏因果性与
+  流式/整段一致性。

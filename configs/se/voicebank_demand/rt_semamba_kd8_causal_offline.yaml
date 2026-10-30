@@ -1,0 +1,116 @@
+# ======================================================================
+# 实验配置：RT-SEMamba KD8，VoiceBank-DEMAND，离线预混（16 kHz）
+# ======================================================================
+# 模型：RT_SEMamba（8 个 cTF-Mamba block，谱进谱出）
+# Params：paper/reference 2.74M；local not measured
+# MACs：paper/reference 47.35G/s；local not measured
+# FLOPs：not measured（不以 2×MACs 冒充独立测量）
+# Trainer MOS boundary：Trainer 只计算侵入式客观指标；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 上游：RoyChao19477/RT-SEMamba @ 0c9e8c7c42caadd7badb6cc145c8af93f760863c
+# 前端差异：官方使用 center=False + Hann；共享 torch.istft 会因 NOLA 拒绝该组合，
+# 因此本配置使用同为 400/100/400、center=False 的 Hamming 窗，不声称前端数值精确复现。
+# 本配置只训练判别式 generator，不包含官方 metric discriminator/PESQ GAN recipe。
+# 数据：VCTK-DEMAND 预混配对 clean/noisy 四列 SCP；offline 无在线仿真随机性
+# 推荐入口：python train.py -C configs/se/voicebank_demand/rt_semamba_kd8_causal_offline.yaml
+# 模型实现：tasks/se/models/discriminative/rt_semamba.py（RT_SEMamba 类）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 42               # 全局随机种子；Trainer 由此派生 validation seed 与 DataLoader worker seed（runtime 默认 42）
+  use_amp: false         # 关闭 AMP：cTF-Mamba 的 SSM 扫描与复数算子在 BF16 下未验证，本配置保持 FP32
+  use_ema: false         # 关闭 EMA 权重：上游判别式配方未使用 EMA，避免额外显存与 eval 分支
+  # 关闭 cudnn 确定性（runtime 默认 false）；开启会牺牲吞吐，仅在需要逐 bit 复现时设 true
+  deterministic: false
+
+# ---- stft：框架负责 wav<->spec；谱进谱出模型只消费本段几何 ----
+stft:
+  n_fft: 400             # FFT 长度（采样点），16 kHz 下 25 ms；决定频率轴 F = n_fft//2+1 = 201
+  hop_length: 100        # 帧移（采样点），16 kHz 下 6.25 ms；官方 100-sample 帧移
+  win_length: 400        # 窗长（采样点），16 kHz 下 25 ms；必须满足 hop_length <= win_length <= n_fft
+  window: hamming        # 分析窗类型；官方为 Hann，但 center=False 下 Hann 触发 torch.istft 的 NOLA 拒绝，故用 Hamming
+  center: false          # 关闭居中补齐（官方口径）；无 lookahead，代价是首尾帧能量偏低；与 window=hamming 组合可过 NOLA 校验
+  normalized: false      # 关闭正交归一化（torch.stft normalized=false）：保持官方谱幅度口径，开启会改变幅度标度与 loss 量级
+
+# ---- model：RT_SEMamba（tasks/se/models/discriminative/rt_semamba.py）----
+model:
+  type: RT_SEMamba       # registry 名称（@MODEL_REGISTRY.register("RT_SEMamba")）
+  # n_fft/hop_length/win_length/window/center 由 build_model 从顶层 stft 注入并严格校验；args 只放模型自身超参
+  args:
+    num_tfmamba: 8       # cTF-Mamba block 数（官方 KD1/KD8 分别为 1/8）；本配置为 KD8 完整模型
+    hid_feature: 64      # Mamba 主干隐藏维度（正整数）
+    d_state: 16          # SSM 状态维度（正整数）；官方 16
+    d_conv: 4            # SSM 内部深度卷积核（正整数）；官方 4
+    expand: 4            # SSM 内部通道扩展倍率（正整数）；官方 4
+    compress_factor: 0.3 # 幅度压缩指数（0 < c <= 1，无量纲）；官方 0.3；构造期越界即报错
+
+# ---- data：VoiceBank-DEMAND 预混配对数据 ----
+# 官方训练随机裁切 2.5 s；这里用等长离线配对片段。
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真（normalize_data_mode fail-fast）
+  sample_rate: 16000     # 目标采样率 Hz；RT_SEMamba 仅支持 fs=16000，模型侧对不一致的 fs 直接报错
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数（Dataset 级）
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_train.scp"   # 四列 uid/fs/length/path；11572 条
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_train.scp"   # 与 clean_scp 逐条配对，uid 一一对应
+    max_duration: 40000               # 40000 样本，即 2.5 s @ 16 kHz；对齐官方随机裁切时长
+    repeat_to_max_duration: true      # 短样本 tile/repeat 到 max_duration（不是 collate pad），批内等长
+  # validation 不设 max_duration/repeat_to_max_duration：沿用 offline Dataset 默认 max_duration=-1、repeat=False
+  validation:            # 验证 split：不裁切、不 tile，保持原始时长与官方评测口径一致
+    clean_scp: "data/se/voicebank_demand/voicebank_clean_val.scp"     # 824 条测试集配对
+    noisy_scp: "data/se/voicebank_demand/voicebank_noisy_val.scp"     # 与 clean_scp 逐条配对
+  dataloader:            # DataLoader 公共参数；train/val 共享（val_num_workers 等可另行覆盖）
+    batch_size: 2        # 单卡 batch（假设：未做显存扫描；2.5 s 画布 + 8 层 Mamba 下取 2）
+    num_workers: 4       # 训练 DataLoader 进程数；验证 loader 默认沿用本值
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：判别式移植采用可直接运行的压缩幅度/相位感知损失；不等同于官方 GAN 总损失 ----
+loss:
+  type: PLCPAAsymmetricLoss  # 压缩幅度 MSE + 相位感知 MSE + 过抑制非对称项，见 core/losses/plcpa_asymmetric.py
+  # n_fft/hop_length/win_length/center/window 由 runtime 按构造器声明从顶层 stft 注入（setdefault，显式 args 优先）
+  args:
+    compress_factor: 0.3 # 功率律压缩指数 p（0 < p <= 1，无量纲）；官方参考实现取 0.3
+    scale_mag: 1.0       # 压缩幅度 MSE 项权重（无量纲，>= 0）
+    scale_phase: 1.0     # 相位感知 MSE 项权重（无量纲，>= 0）
+    scale_asym: 1.0      # 过抑制非对称项权重（无量纲，>= 0）；三项等权，未按论文微调
+
+# ---- optimizer：AdamW ----
+optimizer:
+  type: AdamW            # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.AdamW
+    lr: 0.0005           # 初始学习率（无量纲，假设：未在上游仓库逐条核对；沿用判别式训练常用 5e-4）
+    betas: [0.8, 0.99]   # 一阶/二阶动量系数（无量纲）；上游 RT-SEMamba 配方；未设 weight_decay 即 0.0
+
+# ---- scheduler：每 epoch 指数衰减（core/optim/scheduler.py 的 _Exp）----
+scheduler:
+  type: ExponentialLR    # torch 原生 ExponentialLR；与 trainer.lr_schedule_per_step=false 配套（按 epoch 调度）
+  args:                  # 透传给 torch.optim.lr_scheduler.ExponentialLR
+    gamma: 0.99          # 每个 epoch lr 乘 0.99（无量纲）；1200 epoch 后约为初始值的 0.99^1200 ≈ 5.8e-6 倍
+
+# ---- trainer：SETrainer（单优化器、无 GAN）----
+trainer:
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/rt_semamba_kd8_causal_offline   # 产物根目录；须与 tests/test_configs.py 的固定前缀约定一致
+  epochs: 1200           # 训练轮数；官方 KD8 长训练口径，未声明 max_steps，故按 epoch 跑满
+  gradient_clip_value: 5.0   # 梯度范数裁剪阈值（无量纲）
+  accumulation_steps: 1      # 梯度累积步数；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: false  # 调度器按 epoch step 一次（与 ExponentialLR 配套，见 configs/README.md「MetricGAN 学习率调度」同款约定）
+  log_interval: 50           # 每 N 个 optimizer step 打一条训练日志
+  max_val_batches: 0         # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1   # 每 N 个 epoch 做一次 epoch 末验证（0 = 关闭）
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0（互斥语义见 core/trainer/base_trainer.py）
+  save_top_k: 3                  # 保留 val_loss 最低的 top-k checkpoint（步级验证场景使用）
+  # 客观指标（SI-SDR/PESQ/STOI）；interval 表示每 N 次 validation 计算一次
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, STOI]  # 指标枚举；均需 clean 参考
+    interval: 5          # 每 5 次 validation 计算一次指标（loss 仍每次验证都算）
+    max_utterances: 872              # 全局指标上限；各 rank 均分（当前 val SCP 实际 824 条，故最多评估 824 条）
+    max_utterances_metrics: 872  # 显式声明：省略时回退 max_utterances，避免“共享上限”误读
+    metrics_workers: 2   # 每个 rank 的侵入式指标进程池大小；0 = 自动（受 CPU 数限制）
+  save_checkpoint_interval: 10   # 仅 epoch 末周期性写 latest 与 model_{epoch}.pth
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部参数；设 true 会多一次 autograd 遍历并可能触发 DDP 警告

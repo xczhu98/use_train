@@ -1,0 +1,233 @@
+# 对齐 wesep-real-tse LibriMix-100 baseline 主要参数与训练语义的独立实验配置。
+# 本文件为「官方优化配方复现」变体：与 tse_bsrnn_spk_wesep_baseline.yaml 完全同数据/
+#   超参，仅 exp_path 不同；区别只在启动方式——用 2 卡（torchrun --nproc_per_node=2）
+#   使全局 batch = 2 × 15 = 30、steps/epoch = 463、总 optimizer steps ≈ 69,450，
+#   与官方 config（gpus: [0,1]）一致，用于对照 8 卡（全局 120）训练的整体欠训差距。
+#   推荐入口：torchrun --nproc_per_node=2 train.py -C configs/tse/offline/tse_bsrnn_spk_wesep_baseline_gb30.yaml
+# Params: 27.617800M；MACs: 49.316640G partial THOP；FLOPs: 6.563611G profiler 下界。
+# 复杂度口径：B=1，16 kHz，1 s mixture + 3 s enrollment；仅统计模型前向，图外
+#   STFT/iSTFT 不计；MACs 为 backend-specific partial module-hook count（未测 not measured 的路径不补算）。
+# RTF: not measured（本机未做端到端实时率测量）。
+# Trainer MOS boundary: Trainer 不负责 MOS；本配置不包含主观听测，DNSMOS/NISQA/UTMOS/SCOREQ
+#   等离线代理指标统一在 evaluate/ 流水线运行，不等于主观 MOS。
+# 对齐边界：3 秒 LibriMix 切片、spkemb cue、fbank dither=1、150 epochs、
+# Adam 1e-3/weight_decay=1e-4、逐 optimizer-step ExponentialDecrease 到 2.5e-5。
+# 数据与训练循环保持 use_train 的 offline_tse/Trainer 契约，不声明 bit-exact
+# 复现 WeSep processor、参数分组、短音频处理或随机数流。
+# 与其他变体的关键区别：唯一使用 ExponentialDecrease + batch_size 15 + 150 epochs
+#   的 offline 变体；本文件是它的 2 卡（全局 batch 30）官方配方复现版，
+#   dual_self_estimated 变体复用同一模型但改双路目标，
+#   tfmap_emb / multi_fuse 变体换 TSE_Modular。
+# 推荐入口：torchrun --nproc_per_node=2 train.py -C configs/tse/offline/tse_bsrnn_spk_wesep_baseline_gb30.yaml
+# 实现路径：模型 tasks/tse/models/discriminative/tse_bsrnn_spk.py；数据
+#   tasks/tse/data/offline_dataset.py；Trainer tasks/tse/trainer/tse_trainer.py。
+# 数据可用性：data.train/data.validation 的 samples_jsonl 与 cues_yaml 已生成
+#   并落位于语料旁（wav16k/min/<split>/）；清单由
+#   tools/prepare_data_tools/generators/tse/prepare_librimix_wesep_index.py
+#   从 Libri2Mix 音频与 dynamic_tse enrollment 重新生成。
+
+# meta：随机种子与混合精度
+meta:
+  seed: 42                    # 全局随机种子
+  # 是否启用 AMP 自动混合精度（bool）；false = 全 fp32，保持与官方 baseline 数值可比
+  use_amp: false
+  # 是否维护 EMA 影子权重（bool）；false = 只保存原始权重
+  use_ema: false
+  # 是否强制 cudnn 确定性算法（bool）；false = 允许 autotune 选最快 kernel
+  deterministic: false
+  # AMP 数据类型枚举：float16 | bfloat16（无量纲）；仅 meta.use_amp=true 时生效
+  amp_dtype: float16
+  # cudnn autotune 开关（bool）；meta.deterministic=true 时被强制关闭（core/trainer/base_trainer.py:152）
+  cudnn_benchmark: true
+
+# stft：分析综合窗；win_length 必须等于 n_fft（BandSplit 子带表据此推导）
+stft:
+  # FFT 点数（samples，正整数偶数）；决定 F=n_fft/2+1=257，BandSplit 子带表按此推导
+  n_fft: 512
+  hop_length: 128             # 帧移（采样点）；128 @16 kHz = 8 ms
+  # 分析窗长（samples）；必须等于 stft.n_fft，否则 TSE_BSRNN_SPK 构造期 fail-fast（tse_bsrnn_spk.py:178）
+  win_length: 512
+  # 窗函数枚举：hann（TSE_BSRNN_SPK 唯一合法值，比赛 ckpt 条件固定）；center 未声明取 runtime 默认 True
+  window: hann
+
+# model：TSE_BSRNN_SPK（spkemb cue，非因果），与官方 spk_emb_100 同结构
+model:
+  # 模型注册名；TSE_BSRNN_SPK = BSRNN 分离主干 + 可插拔 speaker cue
+  type: TSE_BSRNN_SPK
+  # 模型构造参数；键必须是 TSE_BSRNN_SPK.__init__ 的显式形参，未知键抛 TypeError
+  args:
+    sr: 16000                # 模型采样率（Hz）
+    feature_dim: 128         # BandSplit 子带特征维（无量纲）
+    num_repeat: 6            # BSNet 重复次数（无量纲）
+    causal: false            # false = 非因果；true = 因果（时间 LSTM 单向，可流式）
+    joint_training: true     # true = 模型内含 vendored ECAPA-TDNN，从 enroll_wav 提 embedding
+    # features：cue 开关表；本配置启用 spkemb（句级 ECAPA-TDNN embedding + multiply 融合）
+    features:
+      # 句级 speaker embedding cue（ECAPA-TDNN 输出）
+      spkemb:
+        # 是否启用该 cue（bool）；true = 用句级 embedding 条件化分离主干
+        enabled: true
+        # 条件融合方式枚举：concat | additive | multiply | FiLM（无量纲）
+        fusion: multiply     # concat | additive | multiply | FiLM
+    # speaker cue 的 fbank 与 ECAPA 编码器配置
+    speaker_model:
+      # 句级 speaker 编码器的 fbank 前端；参数对齐官方 baseline
+      fbank:
+        num_mel_bins: 80     # Mel 滤波器组数（无量纲）
+        frame_shift: 10      # 帧移（ms）
+        frame_length: 25     # 帧长（ms）
+        dither: 1.0          # 官方 spk_emb_100 baseline 显式值
+        sample_rate: 16000   # fbank 采样率（Hz）
+        # 是否做句级 mean-CMN（bool）；true = 减均值，wesep 默认
+        norm_mean: true
+        # 是否做方差归一（bool）；false = 不除标准差，与官方 baseline 一致
+        norm_var: false
+      # 句级 speaker 编码器
+      speaker_encoder:
+        # ECAPA 结构名（speaker 模型注册名）
+        model: ECAPA_TDNN_GLOB_c512
+        # 官方完整 TSE checkpoint；按 prefix 严格选择并冻结 ECAPA 子模块，separator 权重不会进入
+        pretrained: "tasks/tse/pretrained_models/spk_emb_100/avg_model.pt"
+        # 权重前缀；必须完整命中全部 speaker keys，缺失即 fail-closed
+        pretrained_prefix: "spk_ft.encoder.spk_model."
+        freeze: ~            # ~ = 有预训练则冻结（默认推荐）
+        # ECAPA 构造参数；embed_dim 须与 features.spkemb 融合维一致
+        spk_args:
+          embed_dim: 192     # 句级 embedding 维（无量纲）
+          feat_dim: 80       # encoder 输入特征维（无量纲）
+          # 时序池化方式枚举；ASTP = attentive statistics pooling
+          pooling_func: ASTP
+
+# data：offline_tse 读取 WeSep v0.1 manifest（3 秒 LibriMix 切片）
+data:
+  # 数据模式路由键（必填）；offline_tse → TSEOfflineDataset，跳过动态仿真资源校验
+  mode: offline_tse
+  # 数据采样率（Hz）；须与 model.args.sr 一致
+  sample_rate: 16000
+  # 训练 split 的 manifest 与 cue 合同键（offline_tse 导入合同：manifest_format/path_base/target_selection/mix_variant/cue_schema/enabled_cues 全部必填）
+  train:
+    samples_jsonl: "data/tse/spk/wesep/datasets/Libri2Mix/wav16k/min/train-100/samples.jsonl"  # 训练样本清单（WeSep JSONL）
+    manifest_format: jsonl        # jsonl | path_list；runtime 不按后缀猜格式
+    path_base: manifest_relative  # manifest_relative | recipe_root：清单内路径的解析基准
+    target_selection: first       # all | first | 样本→说话人映射；本配置取首个目标
+    mix_variant: default          # 取 manifest mix 段中的变体名
+    cues_yaml: "data/tse/spk/wesep/datasets/Libri2Mix/wav16k/min/train-100/cues.yaml"  # cue 定义清单
+    cue_schema: wesep_v0_1        # none | realtse_raw | wesep_v0_1
+    enabled_cues: [audio]         # 启用的 cue；当前 recipe 只启用可解码的 audio
+    max_duration_seconds: 3.0     # 片段长度上限（s），对齐 3 秒 LibriMix 切片
+    enroll_policy: random         # random | fixed；train=random（每样本随机抽注册音）
+    # 是否按时长过滤样本（bool）；false = 信任 manifest 已裁剪，不再二次过滤
+    filter_by_duration: false
+  # 验证 split：合同键与 train 相同，enroll_policy 固定
+  validation:
+    samples_jsonl: "data/tse/spk/wesep/datasets/Libri2Mix/wav16k/min/dev/samples.jsonl"  # dev split 样本清单
+    # manifest 解析格式（jsonl | path_list）；必须显式声明
+    manifest_format: jsonl
+    # 清单内路径解析基准（manifest_relative | recipe_root）
+    path_base: manifest_relative
+    # 目标选择策略（all | first）；validation 与 train 保持一致便于对比
+    target_selection: first
+    # 取 manifest mix 段中的变体名
+    mix_variant: default
+    # cue 定义清单（dev）
+    cues_yaml: "data/tse/spk/wesep/datasets/Libri2Mix/wav16k/min/dev/cues.yaml"
+    # cue schema 枚举（none | realtse_raw | wesep_v0_1）
+    cue_schema: wesep_v0_1
+    # 启用的 cue 列表；dev 同样只启用 audio
+    enabled_cues: [audio]
+    # 片段长度上限（s）；与 train 一致
+    max_duration_seconds: 3.0
+    enroll_policy: fixed          # 固定候选及裁剪，验证不随机抽注册音
+    # 是否按时长过滤（bool）；false = 与 train 同语义
+    filter_by_duration: false
+  # DataLoader 配置；DDP 下每个 rank 各建一份 train/val loader
+  dataloader:
+    # 训练 batch 大小（样本数）；15 为对齐 WeSep baseline 的显式值
+    batch_size: 15
+    # 训练 loader worker 数（进程数）
+    num_workers: 6
+    # 每个 worker 预取 batch 数（无量纲，>=1）
+    prefetch_factor: 6
+    # 是否 pin 到页锁定内存（bool）
+    pin_memory: true
+    # worker 取 batch 超时（s）；0 = 不设超时
+    timeout: 0
+    # 是否跨 epoch 保留训练 worker 进程（bool）；false = 每 epoch 重建
+    persistent_workers: false
+    # 是否跨 epoch 保留验证 worker 进程（bool）；false = 与训练侧一致的保守设置
+    val_persistent_workers: false
+
+# loss：SI-SNR 监督（weight 1.0）
+loss:
+  # 复合损失注册名；CompositeLoss 顶层只接受 type / components / strict
+  type: CompositeLoss
+  # 是否把指标缺失当致命错误（bool）；false = 容错继续
+  strict: false
+  # 损失分量列表；每项只接受 type / weight / args / name / enable_ss_undesired_energy
+  components:
+    # 尺度不变信噪比；本配置只有这一个分量
+    - type: SISNRLoss
+      # 分量权重（无量纲，>0）
+      weight: 1.0
+      # 日志与 history 中显示的分量名
+      name: SI-SNR
+
+# optimizer：Adam，lr 1e-3 / weight_decay 1e-4（对齐 baseline）
+optimizer:
+  # 优化器注册名；Adam 顶层只接受 type / args
+  type: Adam
+  # 优化器超参；lr/weight_decay 均无量纲
+  args:
+    # 学习率（无量纲）；1e-3 对齐 WeSep baseline
+    lr: 0.001
+    # 权重衰减系数（无量纲）；1e-4 对齐 WeSep baseline
+    weight_decay: 0.0001
+
+# scheduler：逐 optimizer-step ExponentialDecrease，1e-3 → 2.5e-5
+scheduler:
+  # 调度器注册名；按 optimizer step 指数衰减
+  type: ExponentialDecrease
+  # 调度器超参；学习率单位无量纲
+  args:
+    # 初始学习率（无量纲）；应与 optimizer.args.lr 一致
+    initial_lr: 0.001
+    # 终止学习率（无量纲）；衰减到此值后保持不变
+    final_lr: 0.000025
+    total_steps: auto             # auto = 按总 optimizer step 数推导
+
+# trainer：150 epochs，逐 optimizer-step 调度，保留 top-10 checkpoint
+trainer:
+  # Trainer 注册名；TSETrainer 由 tasks/tse/trainer/entry.py 路由
+  type: TSETrainer
+  exp_path: exp/tse/offline/tse_bsrnn_spk_wesep_baseline_gb30  # 实验输出目录
+  epochs: 150                     # 训练总 epoch 数
+  # 梯度裁剪阈值（无量纲 L2 范数）
+  gradient_clip_value: 5.0
+  # 梯度累积步数（无量纲，>=1）；1 = 每 batch 一次 optimizer step
+  accumulation_steps: 1
+  lr_schedule_per_step: true      # 调度器按 optimizer step 而非 epoch 推进
+  # 训练日志打印间隔（optimizer step 数）
+  log_interval: 100
+  max_val_batches: 0              # 单次 val 最大 forward batch 数（每 rank）；0 = 不限制
+  validation_epoch_interval: 1    # 每 N 个 epoch 末验证；0 = 关闭
+  validation_steps_interval: 0    # 0 = 关闭步级验证
+  save_top_k: 10                  # 保留的最优 checkpoint 数量
+  save_checkpoint_interval: 10    # 每 N 个 epoch 存一次 checkpoint
+  # 在线客观指标；基于 (target, target_estimate) 计算
+  val_metrics:
+    # 是否启用在线指标（bool）；关闭则只记录 loss
+    enabled: true
+    metrics: [SI-SDR, ESTOI]      # 基于 (target, target_estimate) 的客观指标
+    # 指标计算间隔（epoch 数）
+    interval: 1
+    # 每 epoch 全局 utterance quota（条，非 per-rank）；各 rank 按 world_size 精确均分，160 为 TSE 训练期取样口径
+    max_utterances: 160
+    # 侵入式指标进程池 worker 数（进程数）；0/null = 自动
+    metrics_workers: 8
+
+# distributed：DDP 后端与超时
+distributed:
+  # 通信后端枚举：nccl | gloo；nccl 要求 CUDA 可用
+  backend: nccl
+  find_unused_parameters: false   # TSETrainer 按 cue 配置自动推导，显式配置优先
+  nccl_timeout_minutes: 30        # NCCL 超时（分钟）

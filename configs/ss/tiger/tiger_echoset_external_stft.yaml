@@ -1,0 +1,112 @@
+# ======================================================================
+# 离线 SS：TIGER（small，num_blocks=4），EchoSet，16 kHz，固定 2 路源，train 3 s 裁剪，external STFT
+# 数据管线：offline_ss（预生成 separation JSONL，无在线仿真随机性）
+# 模型：TIGER（tasks/ss/models/tiger.py adapter，上游网络 tasks/ss/models/_third_party/tiger.py）
+# 采样率 / 帧移：16 kHz / 160 samples（10 ms）；FFT 640 → F=321，1 s 输入 → T=101 帧
+# ----------------------------------------------------------------------
+# Params: not measured（沿用官方 TIGER-small 配置；本机未运行独立参数审计）
+# MACs: 6.583G @ 1 s / 16 kHz（THOP 0.1.1，partial/unverified；输入口径 B=1、F=321、T=101；
+#   仅模型前向，图外 STFT/iSTFT 不计；module hooks 会漏计 functional/complex 等无 hook 路径）
+# FLOPs: 14.411G @ 1 s / 16 kHz（PyTorch FlopCounterMode 独立测量；仅模型前向，图外 STFT/iSTFT 不计）
+# RTF: not measured（未做本地实时率测量）
+# Trainer MOS boundary: Trainer 只做前向/反向与 loss，不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ
+#   等只能经 evaluate/eval_pipeline_*.py 离线评估，并随数据集与评测协议报告
+# ----------------------------------------------------------------------
+# 与其他变体的关键区别：本文件是 TIGER small（model.args.num_blocks=4）；large 变体唯一差异是
+#   model.args.num_blocks=8 与对应 trainer.exp_path，其余键逐值相同，见
+#   configs/ss/tiger/tiger_echoset_external_stft_large.yaml。
+#   TIGER 为 external-STFT 谱进谱出模型：框架计算 STFT/iSTFT，模型内部不做变换，由 SSTrainer 统一管理。
+# 推荐入口：python train.py -C configs/ss/tiger/tiger_echoset_external_stft.yaml
+# 实现路径：tasks/ss/models/tiger.py、tasks/ss/models/_third_party/tiger.py、
+#   tasks/ss/trainer/ss_trainer.py、tasks/ss/data/offline_dataset.py
+# ======================================================================
+
+# meta：全局训练超参（随机种子、确定性、混合精度、EMA）
+meta:
+  seed: 42                     # 全局随机种子（无量纲整数）；离线清单无在线仿真随机性，仅影响采样/worker 顺序类随机性
+  deterministic: false         # false = 不启用 cuDNN deterministic 模式；runtime 默认 false（core/trainer/base_trainer.py:151）
+  use_amp: false               # false = 不启用 torch AMP 自动混合精度；PIT/负 SI-SDR 在 fp16 下数值稳定性未验证，基线保持 fp32（假设）
+  use_ema: false               # false = 不做 EMA 权重平均；基线只用常规 checkpoint，未做 EMA 消融（假设）
+
+# stft：顶层 STFT；TIGER 为 external-STFT，谱由 trainer 计算，模型内部不重复引入
+stft:
+  n_fft: 640                   # FFT 点数（samples）；必须等于 model.args.win，否则构造期 ValueError（tasks/ss/models/tiger.py:59-60）
+  hop_length: 160              # 帧移（samples）；160 @16 kHz = 10 ms；必须等于 model.args.stride（tasks/ss/models/tiger.py:61-62）
+  win_length: 640              # 分析窗长（samples）；必须等于 model.args.win（tasks/ss/models/tiger.py:63-64）
+  window: hann                 # 窗函数；TIGER 仅接受 hann，其他值构造期报错（tasks/ss/models/tiger.py:65-66）
+  center: true                 # true = STFT 居中补零（T=1+floor(N/hop)）；TIGER 硬约束 center=True，false 构造期报错（tasks/ss/models/tiger.py:67-68）
+
+# model：TIGER small（BandSplit → Recurrent separator → complex mask，输出 source spectra）
+model:
+  type: TIGER                   # 注册名，映射 tasks/ss/models/tiger.py:TIGER
+  args:                         # 模型构造参数；由 build_model 显式消费，未知 kwargs 抛 TypeError（core/models/build.py）
+    out_channels: 128           # BandSplit 子带特征维（无量纲）；官方 EchoSet small 口径
+    in_channels: 256            # separator（Recurrent）隐藏通道数（无量纲）；官方 EchoSet small 口径
+    num_blocks: 4               # separator 中 block 重复次数（无量纲）；4 = small，8 = large 变体
+    upsampling_depth: 5         # separator U-Net 式上采样深度（无量纲）
+    win: 640                    # 模型侧 STFT 窗长（samples）；必须等于顶层 stft.win_length，且 band split 依赖该几何
+    stride: 160                 # 模型侧 STFT 帧移（samples）；必须等于顶层 stft.hop_length
+    sample_rate: 16000          # 采样率（Hz）；决定 band split 的 25/100/250/500 Hz 子带边界
+
+# data：offline_ss 路由到 SSOfflineDataset，消费预生成 separation JSONL（严格 uid/fs/length/mixture/sources）
+data:
+  mode: offline_ss              # 必填路由字段；offline 变体无在线仿真随机性（core/data/constants.py）
+  sample_rate: 16000            # 全局采样率（Hz）；必须与模型 execution plan 的 sample_rate 一致，否则 SSTrainer 构造期报错
+  train:                        # 训练 split；strict_load 未声明，runtime 默认 true（tasks/ss/data/offline_dataset.py:45）
+    manifest: data/ss/EchoSet/train.jsonl  # 训练清单（仓库根相对路径）；strict JSONL，未知键 fail-fast（core/data/separation_manifest.py）
+    max_duration_seconds: 3.0   # 训练片段上限（s）；超过则截断到 3 s @16 kHz = 48000 samples
+  validation:                   # 验证 split；同 train，未声明 max_duration_seconds 时不截断
+    manifest: data/ss/EchoSet/val.jsonl    # 验证清单；按原始长度评估（不截断）
+  dataloader:                   # DataLoader 参数；runtime 会按 split 名推导 val_* 覆盖键（core/trainer/entry_components.py:367-396）
+    batch_size: 1               # 每 rank 采样样本数（无量纲）；EchoSet 3 s 定长裁剪下与官方基线口径一致
+    num_workers: 8              # 每 rank DataLoader worker 数（无量纲）；0 = 主进程加载
+    pin_memory: true            # true = 锁页内存加速 H2D 拷贝；runtime 默认 true（core/trainer/entry_components.py:377）
+    persistent_workers: false   # false = 每 epoch 重建 worker（不常驻）；runtime 默认 true（core/trainer/entry_components.py:367-374）；关闭避免长训练下 worker 常驻状态/内存（假设）
+
+# ss：SS 任务级顶层配置；entry 校验后注入 build_model（tasks/ss/trainer/entry.py:_validate_config）
+ss:
+  num_sources: 2                # 固定源数 K（无量纲正整数）；必须与 loss/模型输出一致；model.args 未声明 num_sources，由本键注入
+
+# loss：PITLoss 排列不变训练目标
+loss:
+  type: PITLoss                 # 注册名；LOSS_CONTRACT 输入 est_sources/sources/lengths/source_mask（core/losses/pit.py:22-31）
+  args:                         # loss 构造参数；未知结构键在构造前 fail-fast（core/losses/build.py）
+    pairwise_loss: PairwiseNegSISDRLoss  # 配对损失（注册名）；负 SI-SDR，单位 dB 语义的负值（无量纲标量）
+    assignment: exhaustive      # 排列搜索方式；当前仅支持 exhaustive（全排列最优），其他值构造期报错（core/losses/pit.py:42-43）
+    reduction: mean             # 批内归约方式；当前仅支持 mean，其他值构造期报错（core/losses/pit.py:44-45）
+
+# optimizer：Adam 优化器
+optimizer:
+  type: Adam                    # 注册名
+  args:                         # 优化器构造参数
+    lr: 0.001                   # 学习率（无量纲）；1e-3
+    weight_decay: 0.0           # L2 权重衰减（无量纲）；0.0 = 不做权重衰减
+
+# scheduler：ReduceLROnPlateau，按 validation loss 衰减
+scheduler:
+  type: ReduceLROnPlateau       # 注册名
+  args:                         # 调度器构造参数
+    mode: min                   # min = 指标越小越好（监控 validation loss）
+    factor: 0.5                 # 衰减系数（无量纲）；触发时 lr *= 0.5
+    patience: 10                # 容忍 epoch 数（无量纲）；连续 10 个 epoch 无改善才衰减
+
+# trainer：SSTrainer 训练骨架参数
+trainer:
+  type: SSTrainer               # 注册名；tasks/ss/trainer/ss_trainer.py
+  exp_path: exp/ss/tiger_echoset_external_stft  # 实验输出目录；测试按 configs/ss/tiger/<stem> 钉住该值（tests/test_configs.py:1473-1491）
+  epochs: 500                   # 训练总 epoch 数（无量纲）
+  gradient_clip_value: 5.0      # 梯度范数裁剪阈值（无量纲）；0 = 关闭裁剪
+  accumulation_steps: 1         # 梯度累积步数（无量纲）；1 = 每个 batch 更新一次
+  lr_schedule_per_step: false   # false = scheduler 按 epoch 步进；ReduceLROnPlateau 若为 true 会每个 optimizer step 衰减
+  log_interval: 50              # 日志打印间隔（optimizer step 数）
+  max_val_batches: 0            # 验证 batch 上限（无量纲）；0 = 不限制（跑完整个 validation split）
+  validation_epoch_interval: 1  # 每 N 个 epoch 做一次 epoch 末验证；0 = 关闭（core/trainer/base_trainer.py:267-275）
+  validation_steps_interval: 0  # 每 N 个 optimizer step 做一次步级验证；0 = 关闭步级验证
+  save_top_k: 3                 # 保留的 step-best checkpoint 数（无量纲）；0 = 不保存 step-best
+  val_metrics:                  # 在线指标段；本文件关闭，理由见下一行
+    enabled: false              # 有意关闭在线指标：SS 的 SI-SDR 等侵入式指标开销大，本基线以 validation loss 驱动 ReduceLROnPlateau 与 checkpoint 选择，指标改由 evaluate/ 离线评估
+  save_checkpoint_interval: 1   # 每 N 个 epoch 保存一次中间 checkpoint（无量纲）
+
+# distributed：分布式后端
+distributed:
+  backend: nccl                 # GPU 集合通信后端；单卡训练不生效，多卡 DDP 必填

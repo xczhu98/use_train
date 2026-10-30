@@ -1,0 +1,13 @@
+# MTFAA-Net 来源说明
+
+本目录中的网络主干根据以下非官方实现重写：
+
+- 论文：*MTFAA-Net: Multi-Scale Temporal Frequency Convolutional Network With Axial Attention for Speech Enhancement*
+- 参考仓库：<https://github.com/echocatzh/MTFAA-Net>
+- 固定 commit：`eb3b1f33d7c5178f238076938c99acaec9e2e904`
+- 上游路径：`mtfaa.py`、`asa.py`、`tfcm.py`、`phase_encoder.py`、`f_sampling.py`、`erb.py`
+- 许可证：MIT，Copyright (c) 2022 Shimin Zhang；完整文本见本目录 `LICENSE`
+
+上游 README 明确声明："Implementation details may not be consistent with the paper"。因此本移植只表示对该非官方实现的工程适配，不声称与论文实现逐项一致，也不继承论文或参考仓库报告的指标。
+
+本项目移除了上游模型内部 STFT/iSTFT，改由框架顶层 `stft` 统一管理；使用纯 PyTorch 线性三角 filter bank 替代上游 `spafe` 调用，并复用 `tasks.aec.models.modules.mtfaa_mask.MTFAAMaskHead` 输出头。代码按本仓类型标注、中文 docstring 与谱进谱出契约重写，未原样复制上游文件。

@@ -1,0 +1,113 @@
+digraph UniPASEArchitecture {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="white",
+    size="16,9!",
+    ratio=fill,
+    pad="0.22",
+    margin="0.05",
+    nodesep="0.32",
+    ranksep="0.45",
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Noto Sans CJK SC",
+    fontsize=27,
+    fontcolor="#17324D",
+    label="UniPASE：16 kHz 增强主链与可选 PostNet 带宽扩展",
+    labelloc=t,
+    labeljust=l
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=13,
+    color="#AAB8C5",
+    fontcolor="#17324D",
+    penwidth=1.6,
+    margin="0.17,0.11"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=10,
+    color="#536B80",
+    fontcolor="#40586D",
+    penwidth=1.8,
+    arrowsize=0.78
+  ];
+
+  input [label="输入波形\n任意采样率 sr_in", fillcolor="#EEF2F5", color="#6D7E8C"];
+  resample [label="重采样到 16 kHz\n+ pad_to_multiple", fillcolor="#EEF2F5", color="#6D7E8C"];
+
+  subgraph cluster_encoder {
+    label="DeWavLM-Omni（冻结推理）";
+    labelloc=t;
+    labeljust=l;
+    fontname="Noto Sans CJK SC";
+    fontsize=17;
+    fontcolor="#8A6318";
+    color="#D9B867";
+    fillcolor="#FFF9E9";
+    style="rounded,filled";
+    penwidth=1.6;
+    margin=14;
+
+    plc [label="PLC 丢包检测\nmask embedding 替换缺失帧", fillcolor="#FFF0C9", color="#C99B32"];
+    wavlm [label="WavLM-Large\nCNN + 24 Transformer layers", fillcolor="#FFE9B3", color="#C99B32"];
+    l1 [label="L1 degraded acoustic\nrepresentation", fillcolor="#FFF0C9", color="#C99B32"];
+    l24 [label="L24 enhanced phonetic\nrepresentation", fillcolor="#FFF0C9", color="#C99B32"];
+
+    { rank=same; plc; wavlm; }
+    { rank=same; l1; l24; }
+    plc -> wavlm [color="#C99B32"];
+    wavlm -> l1 [color="#C99B32"];
+    wavlm -> l24 [color="#C99B32"];
+  }
+
+  adapter [
+    label=<<B>VocosAdapter</B><BR/><FONT POINT-SIZE="11">L24 条件化 L1<BR/>输出 enhanced L1 representation</FONT>>,
+    fillcolor="#FFE1C2",
+    color="#E0832E"
+  ];
+  vocoder [
+    label=<<B>VocosVocoder</B><BR/><FONT POINT-SIZE="11">ConvNeXt backbone + iSTFT head</FONT>>,
+    fillcolor="#DCEBFF",
+    color="#4C84C6"
+  ];
+  enhanced16 [
+    label=<<B>增强 16 kHz 波形</B><BR/><FONT POINT-SIZE="11">PostNet 的唯一音频输入</FONT>>,
+    fillcolor="#DDF5E4",
+    color="#439562",
+    penwidth=2.0
+  ];
+
+  decision [shape=diamond, label="sr_out > 16 kHz?", fillcolor="#F0E7FA", color="#875ABB", margin="0.12,0.08"];
+  direct [label="否：不启用 PostNet\n按需重采样到 sr_out ≤ 16 kHz", fillcolor="#EEF2F5", color="#6D7E8C"];
+  postnet [
+    label=<<B>是：PostNet BWE</B><BR/><FONT POINT-SIZE="11">增强 16 kHz 波形 → 宽带波形<BR/>TFGridNet infer 软门控高频残差</FONT>>,
+    fillcolor="#E9DDF7",
+    color="#875ABB"
+  ];
+  align [label="长度对齐\n+ 可选峰值归一化", fillcolor="#EEF2F5", color="#6D7E8C"];
+  output [label="增强输出波形\nsr_out", fillcolor="#DDF5E4", color="#439562", penwidth=2.0];
+
+  { rank=same; input; resample; }
+  { rank=same; adapter; vocoder; enhanced16; decision; }
+  { rank=same; direct; postnet; }
+  { rank=same; align; output; }
+
+  input -> resample;
+  resample -> plc;
+  l1 -> adapter [color="#E0832E"];
+  l24 -> adapter [color="#E0832E"];
+  adapter -> vocoder [color="#4C84C6"];
+  vocoder -> enhanced16 [color="#439562"];
+  enhanced16 -> decision [color="#439562"];
+  decision -> direct [color="#6D7E8C"];
+  decision -> postnet [color="#875ABB"];
+  direct -> align [color="#6D7E8C"];
+  postnet -> align [color="#875ABB"];
+  align -> output [color="#439562"];
+}

@@ -1,0 +1,497 @@
+# ============================================================
+# 实验配置：DBGNet 论文对齐配置（DBG-Mag，16 kHz / 16 ms，4 s 片段）
+# 论文：docs/paper/aec/Yonsei/32_DBGNet.md（IEEE TASLP 2025，Table I / Eq.9-12 / Sec. III-C）
+# 数据管线：dynamic_aec（Acoustic Echo Cancellation）
+# 模型：DBGNet（mask_domain=mag；erb_low_bins=65，erb_bands=64；mic=[32,64,96,128]，
+#   far=[16,32,48,64]；F-GRU 192（默认规则推导）；T-GRU=128）
+# Params: 1.469 M total / 1.444 M trainable（论文报 1.5 M）
+# 1 秒 mic+farend MACs: 2.362 G（THOP partial/unverified；B=1，16 kHz，F=257，T=63；
+#   仅统计当前谱域 forward，图外 STFT/iSTFT 不计，不作为完整部署复杂度）
+#   精确口径（PyTorch FlopCounterMode）: 3.803 GFLOPs ≈ 1.901 G MACs，与论文 Table II 的
+#   2.0 G/s 相差 −5.0%。THOP 对 stride>1 的 ConvTranspose2d 按“输出网格”计数，把 stride
+#   空洞里不发生的乘加也算进去，本模型因此高估 0.418 G（+24%）；与论文比较用精确口径。
+# FLOPs: 3.803G @ 1 s / 16 kHz（FlopCounterMode；B=1，F=257，T=63；仅模型前向）
+# RTF: not measured（无量纲 realtime factor；待在目标硬件、固定线程与部署路径实测）
+# Trainer MOS boundary: AECTrainer 在线验证不计算 MOS；DNSMOS/NISQA/UTMOS/SCOREQ 等
+#   通过 evaluate/ 在 checkpoint 推理产物上离线评估。
+# ============================================================
+# 对齐范围（逐项来自论文）：
+#   - 前端：16 kHz、512-point DFT、Hann、hop 256（16 ms）；ERB 65 + 64 = 129 维
+#     （论文 Sec. III-B："257 magnitude dimensions ... reduced to 129"）；
+#   - 结构：Table I 的 4 层因果 U-Net、非对称双分支通道、首层 kernel (5,2)/stride (1,1)
+#     其余 (3,2)/(2,1)、F-GRU 每方向 192（Table I 输出 (B×T,15,384)）、T-GRU 128；
+#     注：F-GRU 宽度按论文规则 mic[-1] + far[-1] 推导（此处 128 + 64 = 192），因此
+#     本配置不显式写 fgru_hidden；非官方参考实现 vkeep/DBGNet 用 (mic[-1]+far[-1])//2
+#     = 96（输出 192），与论文 Table I 不一致。参数量 1,468,506 ≈ 论文 1.5 M。
+#   - 目标函数：L_recon = (1-β)·L_mag + β·L_com，γ = β = 0.3（Eq.10-12）；
+#     由 GTCRNCompressedSpectralLoss{compress_factor: 0.3, lamda_mag: 0.7, lamda_ri: 0.3}
+#     表达（该 loss = lamda_ri·(Δreal²+Δimag²) + lamda_mag·Δ|·|²）；
+#   - 数据仿真：delay p=0.5、最长 1 s、B(1,3)；SER 均匀 [-15,15] dB；加性噪声 p=0.6、
+#     SNR 0-40 dB；近端混响 p=0.4；扬声器失真（hard clipping / sigmoid）p=0.5；
+#     训练片段 4 s；
+#   - 优化：AdamW lr=3e-4、batch 16、75 epochs、cosine annealing。
+#
+# 明确未对齐 / 无法对齐项（不得据此宣称复现论文数值）：
+#   1) 语料不同：论文为 Interspeech 2021 AEC Challenge synthetic + LibriVox + DNS RIR
+#      + LibriSpeech + MS-SNSD 共 110 h；本配置沿用仓库现有 16 kHz 资产。
+#   2) echo 来源不同：论文用 DNS RIR（RT60 0.3-1.3 s）合成 echo；本配置使用
+#      echo_prealign_16k 真实录制 pair，不做 RIR 合成。
+#   3) 近端混响建模不同：论文用 τ=300 ms 指数衰减；本项目为 RIR 卷积
+#      （prob_reverberation=0.4 + rir_normalize shared full-peak + early target）。
+#   4) L_SD 不复现：论文 L_tot = L_recon + 0.001·L_SD，其 state detector 为
+#      segment-level + temporal pooling；本项目 state 粒度属工程扩展，按约定不纳入
+#      本配置（use_state_detector=false，且 loss 不含 StateCrossEntropyLoss）。
+#   5) 论文未给出的项：AdamW weight decay（沿用项目 0.01）、gradient clip（1.0）、
+#      近端语音音量分布、ERL/far-end 电平耦合（沿用项目 canonical 值）。
+#   6) 10 s 单/双讲内部时间结构（echo 6-10 s、近端 0-1 s 起）未建模：本项目按
+#      4 s 片段随机 crop，不重建 utterance 内部 timeline。
+# 命名：论文没有 small/base 变体，只有 DBG-Mag / DBG-Com；本文件是 DBG-Mag。
+# 把 model.args.mask_domain 改为 com 即得 DBG-Com 变体（2 通道 RI 输入 + tanh 复数掩码，
+# 论文未给该变体的掩码参数化与激活函数，属项目显式选择）。
+# 推荐入口：python train.py -C configs/aec/microsoft_challenge/dbgnet/dbgnet_paper_16k_16ms_delay1000ms_loss_recon.yaml
+# 模型实现：tasks/aec/models/discriminative/dbgnet.py
+# 数据实现：tasks/aec/data/dynamic_dataset.py（_run）
+# 数据资产：data/... 为相对仓库根的在线仿真清单（SCP/JSON）；dynamic_aec 不消费离线
+#   GenerationManifest，因此本配置不声明 generator version。
+# ============================================================
+
+# ----------------------------------------------------------------------
+# meta：全局训练超参（随机种子、混合精度、cuDNN 行为）
+# ----------------------------------------------------------------------
+meta:
+  seed: 42                          # 全局随机种子；validation seed 由 Trainer 派生，划分可复现
+  use_amp: false                    # 关闭 AMP，保持 FP32；论文未用 AMP，数值可对齐
+  use_ema: false                    # 关闭 EMA；在线验证与导出直接用当前权重，不维护 shadow 参数
+  deterministic: false              # 关闭 cuDNN 确定性；换吞吐，代价是逐 run 非 bit-exact
+  amp_dtype: float16                # 仅 use_amp=true 时生效的 AMP 精度（本配置不使用）
+  ema_decay: 0.999                  # use_ema=true 时的 EMA 衰减系数，无量纲（本配置不使用）
+  cudnn_benchmark: true             # 允许 cuDNN 自动选最快卷积算法；输入形状固定时收益最大
+  allow_tf32: false                 # 关闭 TF32，保持 FP32 数值，避免与论文 Table II 口径偏差
+  compile_model: false              # 关闭 torch.compile；未在目标硬件与部署路径实测
+  gradient_checkpointing: false     # 关闭梯度检查点；模型显存不高，重算开销大于收益
+
+# ----------------------------------------------------------------------
+# stft：分析综合窗；AECTrainingEntry.build_model 注入至需频域一致的模型参数
+# ----------------------------------------------------------------------
+# 论文：512-point DFT、Hann、hop 256（16 ms）→ 257 bins，经 ERB 压到 129 维。
+# center=true 是项目对训练/部署一致的显式要求（论文未声明 center）。
+stft:
+  n_fft: 512            # FFT 长度（samples），16 kHz 下 32 ms；n_fft//2+1 = 257 频点（论文口径）
+  hop_length: 256       # 帧移（samples），16 kHz 下 16 ms；论文 hop 256
+  win_length: 512       # 分析窗长（samples）；等于 n_fft，无零填充
+  window: hann          # 分析窗类型；论文使用 Hann
+  center: true          # 帧中心对齐、两端补零；论文未声明，此处为训练/部署一致的项目要求
+
+# ----------------------------------------------------------------------
+# model：DBGNet（tasks/aec/models/discriminative/dbgnet.py）
+# ----------------------------------------------------------------------
+# 论文 Table I 对应：erb 65+64=129；mic/far 通道 32/64/96/128 与 16/32/48/64；F-GRU 每方向
+# 192、T-GRU 128；mask_domain=mag 对应论文主线 DBG-Mag（实值 sigmoid 掩码 + 保留麦克风相位）。
+model:
+  type: DBGNet                        # registry 模型名；实现见 tasks/aec/models/discriminative/dbgnet.py
+  args:                               # 模型构造参数；未知键抛 TypeError，不静默吞掉拼写错误
+    sample_rate: 16000                # Hz；须与 data.sample_rate 一致
+    erb_low_bins: 65                  # 低频原始 bins 数；65 + 64 = 129 维（论文 Sec. III-B）
+    erb_bands: 64                     # 高频 192 bins 压成的 ERB bands 数
+    mic_channels: [32, 64, 96, 128]   # 各层 mic 分支通道数（论文 Table I）
+    far_channels: [16, 32, 48, 64]    # 各层 farend 分支通道数（论文 Table I）
+    # F-GRU 每方向宽度按论文 Table I 规则 mic[-1] + far[-1] = 128 + 64 = 192（双向输出
+    # 384）由模型默认规则推导（tasks/aec/models/discriminative/dbgnet.py 的
+    # fgru_hidden 默认 = mc[3] + fc[3]），因此本配置不写 fgru_hidden，也不存在“必须显式写 192”的要求；
+    # T-GRU 输出 128（= mic[-1]）同样由默认规则得到。
+    mask_domain: mag                  # mag = 实值 sigmoid 掩码并保留 mic 相位（论文主线 DBG-Mag）
+    use_state_detector: false         # 关闭帧级 state head；论文 L_SD 不复现（见文件头第 4 条）
+    state_nclass: 3                   # state head 类别数；关闭时仅占位
+
+# ----------------------------------------------------------------------
+# aec_frontend：顶层 canonical 部署前端配置（Trainer/Inference 在 STFT 前消费）
+# ----------------------------------------------------------------------
+# 论文假设输入已由外部 delay-compensation 对齐（Sec. I），同时用 p=0.5 的随机 delay 增强鲁棒性；
+# 本配置关闭前端对齐，由模型内部 FTG 处理时变远端上下文。
+aec_frontend:
+  delay_alignment:                 # 部署前端子段；enabled=false 时整段仅登记配置
+    enabled: false                 # 关闭前端对齐
+  input_routing: mic_farend        # 模型输入 = 原始 mic + farend
+
+# ----------------------------------------------------------------------
+# data：mode=dynamic_aec 时构建 DynamicMixingDataset；simulation_cfg 经 strict 解析（未知键默认报错）
+# ----------------------------------------------------------------------
+data:
+  mode: dynamic_aec                 # 路由 DynamicMixingDataset；必填，缺失/非法值 fail-fast
+  sample_rate: 16000                # Hz；须与 model.args.sample_rate 及各 SCP 采样率一致
+  task: joint                       # joint = AEC+SE（默认）；aec = 仅回声消除
+  train:                            # 训练 split：数据源清单 + split 级 Dataset 参数
+    # 论文语料不可得（见文件头第 1 条）；以下为仓库现有 16 kHz 资产。
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_train.scp"
+    noise_scp: "data/shared/noise/filter/v2/train_noise_sources.scp"        # 加性噪声源 SCP
+    windnoise_scp: "data/shared/noise/filter/v2/train_wind_noise_sources.scp"  # 风噪源 SCP（Layer C-2）
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/train_rirs.scp"    # RIR SCP
+    # ref/echo 清单必须是 {"pairs": ["stereo.wav"]}；每条为立体声文件（ch0=echo，ch1=farend）。
+    real_farend_echo_pair_json: "data/aec/echo/echo_prealign_16k/real_farend_echo_pair_train.json"
+    filter_min_duration: 2.0   # s；过滤短于该时长的样本
+    filter_max_duration: 30.0  # s；过滤长于该时长的样本
+
+    # ------------------------------------------------------------------
+    # A-3 模式 A 对齐；split 级 Dataset 参数，不能放进 simulation_cfg
+    # ------------------------------------------------------------------
+    # 论文为 10 s 源音频随机 crop 4 s 片段（Sec. III-C）；repeat_to_max_duration=false 时
+    # 短于 4 s 的 utterance 走随机 crop/零填充，不做 tile。
+    max_duration_seconds: 4.0                   # s；固定画布上限（论文 4 s 片段）
+    repeat_to_max_duration: false               # false = 不做 tile；短样本随机 crop/零填充
+    repeat_tile_silence_gap: true               # 仅 tile 路径生效；此处显式登记为禁用值
+    repeat_tile_silence_gap_range: [0.02, 0.8]  # s；静音间隔抽样区间
+
+    # 仿真固定顺序：A → B → C（C-0～C-aec）→ pre-finite → D-normalize → D-guard → E → F
+    # → task-post-EF → final-guard → post-finite（以 dynamic_dataset._run 为准）。
+    simulation_cfg:
+      # ------------------------------------------------------------------
+      # Layer A：干净语音预处理（论文没有 splice / 固定静音画布）
+      # ------------------------------------------------------------------
+      # 论文近端语音是连续片段（6-10 s），不存在句间拼接；splice 关闭，只做随机 crop。
+      # 下列参数为显式登记的禁用值，不依赖 runtime 默认值（默认值变化不得静默改变训练分布）。
+      speech:
+        splice:                             # 模式 A：多段拼接成固定画布；本配置关闭
+          enabled: false                    # 关闭多段 splice；论文近端为连续片段
+          seconds: 10.0                     # s；splice 目标总长（关闭时仅登记）
+          seconds_range: [5.0, 10.0]        # s；目标总长随机抽样区间
+          gap_range: [0.02, 1.0]            # s；句间静音间隔
+          max_repeat_times: 4               # 最多加载的 extra 句数
+          equal_volume: true                # 是否对 extra 句做等响度对齐
+          equal_volume_range: [-6, 6]       # dB；等响度增益区间
+        random_start: true                  # 超长时随机起点连续 crop
+
+        # A-2 语音增强：论文未做语速/音高/均衡扰动，全部显式登记为 0（伯努利门，可共现）
+        speed:
+          prob: 0.0                         # 语速扰动概率；0=关闭
+          rate_range: [0.9, 1.1]            # 语速倍率范围（无量纲）
+        pitch:                            # A-2 音高扰动（关闭）
+          prob: 0.0                         # 音高扰动概率；0=关闭
+          semitone_range: [-1.5, 1.5]       # 半音范围
+        eq:                               # A-2 均衡扰动（关闭）
+          prob: 0.0                         # 均衡扰动概率；0=关闭
+          db_range: [-5, 5]                 # 增益范围（dB）
+        extra_space_prob: 0.0               # 论文为连续 6-10 s 片段，不做额外静音填充；0=关闭
+
+        # A-3 长度对齐：论文不存在固定静音画布，silence 关闭；参数为显式登记的禁用值
+        silence:
+          prob: 0.0                         # 命中模式 B（固定 canvas + 单 utterance）的概率；0=关闭
+          mode: "bimodal"                   # uniform | bimodal；关闭时仅登记
+          short_ratio: 0.30                 # bimodal 取 short_range 的权重（无量纲）
+          short_range: [0.2, 0.8]           # s；short 分支静音区间
+          long_range: [1.0, 5.0]            # s；long 分支静音区间
+          position: "scene_aware"           # random | front | back | center | turn_boundary | scene_aware
+          beta_a: 0.6                       # scene_aware 位置 Beta α
+          beta_b: 0.4                       # scene_aware 位置 Beta β
+
+        # 项目预处理（论文未指定）：高通滤波与 post-RIR 音量标定沿用 canonical 值。
+        high_pass:                       # A-4 高通滤波（去除 DC 与低频隆隆声）
+          enabled: true                  # ~70 Hz 高通滤波（filtfilt）
+      # ------------------------------------------------------------------
+      # Layer B：场景角色抽样（prob_* 七项之和须 = 1.0，否则 fail-fast）
+      # ------------------------------------------------------------------
+      # 论文所有样本都含 echo：prob_target_echo=0.4（近端+echo，无噪声）、
+      # prob_target_noise_echo=0.6（近端+噪声+echo）→ echo 边际 1.0、噪声边际 0.6。
+      # 抽样方式：每条样本用一次 u~Uniform[0,1) 做 cumulative-CDF 选择（等价 multinomial），七项互斥；
+      # runtime 在 tasks/aec/data/dynamic_dataset.py 对 |Σprob−1|>1e-9 fail-fast。
+      # 未声明而取 runtime 默认 0.0 的概率字段（core/data/simulation_configs.py:147-294）：
+      # scene.timeline.prob、music_ratio、prob_point_source_background、prob_wind_noise_background、
+      # prob_array_rotation、prob_microphone_position_jitter —— 论文未涉及，保持 0。
+      scene:
+        prob_target_only: 0.0           # 仅近端
+        prob_noise_only: 0.0            # 仅噪声
+        prob_echo_only: 0.0             # 仅 echo
+        prob_noise_echo_only: 0.0       # 噪声 + echo
+        prob_target_noise: 0.0          # 近端 + 噪声
+        prob_target_echo: 0.4           # 近端 + echo
+        prob_target_noise_echo: 0.6     # 近端 + 噪声 + echo
+
+      # ------------------------------------------------------------------
+      # Layer C：声学混合（C-0 RIR → C-1 噪声 → C-2 风噪 → C-3 彩色噪声 → C-aec）
+      # ------------------------------------------------------------------
+      # C-0：论文近端混响 p=0.4；本项目用 RIR 卷积（论文为 τ=300 ms 指数衰减）。
+      # echo 路径不使用本 RIR（走 C-aec 真实录制 pair）。
+      acoustic:                        # Layer C 声学混合段（C-0 RIR、C-1 噪声、C-2/C-3 见 background）
+        target:                        # 近端目标源子段
+          volume:                      # C-0b 目标音量标定
+            # C-0b：以 early target 标定音量，full/early/target 共用 gain（论文未给出分布）。
+            enabled: true
+            db_range: [-48, -12]        # dBFS；target 音量标定区间
+            use_rms: true               # 以 RMS 而非峰值计算音量
+            distribution: beta          # uniform | beta
+            beta_a: 2.0                 # Beta 分布 a 参数
+            beta_b: 1.5                 # Beta 分布 b 参数
+
+        # C-aec：论文只规定 SER（均匀 -15..15 dB），far-end 物理电平与 ERL 未给出，沿用项目 canonical 值；
+        # ERL = far_db - echo_db（dB）。
+        rir:
+          reverberation_prob: 0.4     # 近端混响概率（论文 p=0.4）
+          moving_prob: 0.0            # 在线 moving RIR 概率；0=全静态
+          target_type: early          # early | dry | rts
+          reuse: false                # 是否在样本间复用同一 RIR
+          normalize: true             # 是否做 shared full-peak 归一化
+          early_window_sec: 0.05      # s；clean_target 取 early RIR，noisy 取 full RIR
+
+        # C-1：论文加性噪声 SNR 0-40 dB；噪声是否出现由 Layer B 分支决定，
+        # noise_mix_prob=0.0 表示不再叠第二段噪声（论文为单噪声）。
+        background:                     # C-1 加性噪声（SNR 抽样；第二段噪声混合关闭）
+          noise_mix_prob: 0.0               # 第二段噪声混合概率；0=关闭（论文为单噪声）
+          noise_mix_ratio_range: [0.1, 1.0] # 第二段噪声相对第一段的功率比区间（关闭时仅登记）
+          snr_low: 0                        # dB；加性噪声 SNR 下限（论文 0 dB）
+          snr_high: 40                      # dB；加性噪声 SNR 上限（论文 40 dB）
+          reuse_noise: false                # 是否在样本间复用同一噪声段
+
+          # C-2 风噪：论文没有风噪，关闭；参数为显式登记的禁用值。
+          prob_wind_noise_sidechain: 0.0    # 风噪 sidechain 概率；0=关闭
+          wind_noise_config:                # C-2 风噪合成参数（关闭时仅登记；区间为 min/max 抽样）
+            threshold: [0.1, 0.3]           # 压缩阈值区间（线性幅度，非 dB）
+            ratio: [1, 20]                  # 压缩比区间（无量纲）
+            attack: [5, 100]                # 起振时间区间（ms）
+            release: [5, 100]               # 释放时间区间（ms）
+            sc_gain: [0.8, 1.2]             # 侧链增益区间（线性，ffmpeg level_sc）
+            clipping_threshold: [0.85, 1.0] # 风噪截幅阈值区间（线性 0–1）
+            clipping_chance: 0.75           # 施加风噪截幅的概率（伯努利，无量纲）
+            wind_noise_snr_range: [-10, 25] # dB；风噪 SNR 区间
+
+          # C-3 彩色噪声：论文噪声来自 MS-SNSD，未使用合成彩色噪声，关闭。
+          prob_colored_noise: 0.0           # 彩色噪声触发概率；0=关闭
+          colored_noise_snr_range: [10, 50]         # dB；彩色噪声 SNR 区间（关闭时仅登记）
+          colored_noise_types: [white, pink, brown, equalized]  # 噪声类型枚举
+      # Layer D：post-mix 幅度处理（normalize → guard），无 YAML 键，不在此配置。
+      # ------------------------------------------------------------------
+      # Layer E：URGENT2026 信道退化，论文没有带宽/编解码退化，整层关闭
+      # ------------------------------------------------------------------
+      channel:
+        enabled: false                  # Layer E 总开关
+        augmentations_name: [bandwidth_limitation]           # 可用退化项名单
+        num_augmentations: {0: 1.0, 1: 0.0, 2: 0.0, 3: 0.0}  # 抽取退化数量的分布；此处恒为 0 项
+        augmentations:                  # 退化项实现表；enabled=false 时仅登记，不生效
+          bandwidth_limitation: {weight: 1.0, resample_methods: random}  # 禁用：论文无带宽退化
+      # ------------------------------------------------------------------
+      # Layer F：observation/device degradation，论文没有设备/ADC 截幅与麦克风 post-EQ，整层关闭
+      # ------------------------------------------------------------------
+      # 总开关 false，全部 prob_* = 0.0，参数显式登记。
+      device:
+        enabled: false                # Layer F 总开关；false 时整层跳过
+        # F-1 设备/ADC 截幅（关闭）
+        prob_clip: 0.0                # 截幅概率；论文未建模
+        clip_variants: [fixed_rail]   # 截幅变体枚举（fixed_rail/hard/soft/sigmoid/sox/pedal）
+        clip_variant_probs: {fixed_rail: 1.0}  # 变体权重；和须为 1.0
+        clip_pre_drive_db_range: [0.0, 9.0]    # 截幅前驱动增益区间（dB）
+        clip_rate_range: [0.01, 0.2]           # hard 变体按采样比例截幅（无量纲）
+        clip_threshold_db_range: [-20, -1]     # hard 变体按阈值截幅（dB）
+        clip_soft_slope_range: [1.0, 5.0]      # soft 变体斜率（无量纲）
+        clip_sigmoid_slope_range: [1.0, 5.0]   # sigmoid 变体斜率（无量纲）
+        clip_sox_threshold_db_range: [-15, -5] # sox 变体阈值（dB）
+        # F-2 后处理 EQ（关闭）
+        prob_post_eq: 0.0             # EQ 施加概率；论文未建模
+        post_eq_db_range: [-3, 3]     # EQ 增益区间（dB）
+        # F-3 低通滤波（关闭）
+        prob_lowpass: 0.0             # 低通触发概率；0=关闭
+        lowpass_cutoff_range: [1000, 8000]  # 截止频率区间（Hz）
+        lowpass_order_range: [4, 20]        # 滤波器阶数区间
+        # F-4 带阻/陷波（关闭）
+        prob_band_reject: 0.0         # 陷波触发概率；0=关闭
+        band_reject_center_freq_range: [100, 8000]  # 中心频率区间（Hz）
+        band_reject_freq_bw_range: [20, 500]        # 带宽区间（Hz）
+        band_reject_use_stft: true                  # 在 STFT 域施加
+        band_reject_max_n: 2                        # 最多陷波个数
+        # F-5 DC 偏移（关闭）
+        prob_dc_offset: 0.0           # DC 偏移触发概率；0=关闭
+        dc_offset_range: [0.001, 0.2] # DC 偏移幅度（无量纲）
+        # F-6 DRC/AGC（关闭）
+        prob_drc: 0.0                 # DRC 触发概率；0=关闭
+        drc_threshold_db_range: [-50, 0]     # 压缩阈值区间（dB）
+        drc_ratio_range: [1, 20]             # 压缩比区间（无量纲）
+        drc_attack_ms_range: [0.5, 5.0]      # 起振时间区间（ms）
+        drc_release_ms_range: [50, 1000]     # 释放时间区间（ms）
+        # F-7 编解码（关闭）
+        prob_codecs: 0.0              # 编解码退化触发概率；0=关闭
+        codecs_types: [mp3, gsm, opus, aac]  # 编解码格式枚举
+        # F-8 比特压缩（关闭）
+        prob_bit_crush: 0.0           # 位深压缩触发概率；0=关闭
+        bit_crush_range: [4, 16]      # 量化位深区间（bit）
+        # F-9 频谱洞（关闭）
+        prob_spectral_holes: 0.0      # 频谱洞触发概率；0=关闭
+        spectral_holes_frame_length: 1024        # STFT 帧长（samples）
+        spectral_holes_hop_length: 256           # STFT 帧移（samples）
+        spectral_holes_num_range: [1, 20]        # 洞个数区间
+        spectral_holes_width_freq_range: [1, 5]  # 频率方向宽度（bin）
+        spectral_holes_width_time_range: [1, 5]  # 时间方向宽度（帧）
+        spectral_holes_cutoff_freq: 10000        # 作用频率上限（Hz）
+        # F-10/F-11 WebRTC NS/AGC（关闭）
+        prob_webrtc_ns: 0.0           # WebRTC 噪声抑制触发概率；0=关闭
+        webrtc_ns_levels: [0, 1, 2, 3]  # NS 等级枚举
+        prob_webrtc_agc: 0.0          # WebRTC AGC 触发概率；0=关闭
+        webrtc_agc_target_dbfs_range: [-31, -3]  # AGC 目标电平区间（dBFS）
+        # F-12 bass_boost（关闭）
+        prob_bass_boost: 0.0          # bass_boost 触发概率；0=关闭
+        bass_boost_highpass_cutoff_range: [500, 2000]  # 高通截止频率区间（Hz）
+        bass_boost_attenuation_min_db: -25             # cutoff 以上最小衰减（dB）
+        # F-13 频谱泄漏（关闭）
+        prob_spectral_leakage: 0.0    # 频谱泄漏触发概率；0=关闭
+        spectral_leakage_window_lengths: [1024, 2048, 4096]  # STFT 窗长枚举（samples）
+        spectral_leakage_max_time_shift: 20                  # 最大时移（samples）
+        # F-14 响度扰动（关闭）
+        prob_loudness_perturb: 0.0    # 响度扰动触发概率；0=关闭
+        loudness_factor_range: [0.3, 3.0]  # 响度倍率区间（无量纲）
+        loudness_max_n_intervals: 5        # 最大分段数
+
+      # Layer C-aec：远端参考电平与 echo 的 ERL 耦合（论文未给出，沿用项目 canonical 值）。
+      aec:
+        far_db_range: [-42, -12]  # dBFS RMS；far-end 参考信号物理范围
+        erl_range: [-20, 40]      # dB；ERL = far_db - echo_db
+        erl_distribution: beta    # uniform | beta
+        erl_beta_a: 1.5           # Beta 分布 a 参数（无量纲）
+        erl_beta_b: 1.5           # Beta 分布 b 参数（无量纲）
+
+        # ------------------------------------------------------------------
+        # Layer C-aec：清单 ref/echo 与随机延迟
+        # ------------------------------------------------------------------
+        # 论文用 DNS RIR 合成 echo；本配置使用预对齐真实录制 pair（见文件头第 2 条）。
+        aec_ref_echo_fine_gcc_align: false
+        aec_ref_echo_gcc_farend_pad_policy: apply     # farend 补零策略
+        aec_ref_echo_gcc_max_tau_seconds: 0.3         # s；GCC 搜索的最大时延
+        aec_ref_echo_gcc_max_pad_seconds: 0.3         # s；farend 最大补零长度
+        aec_ref_echo_gcc_peak_threshold: 0.05         # 归一化互相关峰值门限，无量纲
+        # 论文：delay p=0.5、最长 1 s、Beta(1,3)（Sec. III-C）。
+        aec_ref_echo_random_delay_prob: 0.5           # 施加随机延迟的概率（论文 0.5）
+        aec_ref_echo_random_delay_mode: echo_only     # 延迟只施加到 echo，ref 保持不动
+        aec_ref_echo_random_delay_distribution: beta  # uniform | beta
+        aec_ref_echo_random_delay_beta_a: 1.0         # Beta 分布 a 参数（论文 B(1,3)）
+        aec_ref_echo_random_delay_beta_b: 3.0         # Beta 分布 b 参数（论文 B(1,3)）
+        aec_ref_echo_random_delay_uniform_prob: 0.0   # π；(1-π)·Beta + π·Uniform[min,max] 的混合权重
+        aec_ref_echo_delay_range_ms: [0.0, 1000.0]    # ms；延迟抽样区间（论文最长 1 s）
+        # 论文没有 route/buffer 突跳或时钟漂移，jitter 关闭；参数为显式登记的禁用值。
+        aec_time_delay_jitter:
+          enabled: false                     # 总开关；论文未建模
+          prob: 0.0                          # 命中概率
+          jitter_type: sudden_jump           # sudden_jump | gradual_drift | periodic_jitter | mixed
+          jitter_rate: [0.02, 0.10]          # events/s；跳变发生率区间
+          jitter_corr_length: [100.0, 500.0] # ms；相关长度区间
+          jitter_max_ms: 20.0                # ms；单次事件幅度上限
+          jump_ms_range: [-20.0, 20.0]       # ms；跳变幅度区间
+          min_segment_ms: 1000.0             # ms；分段最短时长
+          transition_ms: 0.0                 # ms；跳变过渡时长
+          edge_mode: nearest                 # constant | nearest
+        # 论文：SER 均匀采样 -15..15 dB（Sec. III-C）。
+        ser_range: [-15, 15]                 # dB；SER 抽样区间
+
+        # 回声设备 EQ：论文只建模扬声器非线性，没有播放设备线性频响着色，关闭；参数为显式登记的禁用值。
+        aec_echo_device_eq:
+          enabled: false                # 总开关
+          prob: 0.0                     # 施加概率
+          variant_probs: {random_eq: 0.75, bass_boost: 0.25}   # 变体权重；和须为 1.0（runtime 校验）
+          random_eq_db_range: [-6.0, 6.0]                       # dB；随机 EQ 增益区间
+          bass_boost_highpass_cutoff_range: [200.0, 2000.0]     # Hz；高通 cutoff 区间
+          bass_boost_attenuation_min_db: -12.0                  # dB；cutoff 以上最小衰减
+
+        # ------------------------------------------------------------------
+        # 回声非线性失真（C-aec，混入 mic 之前）：论文用 hard clipping 或 sigmoid 模拟扬声器失真
+        # ------------------------------------------------------------------
+        # 论文概率 0.5（Sec. III-C 与 Eq.1 的 G(·)），只走 post_ser_distortion；两条非论文路径置 0 但仍显式登记。
+        # path_probs 与各 paths.*.variant_probs 均为互斥权重组，和须为 1.0；runtime 在
+        # tasks/aec/data/dynamic_dataset.py 的权重校验中 fail-fast（容差 1e-9）。
+        aec_echo_clipping:
+          enabled: true              # 总开关
+          prob: 0.5                  # 论文：扬声器失真概率
+          path_probs: {post_ser_distortion: 1.0, pre_ser_overload: 0.0, synced_ref_clip: 0.0}  # 路径权重，和须为 1.0；本配置只走论文路径
+          paths:                     # 各路径参数子表；未命中路径的参数不参与波形变换
+            post_ser_distortion:     # 论文 G(·)：按 echo 自身峰值比例截幅
+              variant_probs: {tanh: 0.5, hard: 0.5}         # 变体权重，和须为 1.0（tanh / hard clipping）
+              peak_relative_threshold_range: [0.90, 0.99]   # 相对 echo 自身峰值的阈值区间
+            pre_ser_overload:        # 非论文路径，权重 0；参数为显式登记的禁用值
+              variant_probs: {fixed_rail: 0.80, tanh: 0.20} # 变体权重，和须为 1.0
+              overload_boost_db_range: [0.0, 6.0]           # dB；boost 区间
+              rail_dbfs_range: [-3.0, -0.5]                 # dBFS；固定截幅 rail
+            synced_ref_clip:         # 非论文路径，权重 0；参数为显式登记的禁用值
+              variant_probs: {fixed_rail: 0.95, tanh: 0.05} # 变体权重，和须为 1.0
+              rail_dbfs_range: [-3.0, -0.5]                 # dBFS；固定截幅 rail
+  validation:                        # 验证 split：结构与 train 同源，inherit_simulation 复用其 simulation_cfg
+    inherit_simulation: true   # 继承 train 的 simulation_cfg，仅覆盖数据源键
+    # 验证集干净近端语音 SCP（canonical 四列；各轨 uid 集合须与 train 一致）。
+    speech_scp: "data/shared/urgent26_track1_se_dataset/urgent26_track1_universal_se/urgent26_clean_16k_val.scp"
+    rir_scp: "data/shared/rirs/gpurir_static/gpurir/fs16000/val_rirs.scp"    # 验证集 RIR SCP
+    noise_scp: "data/shared/noise/filter/v2/val_noise_sources.scp"          # 验证集噪声源 SCP
+    windnoise_scp: "data/shared/noise/filter/v2/val_wind_noise_sources.scp"  # 验证集风噪源 SCP
+    # 真实录制 ref/echo 预对齐 pair 清单；旧目录名不表示已验证原生全频数据。
+    real_farend_echo_pair_json: "data/aec/echo/echo_prealign_16k/real_farend_echo_pair_val.json"
+    filter_min_duration: 2.0   # s；过滤短于该时长的样本
+    filter_max_duration: 30.0  # s；过滤长于该时长的样本
+
+  dataloader:                        # train/val loader 配置（共享项 + val 侧独立限流）
+    batch_size: 16        # 论文 batch size 16；每个 rank 的 batch size
+    num_workers: 4        # 每个 rank 的 train worker 进程数（CPU bound 仿真）
+    val_num_workers: 1    # validation worker 数；0 时该侧强制 persistent_workers=false
+    prefetch_factor: 2    # 每个 worker 预取的 batch 数
+    pin_memory: true      # 启用 CPU→GPU pinned-memory 传输
+    timeout: 120          # s；worker 取数超时后抛 TimeoutError
+    persistent_workers: true    # train worker 跨 epoch 常驻
+    val_persistent_workers: false  # validation worker 每轮回收
+
+# ----------------------------------------------------------------------
+# loss：论文 L_recon = (1-β)·L_mag + β·L_com，γ = β = 0.3（Eq.10-12）
+# ----------------------------------------------------------------------
+# 取 lamda_mag=1-β=0.7、lamda_ri=β=0.3、compress_factor=γ=0.3 逐项对齐 L_recon；
+# 论文另有 0.001·L_SD（segment-level state CE），按对齐约定不复现（见文件头第 4 条）。
+loss:
+  type: CompositeLoss                # 组合损失；子项按 components 顺序执行
+  components:                       # 子项列表；每项只接受 type/weight/args/name/enable_ss_undesired_energy
+  - type: GTCRNCompressedSpectralLoss  # 论文 L_recon 载体（lamda_mag·Δ|·|² + lamda_ri·ΔRI²）
+    weight: 1.0                     # 权重，无量纲
+    args:                           # 该 loss 的构造参数
+      # n_fft / hop_length / win_length / center 由 build_loss 从顶层 stft 注入
+      compress_factor: 0.3          # γ；论文 0.3
+      lamda_mag: 0.7                # 1-β；幅度谱项权重
+      lamda_ri: 0.3                 # β；复数谱项权重
+
+# --- Optimizer ---
+# 论文：AdamW，初始学习率 0.0003（Sec. III-C）。weight decay 论文未给出，沿用项目 0.01。
+optimizer:
+  type: AdamW                        # 优化器类型（论文 AdamW）
+  args:                              # 优化器参数
+    lr: 0.0003                       # 初始学习率（论文 Sec. III-C）
+    weight_decay: 0.01               # 权重衰减（论文未给出，沿用项目值）
+
+# --- Scheduler ---
+# 论文：cosine annealing（Sec. III-C）；按 epoch 调度，T_max = epochs = 75。
+scheduler:
+  type: CosineAnnealingLR            # cosine annealing（论文 Sec. III-C）
+  args:                              # 调度器参数
+    T_max: 75                        # 退火周期（epoch 数）；与 trainer.epochs 一致
+
+# --- Trainer ---
+trainer:
+  type: AECTrainer                   # AEC 任务 Trainer；train.py 按 data.mode 路由
+  exp_path: exp/aec/dbgnet_paper_16k_16ms_delay1000ms_loss_recon  # 实验根目录（checkpoint、日志、曲线）
+
+  # 训练规模：论文 75 epochs / batch 16（batch 见 data.dataloader）。
+  epochs: 75                         # 训练总 epoch 数（论文 75）
+  gradient_clip_value: 1.0     # 论文未给出，沿用项目值；梯度范数裁剪阈值（无量纲）
+  strict_checks: false               # false = 跳过 loss/配置收敛前置检查
+  accumulation_steps: 1              # 梯度累积步数；1 = 每个 batch 更新一次
+  lr_schedule_per_step: false  # cosine annealing 按 epoch 步进
+  log_interval: 100                  # 每 N 个 optimizer step 打印一次训练日志
+
+  # 验证：每个 epoch 末执行完整 loss validation。
+  max_val_batches: 0                 # 0=不限制，覆盖时长过滤后的全部有效验证样本
+  validation_epoch_interval: 1       # 每 N 个 epoch 末验证；0=关闭
+  validation_steps_interval: 0       # 关闭步级验证
+  save_top_k: 0                      # 仅 step-level 验证时生效；当前由 best_model.tar 记录 epoch best
+
+  # 客观指标基于 (nearend, nearend_estimate)。
+  val_metrics:                       # 在线客观指标配置（与 evaluate/ 离线 MOS 无关）
+    enabled: true              # 是否在验证时计算客观指标
+    metrics: [SI-SDR, ESTOI, ERLE]  # 指标名单；AEC 须显式列出 ERLE，否则不计算 ERLE
+    interval: 1                # 每 N 次验证计算一次
+    max_utterances: 2200       # 全部验证样本的全局 quota
+    max_utterances_metrics: 2200   # metrics 独立 quota（省略时回退 max_utterances）
+    max_utterances_erle: 2200      # ERLE 独立 quota（省略时回退 max_utterances）
+    metrics_workers: 2         # 每个 rank 的隔离指标进程数
+
+  save_checkpoint_interval: 1        # 每 N 个 epoch 写一次 latest 与 model_{epoch}.pth
+
+# --- Distributed (DDP) ---
+distributed:
+  backend: nccl                      # 分布式后端
+  find_unused_parameters: false      # 单路径前向无未使用参数；置 true 会显著拖慢 DDP
+  nccl_timeout_minutes: 30           # NCCL 通信超时（min）

@@ -1,0 +1,179 @@
+# Audio Filter Pipeline generation-3 32 kHz 及以上的中文数据集 Step4 配置。
+# 数据集 identity 由 generate_configs.py 的 1 项 active inventory 和 2 项注释 inventory 显式维护；注释条目不进入 active datasets 映射，也不会被 pipeline 处理。
+
+# step: all = 请求 Step6 完整依赖闭包（Step0→Step1→Step2→Step3→Step5→Step6，不含 Step4）；step4 = 请求 Step4 完整依赖闭包（Step0→Step1→Step2→Step3→Step4）。
+pipeline_generation: 3
+step: step4
+# 统一输出根目录：Step0~Step6 的不可变 artifact 与 Step4/Step6 filter 导出的 FLAC 均落在此目录下。
+# 筛选配置已绑定本地输出根和数据集输入根。
+output_root: "/data_nvme0n1/zxc/code/use_train/data/shared/clean/filter/audio_filter_zh_32k"
+# Step0 源采样率下限：读头发现源音频采样率低于该正整数时直接跳过，
+# 不进入冻结快照及后续步骤；当前配置下限为 32000 Hz。
+min_source_sample_rate_hz: 32000
+# 固定导出采样率（仅筛选配置）：32000 Hz。
+output_sample_rate_hz: 32000
+
+# ================= Step0：冻结输入快照 =================
+# 数据集 registry：每个数据集的显式身份，由本文件 inventory 维护，请勿手改
+# （重新生成会覆盖本块）。
+#   speaker：仅标注该数据集的说话人身份信息——source 声明「有无标签及如何解析」
+#     （none=无标签/不解析；path_component/regex/mapping_file=有标签并按指定方式解析），
+#     required 声明缺失标签时是否强制报错；它只影响 Step0 的 speaker_id 标注。
+#     是否执行声纹相似度由顶层 speaker_consistency.enabled 独立控制，不放在 datasets 内。
+#   speaker.source：_spk 数据集用 path_component=0（第一层目录即 speaker_id）；
+#     其余（会议/对话/多说话人类）用 none（不标注 speaker 身份）。
+#   audio_filter_<language bucket>_<source floor/output rate>k.yaml：文件名表达路由桶、源采样率下限与输出采样率；
+#     例如 audio_filter_mixed_32k.yaml 表示 mixed language bucket、32 kHz source floor 与 32 kHz output。
+#   language：仅表示本地五份配置使用的 route 处理桶（zh/en/mixed），
+#     不表示通用语言学标签，也不是运行时自动语言识别结果；mixed route 不等同于特殊数据集。
+#   category：数据集特殊属性元数据（read_speech/expressive/elderly/singing/game_voice）；
+#     selection_policies.categories 当前为空，仅作元数据，不参与阈值。
+#   input_root：数据集本地绝对输入根；筛选配置使用已核验目录。
+datasets:
+# dataset_catalog: SmoothConv（smoothconv）
+#   基本信息：多方中文对话语音语料。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：多通道/多方对话属性；辅助页面支持中文，第一方证据待补。
+#   采样率/证据：本地 header 抽样：48 kHz；辅助页面称 2ch/48 kHz，非一级发布记录。
+#   证据状态：local_rate_auxiliary_language
+  smoothconv: {input_root: "/data_nvme2n1/clean_speech_download/datasets/smoothconv", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: none, required: false}, source_layout: streaming_flac_aggregate}
+# dataset_catalog: Common Voice Chinese（commonvoice_cn_spk）
+#   基本信息：Common Voice 中文 locale/version 的本地整理版本。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：具体 locale 与 release manifest 待绑定。
+#   采样率/证据：本地 header 抽样：32 kHz；官方发布采样率待核验。
+#   证据状态：local_rate_only
+#   commonvoice_cn_spk: {input_root: "/data_nvme2n1/clean_speech_download/datasets/commonvoice_cn_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: AISHELL-3（aishell-3_spk）
+#   基本信息：中文多说话人 TTS 语料。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：Mandarin、多说话人 TTS。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+#   aishell-3_spk: {input_root: "/data_nvme2n1/clean_speech_download/datasets/aishell-3_spk", language: zh, category: read_speech, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+
+# ================= Step0：源扫描与不可变快照 =================
+#   step0_workers：并发哈希/读头线程数（os.pread 与 hashlib 释放 GIL，线程共享
+#   root descriptor，descriptor-bound fail-closed 校验不变）；训练占 ~30% CPU、
+#   空闲核充裕，按 32 并发。
+step0_workers: 32
+
+# ================= Step1：TEN VAD / 带宽 / 有效采样率分析 =================
+#   runtime：当前仅支持 ten_vad_native_cpu。
+#   hop_size：VAD 帧移（样本数）；threshold：语音概率阈值。
+#   workers：进程池工作进程数，上限 STEP1_VAD_MAX_WORKERS=64（超出会被 config 校验拒绝）。
+#   max_pending：同时提交给进程池的 in-flight 任务数上限，必须落在 [workers, workers*2]；
+#                限制在途 future 数量，避免大目录下一次性提交全部任务撑爆内存。
+#   workers/max_pending（32→64, 64→128）：训练仅占 ~30% CPU、空闲核充裕；
+#   每个 worker 已钉死单线程（OMP/OPENBLAS/MKL_NUM_THREADS=1），
+#   64 worker ≈ 64 线程，低于空闲核数，不会与训练数据加载超订抢核。
+vad:
+  runtime: ten_vad_native_cpu
+  hop_size: 256
+  threshold: 0.5
+  workers: 64
+  max_pending: 128
+
+# ================= Step2：切段 =================
+# 连续语音超过该时长仍无安全静音切点的段跳过：不产生 segment 行、
+# 不参与 Step3 打分与后续导出；默认 60 秒。
+step2_max_segment_duration_sec: 60
+# 低于该时长的段直接丢弃：不产生 segment 行、不参与 Step3 打分与后续
+# 导出；过短的 VAD 碎片对训练无价值，且会让 SCOREQ 等 MOS 模型收到
+# 退化输入；五份 audio_filter 配置统一为 1.0 秒。
+step2_min_segment_duration_sec: 1.0
+
+# ================= Step3：MOS 打分 =================
+use_gpu: true
+step3_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+# registry 支持五个 selectable MOS 模型；配置策略决定实际执行 route。
+# 仅当前策略选中的模型会在 Step3 preflight 访问，未选资产字段不会被读取或校验。
+# 路径均相对仓库根解析（cli/main.py 的 _REPO_RELATIVE_CONFIG_PATH_KEYS）。
+# NISQA/UTMOS 已通过真实 GPU smoke，但生产阈值尚未校准，故仅保留可选资产字段。
+# URGENT-PK checkpoint/commit 虽匹配，shipped source 中 urgentpk/model_mod.py 是 symlink，
+# 会被安全 tree scanner fail-closed 拒绝；当前资产不可 opt-in，commit 匹配不等于 tree 可加载。
+urgent_pk_checkpoint: third_party_scripts/URGENT-PK/exp/mel_resnet34_urgent24.ckpt
+urgent_pk_source_dir: third_party_scripts/URGENT-PK
+urgent_pk_encoder: mel
+urgent_pk_backbone: resnet34
+urgent_pk_score_range: mos_1_to_5
+scoreq_model_dir: third_party_scripts/SCOREQ
+dnsmos_model_dir: third_party_scripts/DNSMOS
+nisqa_model_path: third_party_scripts/NISQA/weights/nisqa.tar
+nisqa_model_version: nisqa.tar
+nisqa_model_sha256: 4e69f09f85de3baad68654133046f554b4bd70ca96cf09ce29848a28104586cf
+utmos_model_path: third_party_scripts/UTMOS/utmos22_strong_step7459_v1.pt
+utmos_model_version: utmos22_strong_step7459_v1
+utmos_model_sha256: abe1c1aa15225599fa7189a9887da12842f8beb5541add007855ead9acdb6d9a
+# NISQA/UTMOS 的 SHA-256 绑定 checkpoint 父目录完整 tree；目录内任一文件变化都会 fail-closed。
+# 可信 pickle 加载（weights_only=False）的 fail-closed 门禁：
+#   urgent_pk_expected_sha256 = checkpoint 文件 SHA-256；
+#   urgent_pk_expected_commit  = source_dir 的 git HEAD。
+# 二者必须显式给出且与实际一致，缺失或不匹配即拒绝加载，绝不默认信任任意本地文件；
+# 更换权重或源码版本时必须同步更新这两项。
+urgent_pk_expected_sha256: 266e995f745f265ea52277ca657f86c7d27077b385136edd85f7ef923bdfed5d
+urgent_pk_expected_commit: 484269f41ef17ea2419952e92ace7109b4b96052
+
+# ================= Step4：MOS 2/2 keep/reject 筛选 =================
+selection_policies:
+  global:
+    mos_models: [scoreq, dnsmos]
+    min_mos_models: 2
+    mos_fusion: min
+    early_exit: null
+  # shipped 默认 route 仅选 scoreq / dnsmos，严格 2/2 通过（DNSMOS 四维 AND）。
+  # NISQA/UTMOS 虽已通过真实 GPU smoke，但生产阈值尚未校准；派生策略 opt-in 时须显式补阈值。
+  quality_profiles:
+    quality_balanced:
+      thresholds:
+        dnsmos: {ovrl: 3.2, sig: 3.0, bak: 3.8, p808: 3.6}
+        scoreq: 3.6
+    quality_high:
+      thresholds:
+        dnsmos: {ovrl: 3.3, sig: 3.4, bak: 4.0, p808: 3.8}
+        scoreq: 4.2
+    quality_premium:
+      thresholds:
+        dnsmos: {ovrl: 3.4, sig: 3.6, bak: 4.2, p808: 4.0}
+        scoreq: 4.5
+  categories: {}
+  languages: {en: {}, zh: {}, mixed: {}, fr: {}, ja: {}, ko: {}, ru: {}}
+  datasets: {}
+  # 可选 exact-source override（shipped 默认不启用）：sources.<dataset_id>.<source_relative_path>；仅 exact match，禁止绝对路径、反斜杠和 '..' segment。
+  # sources:
+  #   dataset_id:
+  #     speaker/example.wav: {mos_models: [utmos, nisqa], min_mos_models: 1}
+
+# ================= Step5：WeSpeaker speaker consistency =================
+# 开启后 Step5 用冻结 enrollment bundle 对同一 identity 做 L2-normalized cosine，
+# 生成 speaker score；Step6 filter 才据此执行最终声纹筛选。
+# 五份 audio_filter 配置不执行 Step5/6，speaker consistency 保持关闭。
+speaker_consistency:
+  enabled: false
+
+# ================= Step4：MOS 筛选执行模式 =================
+# dry_run：不发布 artifact，仅按当前阈值统计 keep/reject（调阈值用）；
+# filter（默认）：发布 Step4 artifact 后把 keep 段导出为 FLAC（SE 干净数据集，
+# 采样率路由与 Step6 一致）。导出根由 step4_export_root 显性指定，
+# null 时落在 <output_root>/audio_exports/step4/。
+step4_mode: filter
+step4_export_root: null
+
+# ================= Step6：最终决策与导出 =================
+# dry_run：发布 metadata artifact 并统计，不导出音频；
+# filter（默认）：发布后导出 FLAC（TSE 数据集）。声纹未启用时等价纯 MOS 导出。
+# 导出根由 step6_export_root 显性指定，null 时落在 <output_root>/audio_exports/step6/。
+step6_mode: filter
+step6_export_root: null
+# Step4/Step6 共用导出并发：解码(libsndfile)/重采样(soxr)/FLAC 编码均释放 GIL；
+# 按 8 worker / max_pending 16 配置。max_inflight_bytes 是严格的 estimated
+# waveform/verification bytes gate，不代表进程总 RSS。
+# 导出对 fd 需求高：每次路径操作都从根逐层打开目录链（每层一个 fd），8 worker
+# 并发峰值约为 256 个 fd。运行前必须确认 shell 软限制 ulimit -n 1048576（screen/tmux 老
+# 会话可能只有 1024，fd 耗尽会以 EMFILE 崩溃）。
+audio_export_workers: 8
+audio_export_max_pending: 16
+audio_export_max_inflight_bytes: 4294967296

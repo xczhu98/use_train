@@ -1,0 +1,228 @@
+digraph echo_processing_mechanism {
+  graph [
+    rankdir=TB,
+    bgcolor="#F8FAFC",
+    pad="0.28",
+    nodesep="0.42",
+    ranksep="0.66",
+    splines=polyline,
+    outputorder=edgesfirst,
+    fontname="Noto Sans CJK SC",
+    labelloc=t,
+    labeljust=l,
+    label="AEC 回声处理机制：C-aec 路径与混音后 Layer F",
+    fontsize=22
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#475569",
+    fillcolor="#FFFFFF",
+    fontname="Noto Sans CJK SC",
+    fontcolor="#0F172A",
+    fontsize=12,
+    penwidth=1.4,
+    margin="0.14,0.10"
+  ];
+
+  edge [
+    color="#64748B",
+    fontname="Noto Sans CJK SC",
+    fontcolor="#334155",
+    fontsize=10,
+    penwidth=1.5,
+    arrowsize=0.72
+  ];
+
+  inputs [
+    shape=record,
+    label="{<far> farend 参考|<echo> echo device 输出|<other> nearend + noise}",
+    fillcolor="#E0F2FE",
+    color="#0284C7"
+  ];
+
+  eq [
+    label="Echo device EQ",
+    fillcolor="#FFF7ED",
+    color="#EA580C"
+  ];
+
+  selector [
+    shape=diamond,
+    label="C-aec selector\n条件 prob=.10",
+    fillcolor="#FEF3C7",
+    color="#D97706",
+    width=1.65,
+    height=1.02
+  ];
+
+  pre [
+    label="pre_ser_overload\nfixed rail / tanh=.70/.30\nboost [3,12] dB\nrail [-3,-.5] dBFS",
+    fillcolor="#FEE2E2",
+    color="#DC2626"
+  ];
+
+  ser [
+    label="SER + ERL 耦合\n缩放 echo 与 farend",
+    fillcolor="#EDE9FE",
+    color="#7C3AED"
+  ];
+
+  timing [
+    label="delay / jitter\nref-echo 时序处理",
+    fillcolor="#EDE9FE",
+    color="#7C3AED"
+  ];
+
+  post [
+    label="post_ser_distortion\ntanh / hard=.65/.35\n峰值相对 [.80,.98]",
+    fillcolor="#FFEDD5",
+    color="#EA580C"
+  ];
+
+  synced [
+    label="synced_ref_clip\nfixed rail / tanh=.90/.10\n共享绝对 rail [-3,-.5] dBFS\n同时作用 farend + echo",
+    fillcolor="#DBEAFE",
+    color="#2563EB",
+    penwidth=2.0
+  ];
+
+  mix [
+    shape=circle,
+    label="mix",
+    fillcolor="#DCFCE7",
+    color="#16A34A",
+    width=0.78,
+    fixedsize=true,
+    penwidth=2.0
+  ];
+
+  layer_f [
+    label="Layer F（mix 后，随机）\nmic observation / device degradation\nfixed rail=1，clip prob=.15\npre-drive [0,9] dB，postEQ prob=.15",
+    fillcolor="#DCFCE7",
+    color="#16A34A",
+    penwidth=2.0
+  ];
+
+  final_guard [
+    label="deterministic final guard\nobservation-only 峰值安全网\n不是 device model",
+    fillcolor="#D1FAE5",
+    color="#047857",
+    penwidth=2.0
+  ];
+
+  output [
+    shape=record,
+    label="{<ref> 最终 farend 参考|<mic> 最终 mic observation}",
+    fillcolor="#ECFDF5",
+    color="#059669"
+  ];
+
+  stats [
+    shape=note,
+    label="采样口径（不是实际 rail-hit）\nC 全样本 selector ≈7%\nC/F 并集 20.95%\nF clip + postEQ 期望操作数 .30",
+    fillcolor="#F1F5F9",
+    color="#94A3B8",
+    fontcolor="#334155",
+    fontsize=10
+  ];
+
+  inputs:echo:e -> eq:w [color="#EA580C"];
+  eq:e -> selector:w [color="#EA580C"];
+
+  selector:e -> pre:w [
+    label="pre  .15",
+    color="#DC2626",
+    fontcolor="#B91C1C"
+  ];
+  selector:e -> ser:w [
+    label="post .80 / synced .05\n或 C 未触发",
+    color="#7C3AED",
+    fontcolor="#6D28D9"
+  ];
+
+  inputs:far:e -> ser:w [
+    label="常规路径",
+    color="#0284C7",
+    fontcolor="#0369A1"
+  ];
+  inputs:far:e -> timing:w [
+    label="pre：保持加载电平",
+    color="#0284C7",
+    fontcolor="#0369A1",
+    style=dashed,
+    constraint=false
+  ];
+
+  pre:e -> timing:w [
+    label="SER 前；跳过 SER/ERL",
+    color="#DC2626",
+    fontcolor="#B91C1C"
+  ];
+  ser:e -> timing:w [color="#7C3AED"];
+
+  timing:e -> post:w [
+    label="选中 post",
+    color="#EA580C",
+    fontcolor="#C2410C"
+  ];
+  timing:e -> synced:w [
+    label="选中 synced",
+    color="#2563EB",
+    fontcolor="#1D4ED8"
+  ];
+  timing:e -> mix:w [
+    label="无 C 失真",
+    color="#64748B"
+  ];
+
+  post:e -> mix:w [
+    label="仅 echo",
+    color="#EA580C",
+    fontcolor="#C2410C"
+  ];
+  synced:e -> mix:w [
+    label="echo",
+    color="#2563EB",
+    fontcolor="#1D4ED8"
+  ];
+  synced:e -> output:ref:w [
+    label="同 rail 后 farend",
+    color="#2563EB",
+    fontcolor="#1D4ED8",
+    constraint=false
+  ];
+
+  timing:e -> output:ref:w [
+    label="非 synced farend",
+    color="#0284C7",
+    fontcolor="#0369A1",
+    style=dashed,
+    constraint=false
+  ];
+  inputs:other:e -> mix:s [
+    label="混入",
+    color="#475569"
+  ];
+
+  mix:e -> layer_f:w [
+    color="#16A34A",
+    penwidth=2.0
+  ];
+  layer_f:e -> final_guard:w [
+    color="#047857",
+    penwidth=2.0
+  ];
+  final_guard:e -> output:mic:w [
+    color="#059669",
+    penwidth=2.0
+  ];
+
+  selector:s -> stats:n [
+    style=dotted,
+    arrowhead=none,
+    color="#94A3B8",
+    constraint=false
+  ];
+}

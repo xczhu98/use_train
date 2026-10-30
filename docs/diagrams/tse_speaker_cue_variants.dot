@@ -1,0 +1,48 @@
+digraph TSESpeakerCueVariants {
+  graph [rankdir=LR, bgcolor="white", pad="0.20", nodesep="0.28", ranksep="0.55",
+    splines=ortho, outputorder=edgesfirst, fontname="Noto Sans CJK SC", fontsize=22,
+    fontcolor="#142338", labelloc=t, label="TSE_BSRNN_SPK｜5 种 speaker cue 与 dict 复谱 ABI"];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=11,
+    color="#365875", fontcolor="#142338", fillcolor="#F7FAFC", penwidth=1.6,
+    margin="0.13,0.09"];
+  edge [color="#405A75", penwidth=1.7, arrowsize=0.72];
+
+  inputs [label="模型输入 dict", fillcolor="#EEF3F7", color="#6E8191"];
+  mix [label="mix_spectra\n复谱 [B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.0];
+  enroll_spec [label="enroll_spectra\n复谱 [B, F, T, 2]", fillcolor="#DDEEFF", color="#2E6EB5", penwidth=2.0];
+  enroll_wav [label="enroll_wav\n[B, Le]", fillcolor="#EEF3F7", color="#6E8191"];
+  pre_emb [label="spk_embedding\n[B, D]（预提取模式）", fillcolor="#F1E8FA", color="#7047A3"];
+  inputs -> mix; inputs -> enroll_spec; inputs -> enroll_wav; inputs -> pre_emb;
+
+  subgraph cluster_preband {
+    label="BandSplit 前的谱域 cue"; color="#8CB8E8"; fillcolor="#F4F8FE"; style="rounded,filled";
+    listen [label="listen\n[enroll 复谱 + glue 零帧 + mix 复谱]\n输出端裁掉前缀", fillcolor="#EAF2FA", color="#2E6EB5"];
+    usef [label="usef\nenroll / mix 复谱共享 Conv2d\n跨谱注意力融合", fillcolor="#EAF2FA", color="#2E6EB5"];
+    tfmap [label="tfmap\nenroll 复谱幅度统计\n形成 TF map 并与 mix 特征拼接", fillcolor="#EAF2FA", color="#2E6EB5"];
+  }
+
+  bands [label="BSRNN BandSplit\n+ SubbandNorm", fillcolor="#FFF3D1", color="#C78300", penwidth=2.0];
+
+  subgraph cluster_postband {
+    label="BandSplit 后的 speaker feature cue"; color="#79B88A"; fillcolor="#F3FBF5"; style="rounded,filled";
+    context [label="context\n需 joint_training=true\nECAPA 帧级特征 + cross-attention", fillcolor="#E7F5EC", color="#388B57"];
+    spkemb [label="spkemb\nECAPA 句级 embedding\n或预提取 embedding", fillcolor="#E7F5EC", color="#388B57"];
+  }
+
+  separator [label="BSRNN separator\ncausal=true：时间向单向 LSTM + cLN\ncausal=false：双向 + GN", fillcolor="#F1E8FA", color="#7047A3", penwidth=2.0];
+  output [label="输出 dict\ntarget_estimate_spectra\n复谱 [B, F, T, 2]", fillcolor="#FDE8EE", color="#B33A55", penwidth=2.1];
+
+  mix -> listen; enroll_spec -> listen;
+  mix -> usef; enroll_spec -> usef;
+  mix -> tfmap; enroll_spec -> tfmap;
+  listen -> bands; usef -> bands; tfmap -> bands;
+  mix -> bands [label="cue 未启用时"];
+  bands -> context; bands -> spkemb;
+  enroll_wav -> context; enroll_wav -> spkemb;
+  pre_emb -> spkemb [style=dashed, color="#7047A3", label="joint_training=false"];
+  context -> separator; spkemb -> separator; bands -> separator [label="可组合启用"];
+  separator -> output;
+
+  note [shape=note, label="STFT / iSTFT 在 Trainer / 顶层完成；\n模型内部不重复引入。", fillcolor="#EEF3F7", color="#6E8191"];
+  note -> mix [style=dotted, arrowhead=none, color="#6E8191", constraint=false];
+}

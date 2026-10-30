@@ -1,0 +1,24 @@
+TF-SkiMNet 上游来源与适配声明
+================================
+
+上游信息
+--------
+
+- 论文：*TF-SkiMNet: Speech Enhancement Based on Inplace Modeling and Skipping Memory in Time-Frequency Domain*
+- 官方仓库：https://github.com/zx1292982431/TF-SkiMNet
+- 固定 commit：``2dcb11b84cc042ddda3733fbcba10e1695dee016``
+- 模型源码 blob：``f79bb4648d65ad2323476b703c62f4ada952f40a``
+- 上游文件：``TF-SkiMNet.py``、``README.md``
+- 许可证：上游仓库没有 LICENSE，GitHub API 也未声明许可证，属于无许可证声明状态。因此本目录不把上游源码视为具有明确再分发许可，也不原样复制上游文件。
+
+本仓适配范围
+------------
+
+本目录依据论文方法和上述固定版本公开模型源码，以本仓代码风格重写模型级结构：因果 encoder/decoder、Local-F、逐帧 frequency-axis BiLSTM、hidden/cell Global-T LSTM、Local-T，以及跨 block skipping-memory。重写内容使用中文 docstring/注释、类型标注、显式参数校验，并移除上游可视化、THOP 和设备硬编码。
+
+``tasks/se/models/discriminative/tf_skimnet.py`` 负责本仓 ``BaseSEModel`` 的谱进谱出接口、框架 STFT 参数绑定和 registry 注册。STFT/iSTFT 不在模型内部执行。
+
+边界声明
+--------
+
+这是仅模型级移植。上游没有训练代码、公开 checkpoint、评估代码或完整复现实验资产；本仓配置使用现有数据与 loss 接线。因此本移植不声称复现论文的参数量、MACs、RTF、STOI、PESQ、SNR、WER 或其他论文数值，也不提供部署级 streaming cache API。

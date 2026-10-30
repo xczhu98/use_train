@@ -1,0 +1,77 @@
+digraph UniPASEArtifacts {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.42",
+    ranksep="0.75",
+    splines=polyline,
+    fontname="Noto Sans CJK SC",
+    fontsize=18,
+    labelloc="t",
+    label="UniPASE artifact 依赖（按当前训练与推理 YAML）"
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    color="#334155",
+    fontcolor="#0f172a",
+    fillcolor="#f8fafc",
+    penwidth=1.4,
+    margin="0.14,0.10"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    color="#334155",
+    fontcolor="#334155",
+    penwidth=1.5,
+    arrowsize=0.72
+  ];
+
+  wavlm [shape=note, fillcolor="#fff7ed", color="#ea580c", label="Microsoft WavLM-Large.pt\n~/use_train_checkpoints/pase/WavLM-Large.pt"];
+
+  s1 [fillcolor="#dbeafe", color="#2563eb", label="Stage 1\nunipase_phase1_dewavlm_omni.yaml\n训练 PLC student"];
+  s2 [fillcolor="#dcfce7", color="#16a34a", label="Stage 2\nunipase_phase2_vocoder_gan.yaml\n训练 Vocos vocoder"];
+  s3 [fillcolor="#ffedd5", color="#ea580c", label="Stage 3\nunipase_phase3_adapter_gan.yaml\n训练 VocosAdapter"];
+  s4 [fillcolor="#f3e8ff", color="#9333ea", label="Stage 4\nunipase_phase4_postnet_gan.yaml\n训练 48 kHz PostNet"];
+
+  enc [shape=note, fillcolor="#eff6ff", color="#2563eb", label="DeWavLM-Omni.pt\nrepo: tasks/se/models/pase_family/\nunipase/open_model_checkpoint/"];
+  voc [shape=note, fillcolor="#f0fdf4", color="#16a34a", label="Vocoder_DWO-L1.pt\nrepo: tasks/se/models/pase_family/\nunipase/open_model_checkpoint/"];
+  ada [shape=note, fillcolor="#fff7ed", color="#ea580c", label="Adapter.pt\nrepo: tasks/se/models/pase_family/\nunipase/open_model_checkpoint/"];
+  post [shape=note, fillcolor="#faf5ff", color="#9333ea", label="PostNet.pt\n兼容 Stage 4 导出 artifact"];
+
+  infer [fillcolor="#f8fafc", color="#475569", label="unipase_infer.yaml\n默认 sr_out: 16000\n严格读取三件 16 kHz artifact"];
+  infer_note [shape=note, fillcolor="#fef2f2", color="#dc2626", fontcolor="#991b1b", label="当前 infer YAML 未声明 postnet_ckpt_path\n48 kHz 输出需显式增加路径并修改 sr_out"];
+
+  wavlm -> s1 [label="teacher_ckpt_path\nstudent_ckpt_path"];
+  s1 -> enc [style=dashed, color="#2563eb", fontcolor="#1d4ed8", label="自训时手工导出/替换固定路径"];
+
+  enc -> s2 [label="encoder_ckpt_path"];
+  enc -> s3 [label="encoder_ckpt_path"];
+  s2 -> voc [style=dashed, color="#16a34a", fontcolor="#15803d", label="手工导出/替换固定路径"];
+  s3 -> ada [style=dashed, color="#ea580c", fontcolor="#c2410c", label="手工导出/替换固定路径"];
+
+  enc -> s4 [label="encoder_ckpt_path"];
+  voc -> s4 [label="vocoder_ckpt_path"];
+  ada -> s4 [label="adapter_ckpt_path"];
+  s4 -> post [style=dashed, color="#9333ea", fontcolor="#7e22ce", label="训练 checkpoint → 手工导出"];
+
+  enc -> infer [color="#475569", label="dewavlm_ckpt_path"];
+  voc -> infer [color="#475569", label="vocoder_ckpt_path"];
+  ada -> infer [color="#475569", label="adapter_ckpt_path"];
+  post -> infer_note [style=dotted, arrowhead=none, color="#dc2626"];
+  infer_note -> infer [style=dotted, arrowhead=none, color="#dc2626"];
+
+  legend [
+    shape=plain,
+    label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="4" CELLPADDING="2">
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#334155">━━▶</FONT></TD><TD ALIGN="LEFT">YAML 直接读取的固定 checkpoint 路径</TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#2563eb">┄┄▶</FONT></TD><TD ALIGN="LEFT">自训产物需手工导出或修改 YAML 路径</TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT COLOR="#dc2626">····</FONT></TD><TD ALIGN="LEFT">当前 YAML 未接线</TD></TR>
+    </TABLE>>
+  ];
+  { rank=sink; legend; }
+}

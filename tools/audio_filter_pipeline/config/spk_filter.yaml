@@ -1,0 +1,459 @@
+# Audio Filter Pipeline generation-3 speaker identity Step6 fail-closed 模板（speaker 缺失最终拒绝）。
+# 数据集 identity 由 generate_configs.py 的 36 项 active inventory 和 0 项注释 inventory 显式维护；注释条目不进入 active datasets 映射，也不会被 pipeline 处理。
+
+# step: all = 请求 Step6 完整依赖闭包（Step0→Step1→Step2→Step3→Step5→Step6，不含 Step4）；step4 = 请求 Step4 完整依赖闭包（Step0→Step1→Step2→Step3→Step4）。
+pipeline_generation: 3
+step: all
+# 统一输出根目录：Step0~Step6 的不可变 artifact 与 Step4/Step6 filter 导出的 FLAC 均落在此目录下。
+# 筛选配置已绑定本地输出根和数据集输入根。
+output_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/filter"
+# Step0 源采样率下限：读头发现源音频采样率低于该正整数时直接跳过，
+# 不进入冻结快照及后续步骤；当前配置下限为 16000 Hz。
+min_source_sample_rate_hz: 16000
+# 固定导出采样率（仅筛选配置）：16000 Hz。
+output_sample_rate_hz: 16000
+
+# ================= Step0：冻结输入快照 =================
+# 数据集 registry：每个数据集的显式身份，由本文件 inventory 维护，请勿手改
+# （重新生成会覆盖本块）。
+#   speaker：仅标注该数据集的说话人身份信息——source 声明「有无标签及如何解析」
+#     （none=无标签/不解析；path_component/regex/mapping_file=有标签并按指定方式解析），
+#     required 声明缺失标签时是否强制报错；它只影响 Step0 的 speaker_id 标注。
+#     是否执行声纹相似度由顶层 speaker_consistency.enabled 独立控制，不放在 datasets 内。
+#   speaker.source：_spk 数据集用 path_component=0（第一层目录即 speaker_id）；
+#     其余（会议/对话/多说话人类）用 none（不标注 speaker 身份）。
+#   audio_filter_<language bucket>_<source floor/output rate>k.yaml：文件名表达路由桶、源采样率下限与输出采样率；
+#     例如 audio_filter_mixed_32k.yaml 表示 mixed language bucket、32 kHz source floor 与 32 kHz output。
+#   language：仅表示本地五份配置使用的 route 处理桶（zh/en/mixed），
+#     不表示通用语言学标签，也不是运行时自动语言识别结果；mixed route 不等同于特殊数据集。
+#   category：数据集特殊属性元数据（read_speech/expressive/elderly/singing/game_voice）；
+#     selection_policies.categories 当前为空，仅作元数据，不参与阈值。
+#   input_root：数据集本地绝对输入根；筛选配置使用已核验目录。
+datasets:
+# dataset_catalog: CASIA 情感语音（casia_spk）
+#   基本信息：中文情感语音的说话人整理版本。
+#   language bucket：zh；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：语言与具体发布版本待核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  casia_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/casia_spk", language: zh, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: CREMA-D（cremad_spk）
+#   基本信息：英语演员情感语音，含多种情绪表达。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：91 位演员、情感标签。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  cremad_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/cremad_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: EmoV-DB English 16k（emov-db_en_16k_spk）
+#   基本信息：EmoV-DB 英语情感语音的 16 kHz 逻辑视图。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：物理目录已统一为 16 kHz。
+#   采样率/证据：本地 header：16 kHz；官方仅确认 16-bit WAV。
+#   证据状态：official_language_local_rate
+  emov-db_en_16k_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/emov-db_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: ESD Mandarin speakers（esd_zh_16k_spk）
+#   基本信息：ESD 中 0001–0010 说话人的中文情感语音视图。
+#   language bucket：zh；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：按官方说话人编号拆分；本地 16 kHz。
+#   采样率/证据：本地 header 抽样：16 kHz；官方 README 未给采样率。
+#   证据状态：official_language_local_rate
+  esd_zh_16k_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/esd_spk", language: zh, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}, source_selector: {include_speaker_ids: ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]}}
+# dataset_catalog: ESD English speakers（esd_en_16k_spk）
+#   基本信息：ESD 中 0011–0020 说话人的英语情感语音视图。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：按官方说话人编号拆分；本地 16 kHz。
+#   采样率/证据：本地 header 抽样：16 kHz；官方 README 未给采样率。
+#   证据状态：official_language_local_rate
+  esd_en_16k_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/esd_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}, source_selector: {include_speaker_ids: ["0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"]}}
+# dataset_catalog: HQ Conversations（hq-conversations_spk）
+#   基本信息：高质量对话语音的说话人整理版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：对话属性；语言的一手证据待补。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  hq-conversations_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/hq-conversations_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: IEMOCAP（iemocap_spk）
+#   基本信息：多说话人、表演式、多模态情感对话语料。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：acted、多说话人、多模态；语言/发布采样率待核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  iemocap_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/iemocap_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: LibriSpeech（librispeech_spk）
+#   基本信息：英语朗读语音语料。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：约 1000 小时；read speech。
+#   采样率/证据：官方与本地记录：16 kHz。
+#   证据状态：official_language_and_rate
+  librispeech_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/librispeech_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: M3ED（m3ed_spk）
+#   基本信息：中文多模态情感语音的说话人整理版本。
+#   language bucket：zh；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：情感/多模态属性；完整语言集合待 data card 核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  m3ed_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/m3ed_spk", language: zh, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: MagicData（magicdata_spk）
+#   基本信息：MagicData 语音的说话人整理版本。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：具体 MagicData 产品版本待绑定核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  magicdata_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/magicdata_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: MEAD（mead_spk）
+#   基本信息：带人脸视频的表演式情感语音语料。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：60 位演员、8 种情绪、audio-visual；语言待核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  mead_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/mead_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: MELD（meld_spk）
+#   基本信息：Friends 片段中的多说话人英语对话情感语料。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：多说话人、audio/visual/text、多模态情感。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  meld_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/meld_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: MSP-Podcast（msp-podcast_spk）
+#   基本信息：播客场景的英语情感语音说话人整理版本。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：播客/自然表达属性；官方 release 证据待补。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  msp-podcast_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/msp-podcast_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: SeniorTalk（seniortalk_spk）
+#   基本信息：面向老年说话人的语音数据集。
+#   language bucket：zh；category：elderly；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：老人声（elderly speech）；语言证据待补。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  seniortalk_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/seniortalk_spk", language: zh, category: elderly, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: TESS（tess_spk）
+#   基本信息：两位英语母语演员的情感语音。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：两位演员、多情绪表达。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  tess_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/tess_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: VoiceBank / VCTK release（voicebank_spk）
+#   基本信息：VCTK/VoiceBank 英语多口音语音的本地派生版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：官方发布版 48 kHz，本地当前文件为再次派生的 16 kHz。
+#   采样率/证据：官方发布：48 kHz；本地 header 抽样：16 kHz。
+#   证据状态：official_rate_differs_local
+  voicebank_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/voicebank_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: CN-Celeb（cnceleb_spk）
+#   基本信息：中文说话人识别语料。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：Chinese umbrella；官方未提供逐条语言集合。
+#   采样率/证据：官方记录：16 kHz/16-bit mono；本地 header 抽样：16 kHz。
+#   证据状态：official_rate_language_umbrella
+  cnceleb_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/cnceleb_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: CS Dialogue（cs_dialogue_spk）
+#   基本信息：中文对话语音的说话人整理版本。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：对话属性；官方语言/采样率证据待补。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  cs_dialogue_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/cs_dialogue_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: EasyTurn（easyturn_spk）
+#   基本信息：对话语音的说话人整理版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：本地路径存在 ZH/CTS-CN 线索；语言必须以 manifest 核验。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：language_pending_manifest
+  easyturn_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/easyturn_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: KeSpeech（kespeech_spk）
+#   基本信息：普通话及八种子方言语音。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：Mandarin 与八种子方言；Chinese umbrella。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  kespeech_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/kespeech_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: VoxCeleb1（voxceleb_vox1_spk）
+#   基本信息：名人访谈场景的说话人识别语料。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：官方资源页提供 identity/gender/nationality，不等同逐条语言标签。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：language_pending_manifest
+  voxceleb_vox1_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/voxceleb_vox1_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: VoxCeleb2（voxceleb_vox2_spk）
+#   基本信息：名人访谈场景的说话人识别语料扩展集。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_premium
+#   特殊属性/备注：官方资源页提供 identity/gender/nationality，不等同逐条语言标签。
+#   采样率/证据：本地 header 抽样：16 kHz；官方采样率待核验。
+#   证据状态：language_pending_manifest
+  voxceleb_vox2_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/voxceleb_vox2_spk", language: en, category: read_speech, quality_profile: quality_premium, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: LibriTTS-R（libritts_r_spk）
+#   基本信息：英语朗读语音的修复/重制版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：R 版来源需与 LibriTTS 原版独立绑定。
+#   采样率/证据：官方 LibriTTS 记录：24 kHz；本地 header 抽样：24 kHz。
+#   证据状态：official_rate_local_rate
+  libritts_r_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/libritts_r_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: Common Voice Chinese（commonvoice_cn_spk）
+#   基本信息：Common Voice 中文 locale/version 的本地整理版本。
+#   language bucket：zh；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：具体 locale 与 release manifest 待绑定。
+#   采样率/证据：本地 header 抽样：32 kHz；官方发布采样率待核验。
+#   证据状态：local_rate_only
+  commonvoice_cn_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/commonvoice_cn_spk", language: zh, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: Common Voice English（commonvoice_en_spk）
+#   基本信息：Common Voice 英文 locale/version 的本地整理版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_premium
+#   特殊属性/备注：具体 locale 与 release manifest 待绑定。
+#   采样率/证据：本地 header 抽样：32 kHz；官方发布采样率待核验。
+#   证据状态：local_rate_only
+  commonvoice_en_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/commonvoice_en_spk", language: en, category: read_speech, quality_profile: quality_premium, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: Hi-Fi TTS（hifi_tts_spk）
+#   基本信息：英语高保真 TTS 语音。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：不要与 HiFiTTS-2 本地 32 kHz 版本混称。
+#   采样率/证据：官方与本地记录：44.1 kHz。
+#   证据状态：official_language_and_rate
+  hifi_tts_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/hifi_tts_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: JL-Corpus（jlcorpus_spk）
+#   基本信息：New Zealand English 语音语料。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：New Zealand English；当前运行分类沿用 expressive。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  jlcorpus_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/jlcorpus_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: NN-CES read（nnces_read_spk）
+#   基本信息：NN-CES 朗读语音子集。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：UK/Ireland English dialect；年龄属性待 manifest 核验，不标注为儿童。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  nnces_read_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/nnces_read_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: NN-CES spontaneous（nnces_spontaneous_spk）
+#   基本信息：NN-CES 自发语音子集。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：UK/Ireland English dialect；年龄属性待 manifest 核验，不标注为儿童。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：official_language_local_rate
+  nnces_spontaneous_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/nnces_spontaneous_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: SAVEE（savee_spk）
+#   基本信息：英语演员情感语音。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：表演式情绪表达；具体发布证据待补。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  savee_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/savee_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: VocalSet（vocalset_spk）
+#   基本信息：歌唱技巧与人声演唱语料。
+#   language bucket：en；category：singing；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：歌唱（singing）；当前语言桶为运行路由，语言证据待补。
+#   采样率/证据：本地 header 抽样：44.1 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  vocalset_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/vocalset_spk", language: en, category: singing, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: EARS（ears_spk）
+#   基本信息：EARS 语音数据集的说话人整理版本。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：官方含 native language metadata，但完整音频语言集合待核验。
+#   采样率/证据：官方与本地记录：48 kHz。
+#   证据状态：official_rate_language_pending
+  ears_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/ears_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: EMNS（emns_spk）
+#   基本信息：EMNS 情感/表达语音的说话人整理版本。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：具体语言与发布规格待补。
+#   采样率/证据：本地 header 抽样：48 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  emns_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/emns_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: Expresso（expresso_spk）
+#   基本信息：Expresso 表达性语音的说话人整理版本。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：表达性/风格属性；具体语言与发布规格待补。
+#   采样率/证据：本地 header 抽样：48 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  expresso_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/expresso_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: RAVDESS（ravdess_spk）
+#   基本信息：演员表演式情感语音/视听语料。
+#   language bucket：en；category：expressive；
+#   quality_profile：quality_balanced
+#   特殊属性/备注：情绪与表演属性；具体语言证据待补。
+#   采样率/证据：本地 header 抽样：48 kHz；官方采样率待核验。
+#   证据状态：local_rate_only
+  ravdess_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/ravdess_spk", language: en, category: expressive, quality_profile: quality_balanced, speaker: {source: path_component, path_component: 0, required: false}}
+# dataset_catalog: VCTK（vctk_spk）
+#   基本信息：英语多口音、多说话人语音语料。
+#   language bucket：en；category：read_speech；
+#   quality_profile：quality_high
+#   特殊属性/备注：110 位英语说话人、多口音。
+#   采样率/证据：官方发布版与本地记录：48 kHz/16-bit；原录音 96 kHz/24-bit。
+#   证据状态：official_language_and_rate
+  vctk_spk: {input_root: "/data_nvme0n1/zxc/code/use_train/data/tse/spk/ori/vctk_spk", language: en, category: read_speech, quality_profile: quality_high, speaker: {source: path_component, path_component: 0, required: false}}
+
+# ================= Step0：源扫描与不可变快照 =================
+#   step0_workers：并发哈希/读头线程数（os.pread 与 hashlib 释放 GIL，线程共享
+#   root descriptor，descriptor-bound fail-closed 校验不变）；训练占 ~30% CPU、
+#   空闲核充裕，按 32 并发。
+step0_workers: 32
+
+# ================= Step1：TEN VAD / 带宽 / 有效采样率分析 =================
+#   runtime：当前仅支持 ten_vad_native_cpu。
+#   hop_size：VAD 帧移（样本数）；threshold：语音概率阈值。
+#   workers：进程池工作进程数，上限 STEP1_VAD_MAX_WORKERS=64（超出会被 config 校验拒绝）。
+#   max_pending：同时提交给进程池的 in-flight 任务数上限，必须落在 [workers, workers*2]；
+#                限制在途 future 数量，避免大目录下一次性提交全部任务撑爆内存。
+#   workers/max_pending（32→64, 64→128）：训练仅占 ~30% CPU、空闲核充裕；
+#   每个 worker 已钉死单线程（OMP/OPENBLAS/MKL_NUM_THREADS=1），
+#   64 worker ≈ 64 线程，低于空闲核数，不会与训练数据加载超订抢核。
+vad:
+  runtime: ten_vad_native_cpu
+  hop_size: 256
+  threshold: 0.5
+  workers: 64
+  max_pending: 128
+
+# ================= Step2：切段 =================
+# 连续语音超过该时长仍无安全静音切点的段跳过：不产生 segment 行、
+# 不参与 Step3 打分与后续导出；默认 60 秒。
+step2_max_segment_duration_sec: 60
+# 低于该时长的段直接丢弃：不产生 segment 行、不参与 Step3 打分与后续
+# 导出；过短的 VAD 碎片对训练无价值，且会让 SCOREQ 等 MOS 模型收到
+# 退化输入；五份 audio_filter 配置统一为 1.0 秒。
+step2_min_segment_duration_sec: 1.0
+
+# ================= Step3：MOS 打分 =================
+use_gpu: true
+step3_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+# registry 支持五个 selectable MOS 模型；配置策略决定实际执行 route。
+# 仅当前策略选中的模型会在 Step3 preflight 访问，未选资产字段不会被读取或校验。
+# 路径均相对仓库根解析（cli/main.py 的 _REPO_RELATIVE_CONFIG_PATH_KEYS）。
+# NISQA/UTMOS 已通过真实 GPU smoke，但生产阈值尚未校准，故仅保留可选资产字段。
+# URGENT-PK checkpoint/commit 虽匹配，shipped source 中 urgentpk/model_mod.py 是 symlink，
+# 会被安全 tree scanner fail-closed 拒绝；当前资产不可 opt-in，commit 匹配不等于 tree 可加载。
+urgent_pk_checkpoint: third_party_scripts/URGENT-PK/exp/mel_resnet34_urgent24.ckpt
+urgent_pk_source_dir: third_party_scripts/URGENT-PK
+urgent_pk_encoder: mel
+urgent_pk_backbone: resnet34
+urgent_pk_score_range: mos_1_to_5
+scoreq_model_dir: third_party_scripts/SCOREQ
+dnsmos_model_dir: third_party_scripts/DNSMOS
+nisqa_model_path: third_party_scripts/NISQA/weights/nisqa.tar
+nisqa_model_version: nisqa.tar
+nisqa_model_sha256: 4e69f09f85de3baad68654133046f554b4bd70ca96cf09ce29848a28104586cf
+utmos_model_path: third_party_scripts/UTMOS/utmos22_strong_step7459_v1.pt
+utmos_model_version: utmos22_strong_step7459_v1
+utmos_model_sha256: abe1c1aa15225599fa7189a9887da12842f8beb5541add007855ead9acdb6d9a
+# NISQA/UTMOS 的 SHA-256 绑定 checkpoint 父目录完整 tree；目录内任一文件变化都会 fail-closed。
+# 可信 pickle 加载（weights_only=False）的 fail-closed 门禁：
+#   urgent_pk_expected_sha256 = checkpoint 文件 SHA-256；
+#   urgent_pk_expected_commit  = source_dir 的 git HEAD。
+# 二者必须显式给出且与实际一致，缺失或不匹配即拒绝加载，绝不默认信任任意本地文件；
+# 更换权重或源码版本时必须同步更新这两项。
+urgent_pk_expected_sha256: 266e995f745f265ea52277ca657f86c7d27077b385136edd85f7ef923bdfed5d
+urgent_pk_expected_commit: 484269f41ef17ea2419952e92ace7109b4b96052
+
+# ================= Step4：MOS 2/2 keep/reject 筛选 =================
+selection_policies:
+  global:
+    mos_models: [scoreq, dnsmos]
+    min_mos_models: 2
+    mos_fusion: min
+    early_exit: null
+  # shipped 默认 route 仅选 scoreq / dnsmos，严格 2/2 通过（DNSMOS 四维 AND）。
+  # NISQA/UTMOS 虽已通过真实 GPU smoke，但生产阈值尚未校准；派生策略 opt-in 时须显式补阈值。
+  # Step6 全部数据集统一使用 quality_balanced 阈值；dataset quality_profile 身份字段保持不变。
+  quality_profiles:
+    quality_balanced:
+      thresholds:
+        dnsmos: {ovrl: 3.2, sig: 3.0, bak: 3.8, p808: 3.6}
+        scoreq: 3.6
+    quality_high:
+      thresholds:
+        dnsmos: {ovrl: 3.2, sig: 3.0, bak: 3.8, p808: 3.6}
+        scoreq: 3.6
+    quality_premium:
+      thresholds:
+        dnsmos: {ovrl: 3.2, sig: 3.0, bak: 3.8, p808: 3.6}
+        scoreq: 3.6
+  categories: {}
+  languages: {en: {}, zh: {}, mixed: {}, fr: {}, ja: {}, ko: {}, ru: {}}
+  datasets: {}
+  # 可选 exact-source override（shipped 默认不启用）：sources.<dataset_id>.<source_relative_path>；仅 exact match，禁止绝对路径、反斜杠和 '..' segment。
+  # sources:
+  #   dataset_id:
+  #     speaker/example.wav: {mos_models: [utmos, nisqa], min_mos_models: 1}
+
+# ================= Step5：WeSpeaker speaker consistency =================
+# 开启后 Step5 用冻结 enrollment bundle 对同一 identity 做 L2-normalized cosine，
+# 生成 speaker score；Step6 filter 才据此执行最终声纹筛选。
+# 此 shipped Step6 fail-closed 模板显式启用 speaker consistency，但下列 /REPLACE_ME 路径、
+# replace-me 版本与全 0 digest 都是拒绝执行的占位，不代表资产可运行。
+# 运行前必须替换为真实 WeSpeaker/enrollment 资产、版本、SHA-256 与校准阈值；
+# Step5/Step6 execution preflight 会在任何 stage/factory/GPU worker 启动前拒绝占位。
+# 即使其他检查通过，缺失 speaker_id、enrollment 或 speaker score 的输出也会在 Step6 最终拒绝。
+speaker_consistency:
+  enabled: true
+  runtime: wespeaker
+  model_dir: /REPLACE_ME/audio_filter_pipeline/wespeaker_model
+  model_version: replace-me
+  model_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  runtime_version: replace-me
+  target_sample_rate: 16000
+  enrollment_bundle_path: /REPLACE_ME/audio_filter_pipeline/enrollment_bundle.jsonl
+  enrollment_bundle_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  enrollment_exclusion_path: /REPLACE_ME/audio_filter_pipeline/enrollment_exclusion.jsonl
+  enrollment_exclusion_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  min_cosine_similarity: 0.8
+
+# ================= Step4：MOS 筛选执行模式 =================
+# dry_run：不发布 artifact，仅按当前阈值统计 keep/reject（调阈值用）；
+# filter（默认）：发布 Step4 artifact 后把 keep 段导出为 FLAC（SE 干净数据集，
+# 采样率路由与 Step6 一致）。导出根由 step4_export_root 显性指定，
+# null 时落在 <output_root>/audio_exports/step4/。
+step4_mode: filter
+step4_export_root: null
+
+# ================= Step6：最终决策与导出 =================
+# dry_run：发布 metadata artifact 并统计，不导出音频；
+# filter（默认）：发布后导出 FLAC（TSE 数据集）。声纹未启用时等价纯 MOS 导出。
+# 导出根由 step6_export_root 显性指定，null 时落在 <output_root>/audio_exports/step6/。
+step6_mode: filter
+step6_export_root: null
+# Step4/Step6 共用导出并发：解码(libsndfile)/重采样(soxr)/FLAC 编码均释放 GIL；
+# 按 32 worker / max_pending 64 配置。max_inflight_bytes 是严格的 estimated
+# waveform/verification bytes gate，不代表进程总 RSS。
+# 导出对 fd 需求高：每次路径操作都从根逐层打开目录链（每层一个 fd），32 worker
+# 并发峰值 >1024。运行前必须确认 shell 软限制 ulimit -n 1048576（screen/tmux 老
+# 会话可能只有 1024，fd 耗尽会以 EMFILE 崩溃）。
+audio_export_workers: 32
+audio_export_max_pending: 64
+audio_export_max_inflight_bytes: 4294967296
