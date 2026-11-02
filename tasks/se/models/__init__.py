@@ -3,6 +3,7 @@
 SE model registry overview（非完整清单；YAML 通过 ``model.type`` 选择，权威全集见
 下方 ``_MODEL_REGISTRY_MAP``）：
   - GTCRN:           Lightweight real-time model, 23.67K trainable (~48K total 含 ERB), 16kHz
+  - CoFiLite:        CoFi-Lite，waveform-native 超轻量因果 SE（内部 sqrt-Hann STFT/iSTFT），83.12K trainable，16kHz
   - BSRNN:           Band-Split RNN（含 causal/noncausal、USR 多采样率）；usr_bsrnn_* / bsrnn_* 均用此 type；流式/ONNX 用 causal BSRNN + ``onnx/StreamingBSRNNWrapper``
   - DeepFilterNet:   DeepFilterNet2/3 or DPDFNet2/4/8 via YAML params (enc_concat, enc_lin_groups, etc.), 16kHz
   - FastEnhancer:    RNNFormer SE model, 5 variants (T/B/S/M/L), 16kHz
@@ -69,6 +70,7 @@ logger = logging.getLogger(__name__)
 _MODEL_REGISTRY_MAP: dict[str, str] = {
     # Discriminative models (single-model supervised)
     "GTCRN":          "tasks.se.models.discriminative.gtcrn",
+    "CoFiLite":       "tasks.se.models.discriminative.cofi_lite",
     "BSRNN":          "tasks.se.models.discriminative.bsrnn",
     "DeepFilterNet": "tasks.se.models.discriminative.deepfilternet",
     "FastEnhancer":   "tasks.se.models.discriminative.fastenhancer",

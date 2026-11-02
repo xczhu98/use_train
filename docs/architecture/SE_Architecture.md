@@ -10,7 +10,7 @@
 |------|----------|
 | DeepFilterNet / DPDFNet 实现与默认超参 | `tasks/se/models/discriminative/deepfilternet.py`（入口）与 `tasks/se/models/modules/deepfilternet_impl.py`（`DeepFilterNet`、`Encoder`、`ErbDecoder`、`DfDecoder`） |
 | 模型注册与 YAML 路由 | `tasks/se/models/discriminative/deepfilternet.py` |
-| GTCRN / BSRNN / FastEnhancer / FastULCNet / ULUNAS | `tasks/se/models/discriminative/gtcrn.py`、`tasks/se/models/discriminative/bsrnn.py` 与 `tasks/se/models/modules/bsrnn_impl/`、`tasks/se/models/discriminative/fastenhancer.py`、`tasks/se/models/discriminative/fast_ulcnet.py`、`tasks/se/models/discriminative/ulunas.py` |
+| GTCRN / CoFi-Lite / BSRNN / FastEnhancer / FastULCNet / ULUNAS | `tasks/se/models/discriminative/gtcrn.py`、`tasks/se/models/discriminative/cofi_lite.py`、`tasks/se/models/discriminative/bsrnn.py` 与 `tasks/se/models/modules/bsrnn_impl/`、`tasks/se/models/discriminative/fastenhancer.py`、`tasks/se/models/discriminative/fast_ulcnet.py`、`tasks/se/models/discriminative/ulunas.py` |
 | MeanFlowSE | `tasks/se/models/generative/meanflowse/model.py`、`tasks/se/trainer/meanflowse_trainer.py`、`configs/se/voicebank_demand/meanflowse_ncsnpp_offline.yaml` |
 | RWSA-MambaUNet | `tasks/se/models/gan/generators/rwsa_mamba_unet.py`、`tasks/se/models/modules/rwsa_mamba_impl/`、`configs/se/urgent2026/gan/rwsa_mamba_unet_metricgan_dynamic.yaml` |
 | 变体说明（DF2 / DF3 / DPDFNet） | `tasks/se/models/discriminative/deepfilternet.py` / `tasks/se/models/modules/deepfilternet_impl.py` 模块 docstring |
@@ -800,6 +800,7 @@ use_train 验证阶段不请求 LSNR/alpha 输出，也不计算对应辅助 los
 | 模型 | 结构分解（公式化） | 参数量(M) | 算力(G MACs) | 主要 Loss | 配置路径 | Loss 文件路径 | 论文创新点摘要 |
 |------|--------------------|-----------|--------------|-----------|----------|----------------|----------------|
 | GTCRN | ERB + SFE + Enc(GTConv×3) + DPGRNN×2 + Dec + Mask | 0.0237(train)/0.0482(total) | ~0.034 | CompositeLoss（GTCRN 两项） | `configs/se/voicebank_demand/gtcrn_causal_offline.yaml`、`configs/se/dns_challenge3/gtcrn_causal_offline.yaml` | `core/losses/hybrid.py` + `core/losses/composite.py` | 超轻量 Grouped+双路径 RNN、ERB 固定 |
+| CoFi-Lite | 内部 sqrt-Hann STFT + ERB(64+65) + SFE + MobileNetV2 双路径 Enc + CPF + InterRNN + 包络/细节双 mask Dec + 内部 iSTFT | 0.0831(train)/0.1082(total) | 0.01287(paper) | CoFiLiteHybridLoss | `configs/se/dns_challenge3/cofi_lite_causal_offline.yaml` | `core/losses/model_specific/cofi_lite.py` | waveform-native 超轻量双路径包络/细节建模、跨路径融合 |
 | BSRNN (URGENT) | BandSplit → Time-LSTM → Freq-LSTM×6 → MaskDecoder(residual) | 37.8 | ~84(1s@48k) | MultiResL1SpecLoss | `configs/se/urgent2026/usr_bsrnn_noncausal_urgent26_offline_multires_l1_spec.yaml` | `core/losses/freq_domain.py` | 子带划分、Time-Freq 双 LSTM、scale-invariant |
 | BSRNN (Lite) | 同上，41 子带 N=16，mask-only | 0.475 | 0.529 | CompositeLoss（GTCRN 两项） | `configs/se/urgent2026/usr_bsrnn_causal_urgent26_offline_hybrid.yaml` | `core/losses/hybrid.py` + `core/losses/composite.py` | USR 多采样率、轻量 mask-only |
 | DeepFilterNet/DPDFNet | ERB+DF Enc + DPRNN×0/2/4/8 + Dec + LSNR | 2.15~3.55 | 0.36~4.37 | CompositeLoss | `configs/se/urgent2026/dpdfnet2_causal_urgent26_dynamic_hybrid.yaml`、`configs/se/urgent2026/dpdfnet2_causal_urgent26_offline_hybrid.yaml` | `core/losses/composite.py` + `core/losses/hybrid.py` + `core/losses/model_specific/deepfilternet.py` 等 | LSNR、双路径 Enc、DPRNN 可扩展 |

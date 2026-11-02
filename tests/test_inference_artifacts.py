@@ -202,6 +202,44 @@ def test_main_artifact_fingerprint_binds_task_model_sources(tmp_path):
     assert review_changed["sha256"] != changed["sha256"]
 
 
+def test_waveform_native_fingerprint_distinguishes_model_artifacts(tmp_path):
+    """checkpoint 训练的 waveform-native 模型必须把 --checkpoint 纳入身份。"""
+    from argparse import Namespace
+
+    config = tmp_path / "config.yaml"
+    checkpoint = tmp_path / "model.tar"
+    inference_entry = tmp_path / "inference.py"
+    config.write_text("model: {type: CoFiLite}\n", encoding="utf-8")
+    checkpoint.write_bytes(b"checkpoint")
+    inference_entry.write_text("# entry\n", encoding="utf-8")
+    args = Namespace(
+        checkpoint=str(checkpoint),
+        config=str(config),
+        device="cpu",
+        sr=None,
+        chunk_seconds=0.0,
+        aec_stream_align=False,
+        aec_no_stream_align=False,
+        aec_review_multichannel=False,
+    )
+    common = {
+        "project_root": tmp_path,
+        "inference_entry": inference_entry,
+        "is_aec": False,
+        "is_waveform_native": True,
+        "source_files": {},
+    }
+    cfg = {"model": {"type": "CoFiLite", "args": {}}}
+    artifacts = build_artifact_fingerprint(cfg=cfg, args=args, has_model_artifacts=True, **common)
+    checkpointed = build_artifact_fingerprint(
+        cfg=cfg, args=args, has_model_artifacts=False, **common
+    )
+
+    assert artifacts["files"]["checkpoint"] is None
+    assert checkpointed["files"]["checkpoint"]["path"] == str(checkpoint)
+    assert artifacts["sha256"] != checkpointed["sha256"]
+
+
 def test_aec_review_multichannel_rejected_for_se(monkeypatch, tmp_path):
     from argparse import Namespace
 

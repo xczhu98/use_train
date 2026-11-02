@@ -50,8 +50,8 @@
 
 - 入口：训练统一从 `train.py` 进入，按配置里的 `data.mode` 路由；SE 支持 `dynamic` 在线仿真和 `offline` 预混合配对。offline spatial 的 clean 保持 mono，noisy 保持 `[C,T]`；split 必须声明 `spatial_enabled`、`array_profile`/`custom_geometry`、`reference_channel` 与 `channel_order`。文件推理走根 `inference.py`，模型 I/O 适配在 `tasks/se/inference/adapter.py`，manifest、输出锁与产物校验由公共 runner 负责。
 - 批合同：Dataset 样本为 4 元组，或追加 `is_pure_noise` / `is_pure_echo` / `is_pure_echo_noise` 的 7 元组；`core.data.collate.collate_fn` 补齐后返回已校验的 `SEBatch`。该类型定义于 `core.data.speech_enhancement_batch`，任务侧 `tasks.se.data.batch` 再导出；提供 `validate()`、`pin_memory()`、`.to()` 和 `batch_size`，支持 DataLoader 锁页及异步设备搬运。5 元组旧样本和 Trainer 的 tuple/list 批均显式拒绝。
-- 模型 I/O 基线：判别式模型继承 `tasks/se/models/base_model.py::BaseSEModel`，签名为 `forward(noisy_spec, lengths=None, *, fs=None)`，即输入含噪频谱、输出增强频谱；dual-input、loss-returning 与 GAN 形态是显式例外，由对应 Trainer 驱动。`MossFormer2_SE_48K` 内部自带 iSTFT→Kaldi fbank 前端，是登记例外。
-- STFT/iSTFT 由 Trainer 或顶层模块统一管理，模型内部不重复引入。
+- 模型 I/O 基线：判别式模型继承 `tasks/se/models/base_model.py::BaseSEModel`，签名为 `forward(noisy_spec, lengths=None, *, fs=None)`，即输入含噪频谱、输出增强频谱；dual-input、loss-returning 与 GAN 形态是显式例外，由对应 Trainer 驱动。`MossFormer2_SE_48K` 内部自带 iSTFT→Kaldi fbank 前端；`CoFi-Lite` 是 waveform-native 判别式例外，按上游方案在模型内部完成 sqrt-Hann STFT/iSTFT（`frontend_owner="model"`，YAML 设 `meta.allow_no_stft: true`）。
+- STFT/iSTFT 由 Trainer 或顶层模块统一管理，模型内部不重复引入；`MossFormer2_SE_48K` 与 `CoFi-Lite` 的模型自有前端是登记例外。
 - 仿真合同（Layer A–F、clean target 边界）以 [`docs/guides/simulation/Simulation_Flow_Logic.md`](../../docs/guides/simulation/Simulation_Flow_Logic.md) 为准；本文件只保留 SE 的运行入口与数据边界。
 
 ---
@@ -270,6 +270,7 @@ SE 模型按**训练范式**划分成四类。它们都是 SE 模型的子类（
 | 模型 | 说明 | 参考来源 |
 |------|------|----------|
 | **GTCRN** | 轻量因果 SE | [gtcrn-main](https://github.com/Xiaobin-Rong/gtcrn) |
+| **CoFi-Lite** | waveform-native 超轻量因果 SE；模型内部 sqrt-Hann STFT/iSTFT，双路径包络/细节建模 | [CoFi-Lite](https://github.com/Acceleration123/CoFi-Lite) |
 | **BSRNN** | 频带切分 RNN | [URGENT2026 Baseline](https://github.com/urgent-challenge/urgent2026_challenge_track1) |
 | **DeepFilterNet** | 深度滤波增强 (DF2/DF3) | [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) |
 | **FastEnhancer** | 轻量非因果/流式增强 | [fastenhancer](https://github.com/aask1357/fastenhancer) |

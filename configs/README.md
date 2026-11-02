@@ -95,7 +95,7 @@ configs/
 ├── se/
 │   ├── README.md / README_CN.md SE 任务索引
 │   ├── urgent2026/               URGENT2026（BSRNN / DPDFNet2）+ pase/（生成式增强）+ gan/（MetricGAN）子目录
-│   ├── dns_challenge3/           DNS Challenge 3（GTCRN）
+│   ├── dns_challenge3/           DNS Challenge 3（GTCRN / CoFi-Lite）
 │   ├── spatial/                  8 kHz SpatialNet / OnlineSpatialNet dynamic 配方、cIRM 配方与 offline spatial mc_sim 样板（含 32 s LF 阶段）
 │   └── voicebank_demand/         VoiceBank-DEMAND（十份 recipe：GTCRN / ZipEnhancer-S / FastULCNet / MeanFlowSE / MeanSE / DCCRN / MTFAANet / RT-SEMamba / TFSkiMNet）
 ├── tse/

@@ -1,0 +1,135 @@
+# ======================================================================
+# 实验配置：CoFi-Lite，DNS Challenge 3 宽带数据，离线预混（16 kHz）
+# ======================================================================
+# 模型：CoFi-Lite（waveform-native 超轻量因果 SE；模型内部 512/256/512 sqrt-Hann STFT/iSTFT）
+# Params：local 0.1082M total / 0.0831M trainable；paper/reference 83.12K trainable
+# 1 秒输入 MACs：paper/reference 12.87M MACs/s；本机未用 THOP 复核（内部 STFT/iSTFT 属 THOP 部分覆盖算子）
+# 独立 FLOPs：not measured
+# Trainer MOS boundary：Trainer 只计算侵入式客观指标；DNSMOS/NISQA/UTMOS/SCOREQ 等须经 evaluate 离线计算
+# 论文/参考："CoFi-Lite: Pushing the Limits of Ultra-Lightweight Speech Enhancement"（IEEE SPL 2026）
+# 上游源码参考：https://github.com/Acceleration123/CoFi-Lite 的 model/cofilite.py
+# 本地口径：模型实现、模块命名与 released DNS3 checkpoint 逐位对齐；total 含固定 ERB 滤波器组
+#
+# DNS Challenge 3 数据：16 kHz 宽带 clean speech、多类噪声以及 synthetic/real recording，
+# 用于低延迟实时语音增强研究。上游 recipe 使用 10 s 片段、batch 8、200 epochs。
+# 上游 DNS3Dataset 另有 num_data_tot=72000 的训练池截断；本仓 offline Dataset 不提供等价 cap，
+# 训练池为生成目录全量，num_per_epoch=10000 与上游一致。
+#
+# 数据准备（生成预混配对音频与 SCP，与 GTCRN DNS3 配方共用同一生成器）：
+#   python -m tools.prepare_data_tools.generators.se.generate_dns3_offline_dataset \
+#       --data-root /path/to/DNS-Challenge \
+#       --output-dir data/se/dns_challenge3_generated \
+#       --scp-dir data/se/dns_challenge3
+#   clean target 使用从直达峰起截取的前 100 ms early RIR；noisy 使用 full RIR 语音与噪声混合。
+#   data/se/dns_challenge3/ 当前在本机不存在时，下方四条 *_scp 均不可用；必须先运行生成器。
+#
+# Train:
+#   python train.py -C configs/se/dns_challenge3/cofi_lite_causal_offline.yaml
+#
+# 模型实现：tasks/se/models/discriminative/cofi_lite.py（CoFiLite 类）
+# 数据实现：core/data/offline_dataset.py（offline 配对 Dataset）
+# ======================================================================
+
+# ---- meta：全局训练超参（随机种子、精度开关、cuDNN 行为）----
+meta:
+  seed: 43               # 上游 train.py 固定 seed=43；Trainer 由此派生 validation seed 与 DataLoader worker seed
+  allow_no_stft: true    # CoFi-Lite 为 waveform-native：STFT/iSTFT 在模型内部，不使用框架 STFT
+  use_amp: false         # 上游为 fp32 训练；模型内部含 stft/istft，关闭 AMP 避免复数与半精度边界
+  use_ema: false         # 上游未使用 EMA，避免额外显存与 eval 分支
+  deterministic: false   # 关闭 cudnn 确定性（runtime 默认 false）；仅在需要逐 bit 复现时设 true
+
+# ---- model：CoFi-Lite（tasks/se/models/discriminative/cofi_lite.py）----
+model:
+  type: CoFiLite         # registry 名称（@MODEL_REGISTRY.register("CoFiLite")）
+  args: {}               # 上游结构固定；n_fft/hop/win/window/center 由模型内部校验为 512/256/512/hann/true
+
+# ---- data：DNS Challenge 3 离线预混配对 ----
+data:
+  mode: offline          # 路由字段：offline 读磁盘配对 SCP，不做在线仿真
+  sample_rate: 16000     # CoFi-Lite 固定 16 kHz；ERB 滤波器组硬编码 fs=16000/high_lim=8000
+
+  train:                 # 训练 split：配对 clean/noisy SCP 与画布生命周期参数
+    # 当前不可用：需先运行头部生成器，产出 data/se/dns_challenge3/train/clean.scp。
+    clean_scp: "data/se/dns_challenge3/train/clean.scp"
+    # 当前不可用：需先运行头部生成器，产出 data/se/dns_challenge3/train/noisy.scp。
+    noisy_scp: "data/se/dns_challenge3/train/noisy.scp"
+    max_duration: 160000            # 上游 10 s @ 16 kHz；生成文件为 10 s，超长时 clean/noisy 同步随机裁切
+    repeat_to_max_duration: false   # 上游按 10 s 读取，短样本原样返回并由 collate 补齐，不 tile
+    num_per_epoch: 10000            # 上游每个 epoch 从训练池采样 10,000 条；virtual epoch 由 sampler 重采样
+
+  validation:            # 验证 split：不设 max_duration，保持生成文件的原始 10 s 时长
+    # 当前不可用：需先运行头部生成器，产出 data/se/dns_challenge3/val/clean.scp。
+    clean_scp: "data/se/dns_challenge3/val/clean.scp"
+    # 当前不可用：需先运行头部生成器，产出 data/se/dns_challenge3/val/noisy.scp。
+    noisy_scp: "data/se/dns_challenge3/val/noisy.scp"
+
+  dataloader:            # DataLoader 公共参数；train/val 共享
+    batch_size: 8        # 上游 train_dataloader.batch_size=8
+    val_batch_size: 4    # 上游 validation_dataloader.batch_size=4；验证 loader 独立 batch
+    num_workers: 4       # 上游 num_workers=4
+    pin_memory: true     # 锁页内存加速 H2D 拷贝；仅在 CUDA 训练时有收益
+
+# ---- loss：CoFi-Lite 官方 HybridLoss（压缩 RI + magnitude + SI-SNR）----
+# 上游 loss_factory.py: 30*(L_real+L_imag) + 70*L_mag - SI-SNR。
+# 本仓库同名 loss 逐项移植上游公式，并按 collate 的 lengths 对谱帧/SI-SNR 做有效区掩码。
+# 频谱项使用普通 Hann 窗，与上游 loss 内部 torch.stft 的窗口一致（模型分析/合成窗才是 sqrt-Hann）。
+loss:
+  type: CoFiLiteHybridLoss  # core/losses/model_specific/cofi_lite.py
+  args:                  # 透传给 CoFiLiteHybridLoss
+    n_fft: 512           # 上游 loss n_fft=512
+    hop_length: 256      # 上游 loss hop_len=256
+    win_length: 512      # 上游 loss win_len=512
+    window: hann         # 上游 loss 使用 torch.hann_window(win_len)
+    center: true         # 与上游 torch.stft 默认 center=True 一致
+    compress_factor: 0.3 # 上游 compress_factor=0.3
+    eps: 1.0e-12         # 上游 eps=1e-12
+    lamda_ri: 30.0       # 上游 lamda_ri=30
+    lamda_mag: 70.0      # 上游 lamda_mag=70
+
+# ---- optimizer：Adam（上游 optimizer.lr=1e-3）----
+optimizer:
+  type: Adam             # build_single_optimizer；归一化层参数自动进入 no-decay 组
+  args:                  # 透传给 torch.optim.Adam
+    lr: 0.001            # 上游 optimizer.lr=0.001
+    eps: 0.00000001      # 上游未显式设置，使用 torch 默认 1e-8；weight_decay 未设置即 0.0
+
+# ---- scheduler：线性 warmup + 余弦退火（上游 per-step 更新）----
+scheduler:
+  type: LinearWarmupCosineAnnealing  # lr: 0 → max_lr（warmup）→ min_lr（余弦）
+  args:                  # 透传给 LinearWarmupCosineAnnealing
+    warmup_steps: 25000  # 上游 warmup_steps=25000
+    decay_until_step: 250000  # 上游 decay_until_step=250000
+    max_lr: 0.001        # 上游 max_lr=0.001；必须等于 optimizer.args.lr
+    min_lr: 0.000001     # 上游 min_lr=1e-6
+    zero_based_warmup: true  # 上游 LinearWarmupCosineAnnealingLR 在 step 0 使用 lr=0
+
+# ---- trainer：SETrainer（单优化器、无 GAN）----
+trainer:
+  type: SETrainer        # core/trainer/entry.py 按 type 解析；SE 任务通用 Trainer
+  exp_path: exp/se/cofi_lite_causal_offline  # 产物根目录；测试约定为 exp/se/<配置文件名>
+
+  # 训练规模与日志
+  epochs: 200            # 上游 trainer.epochs=200
+  gradient_clip_value: 3.0   # 上游 clip_grad_norm_value=3.0
+  accumulation_steps: 1      # 上游未使用梯度累积；1 = 每个 batch 一次 optimizer step
+  lr_schedule_per_step: true # 上游 scheduler 按 step 更新；warmup/decay 单位均为 optimizer step
+  log_interval: 100          # 每 N 个 optimizer step 打一条训练日志
+
+  # 验证（全局）
+  max_val_batches: 0          # 每个 rank 单次 validation 的最大 forward batch 数；0 = 不限制
+  validation_epoch_interval: 1
+  validation_steps_interval: 0   # 0 = 关闭步级验证；> 0 时需 save_top_k > 0
+  save_top_k: 3                  # 步级验证保留 val_loss 最低的 top-k checkpoint
+  val_metrics:
+    enabled: true        # 启用侵入式在线指标；关闭则整段指标不参与验证
+    metrics: [SI-SDR, PESQ, ESTOI]  # 与上游 DNS3 评估口径一致；均需 clean 参考
+    interval: 5          # 每 5 次 validation 计算一次指标（loss 仍每次验证都算）
+    max_utterances: 200          # 全局指标上限；各 rank 均分
+    max_utterances_metrics: 200  # 显式声明：省略时回退 max_utterances
+    metrics_workers: 2           # 侵入式指标进程池（0=自动）
+  save_checkpoint_interval: 1  # 上游 save_checkpoint_interval=1（每个 epoch 保存）
+
+# ---- Distributed：DDP ----
+distributed:
+  backend: nccl          # 进程组后端；GPU 训练用 nccl（runtime 默认 nccl，CPU/Gloo 需显式改）
+  find_unused_parameters: false  # 单路径前向使用全部 trainable 参数

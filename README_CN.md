@@ -52,7 +52,7 @@
 
 | 任务 | `data.mode` | 代表模型 | 推理 / 评估入口 |
 |---|---|---|---|
-| [SE · 语音增强](tasks/se/README.md) | `dynamic` / `offline` | GTCRN、BSRNN、SpatialNet_SE、PASE 系列 | `inference.py`；`evaluate/eval_pipeline_se.py` |
+| [SE · 语音增强](tasks/se/README.md) | `dynamic` / `offline` | GTCRN、CoFi-Lite、BSRNN、SpatialNet_SE、PASE 系列 | `inference.py`；`evaluate/eval_pipeline_se.py` |
 | [AEC · 回声消除](tasks/aec/README.md) | `dynamic_aec` / `offline_aec` | DeepVQE、CAGCRN、DBGNet、LocalVQE | `inference.py`；`evaluate/eval_pipeline_aec.py` |
 | [TSE · 目标说话人提取](tasks/tse/README.md) | `dynamic_tse` / `offline_tse` | TSE_BSRNN_SPK、TSE_Modular | `inference.py --tse-manifest`；`evaluate/eval_pipeline_tse.py` |
 | [SS · 语音分离](tasks/ss/README.md) | `dynamic_ss` / `offline_ss` | TDANet、TIGER、SpatialNet、OnlineSpatialNet | 包内 `SSExtractor` / `SSInferenceAdapter` |

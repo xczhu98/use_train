@@ -22,6 +22,7 @@ from core.losses.perceptual_lib import *        # noqa: F401,F403
 from core.losses.spectral_distance import *     # noqa: F401,F403
 from core.losses.model_specific.deepfilternet import *  # noqa: F401,F403
 from core.losses.model_specific.metricgan import *      # noqa: F401,F403
+from core.losses.model_specific.cofi_lite import *      # noqa: F401,F403
 from core.losses.fw_sdr import *                # noqa: F401,F403
 from core.losses.plcpa_asymmetric import *      # noqa: F401,F403
 from core.losses.scalar_passthrough import *    # noqa: F401,F403

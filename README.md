@@ -52,7 +52,7 @@ All tasks train through `train.py -C <config.yaml>`. The required `data.mode` se
 
 | Task | `data.mode` | Representative models | Inference / evaluation |
 |---|---|---|---|
-| [SE · Speech enhancement](tasks/se/README.md) | `dynamic` / `offline` | GTCRN, BSRNN, SpatialNet_SE, PASE family | `inference.py`; `evaluate/eval_pipeline_se.py` |
+| [SE · Speech enhancement](tasks/se/README.md) | `dynamic` / `offline` | GTCRN, CoFi-Lite, BSRNN, SpatialNet_SE, PASE family | `inference.py`; `evaluate/eval_pipeline_se.py` |
 | [AEC · Echo cancellation](tasks/aec/README.md) | `dynamic_aec` / `offline_aec` | DeepVQE, CAGCRN, DBGNet, LocalVQE | `inference.py`; `evaluate/eval_pipeline_aec.py` |
 | [TSE · Target speaker extraction](tasks/tse/README.md) | `dynamic_tse` / `offline_tse` | TSE_BSRNN_SPK, TSE_Modular | `inference.py --tse-manifest`; `evaluate/eval_pipeline_tse.py` |
 | [SS · Speech separation](tasks/ss/README.md) | `dynamic_ss` / `offline_ss` | TDANet, TIGER, SpatialNet, OnlineSpatialNet | Package-level `SSExtractor` / `SSInferenceAdapter` |

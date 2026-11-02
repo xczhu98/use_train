@@ -282,6 +282,7 @@ def build_artifact_fingerprint(
     inference_entry: str | Path,
     is_aec: bool,
     is_waveform_native: bool,
+    has_model_artifacts: bool | None = None,
     effective_device: str | None = None,
     source_files: dict[str, Path] | None = None,
     effective_identity: Mapping[str, Any] | None = None,
@@ -290,10 +291,16 @@ def build_artifact_fingerprint(
     """绑定推理入口、源码、配置、模型权重与影响结果的 CLI 参数。
 
     输出布局由调用方传入 ``output_paths``，在 manifest 复用时严格校验。
+    ``has_model_artifacts`` 区分两种 waveform-native 形态：PASE/StuPASE 的权重
+    由模型配置内的 artifact 路径提供（默认沿用 ``is_waveform_native``），
+    CoFi-Lite 等 checkpoint 训练模型仍必须把 ``--checkpoint`` 纳入身份。
     """
+    uses_model_artifacts = (
+        bool(is_waveform_native) if has_model_artifacts is None else bool(has_model_artifacts)
+    )
     checkpoint = (
         None
-        if is_waveform_native or not args.checkpoint
+        if uses_model_artifacts or not args.checkpoint
         else Path(args.checkpoint).expanduser()
     )
     files = {
@@ -306,7 +313,7 @@ def build_artifact_fingerprint(
             else inference_source_files(project_root, is_aec=is_aec)
         ),
     }
-    if is_waveform_native:
+    if uses_model_artifacts:
         files.update(configured_checkpoint_files(cfg.get("model", {})))
     return build_content_fingerprint(
         files,

@@ -115,7 +115,7 @@ def parse_args():
         default=None,
         help="可选父进程 effective merged config SHA-256；模型构造前严格校验。",
     )
-    p.add_argument("--checkpoint", required=False, help="训练 checkpoint 路径；waveform-native 模型(PASE/StuPASE, meta.allow_no_stft=true)忽略此项（权重由 artifact 注入）")
+    p.add_argument("--checkpoint", required=False, help="训练 checkpoint 路径；仅当 waveform-native 模型把权重写在 model 配置的 artifact 路径时（PASE/StuPASE）可省略，模型仍设 meta.allow_no_stft=true")
     # SE inputs
     p.add_argument("--input_dir", default=None, help="SE: noisy audio directory")
     p.add_argument("--input_scp", default=None, help="SE: noisy scp file")
@@ -923,6 +923,9 @@ def _main_locked(args, out_dir: Path):
     stft_cfg = cfg.get("stft")
     allow_no_stft = cfg.get("meta", {}).get("allow_no_stft", False)
     is_waveform_native = allow_no_stft and not stft_cfg
+    has_model_artifacts = is_waveform_native and bool(
+        configured_checkpoint_files(cfg.get("model", {}))
+    )
     project_root = Path(__file__).resolve().parent
     artifact_fingerprint = build_artifact_fingerprint(
         args,
@@ -931,11 +934,12 @@ def _main_locked(args, out_dir: Path):
         inference_entry=Path(__file__),
         is_aec=is_aec,
         is_waveform_native=is_waveform_native,
+        has_model_artifacts=has_model_artifacts if is_waveform_native else None,
         effective_device=str(device),
         source_files=inference_source_files(project_root, is_aec=is_aec),
         effective_identity=effective_identity,
     )
-    if is_waveform_native:
+    if is_waveform_native and has_model_artifacts:
         from tasks.se.models import build_model
         _mcfg = cfg.get("model", {})
         _waveform_checkpoint_files = configured_checkpoint_files(_mcfg)
@@ -949,7 +953,9 @@ def _main_locked(args, out_dir: Path):
     else:
         if not args.checkpoint:
             raise ValueError(
-                "非 waveform-native 模型需要 --checkpoint（waveform-native 模型设 meta.allow_no_stft=true 可免，权重由 artifact 注入）"
+                "非 waveform-native 模型需要 --checkpoint（waveform-native artifact 模型设 "
+                "meta.allow_no_stft=true 可免，权重由模型配置内的 artifact 注入；"
+                "checkpoint 训练的 waveform-native 模型仍需 --checkpoint）"
             )
         model = _load_model(
             cfg,

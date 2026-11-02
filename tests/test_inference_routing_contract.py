@@ -574,7 +574,7 @@ def test_root_se_main_routes_real_adapter_to_public_runner(monkeypatch, tmp_path
     mocked_fingerprint["sha256"] = fingerprint_json(mocked_fingerprint)
     monkeypatch.setattr(inference, "build_artifact_fingerprint", lambda *_a, **_k: mocked_fingerprint)
     monkeypatch.setattr(inference, "inference_source_files", lambda *_a, **_k: [])
-    monkeypatch.setattr(inference, "configured_checkpoint_files", lambda *_a, **_k: [])
+    monkeypatch.setattr(inference, "configured_checkpoint_files", lambda *_a, **_k: {"artifact": str(source)})
     monkeypatch.setattr(inference, "verify_configured_checkpoint_fingerprints", lambda *_a, **_k: None)
     monkeypatch.setattr(inference, "_collect_files", lambda *_a, **_k: [("utt", str(source))])
     monkeypatch.setattr(tasks.se.models, "build_model", lambda *_a, **_k: Model())

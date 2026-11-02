@@ -30,7 +30,8 @@ The whole workflow is five steps: download the DNS3 sources, materialize paired 
 
 | File | Purpose |
 |------|---------|
-| [`gtcrn_causal_offline.yaml`](gtcrn_causal_offline.yaml) | The only DNS3 YAML: causal GTCRN on offline premixed pairs; experiment root `exp/se/dns_challenge3_gtcrn_causal_offline` |
+| [`gtcrn_causal_offline.yaml`](gtcrn_causal_offline.yaml) | Causal GTCRN on offline premixed pairs; experiment root `exp/se/dns_challenge3_gtcrn_causal_offline` |
+| [`cofi_lite_causal_offline.yaml`](cofi_lite_causal_offline.yaml) | Waveform-native CoFi-Lite (internal sqrt-Hann STFT/iSTFT) on the same generated pairs; experiment root `exp/se/cofi_lite_causal_offline` |
 
 ---
 
@@ -48,6 +49,8 @@ The whole workflow is five steps: download the DNS3 sources, materialize paired 
 | Optimizer | paper: AdamW, `lr=1e-3`, `wd=0.01`; current YAML: Adam, `lr=1e-3`, no weight decay |
 | Scheduler | paper: ReduceLROnPlateau (`patience=5`, `factor=0.5`); current YAML: LinearWarmupCosineAnnealing (25,000 warmup / 250,000 decay optimizer steps) |
 | Loss | Paper terminology: HybridLoss; the current YAML migrates/replaces the removed monolithic API with the explicit official-formula components `GTCRNCompressedSpectralLoss` + `GTCRNLogRatioLoss` in `CompositeLoss` |
+
+CoFi-Lite reuses the same generated pairs but has its own recipe: 10 s read length, batch 8 / validation batch 4, Adam `lr=1e-3`, linear-warmup cosine (25k/250k steps), `CoFiLiteHybridLoss`, and 200 epochs; see the YAML header and comments for the exact upstream mapping.
 
 ---
 

@@ -4,7 +4,8 @@
 ``forward(noisy_spec, lengths=None, *, fs=None) -> enhanced_spec``，不得在模型内重复变换。
 
 没有顶层 ``stft`` 的 waveform-native 路径仅适用于明确的端到端/生成式模型（例如
-PASE 家族）；它们实现 ``forward(noisy_wav, lengths=None, *, fs=None) -> enhanced_wav``，
+PASE 家族）和登记为 waveform-native 的判别式模型（``CoFiLite``）；它们实现
+``forward(noisy_wav, lengths=None, *, fs=None) -> enhanced_wav``，
 并由对应模型自行管理其特征前端。
 
 Multi-SR models (e.g. BSRNN, DeepFilterNet) may accept ``fs`` in forward;

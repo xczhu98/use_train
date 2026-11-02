@@ -13,9 +13,10 @@
 - `MultiBandRelativeContrastiveLoss`（MBRCL）
 - `TAPLoss`（官方兼容别名 `AcousticLoss`）
 - `ComplexIdealRatioMaskLoss`（cIRM-MSE）
+- `CoFiLiteHybridLoss`（CoFi-Lite 官方压缩谱 + SI-SNR 单 loss）
 - 以及负责组合它们的 `CompositeLoss`
 
-实现以 [`time_domain.py`](time_domain.py)、[`se_train_mr.py`](se_train_mr.py)、[`hybrid.py`](hybrid.py)（GTCRN 压缩谱项与 log-ratio 项）、[`mbrcl.py`](mbrcl.py)、[`tap.py`](tap.py)、[`complex_mask.py`](complex_mask.py) 和 [`composite.py`](composite.py) 为准；构建入口是 [`build.py`](build.py)。完整的 YAML 结构约束和多分辨率 schedule 说明见 [`Loss_Configuration_Guide.md`](../../docs/guides/loss/Loss_Configuration_Guide.md)；面向使用者的逐 Loss 公式、论文对照与归属边界由 [`docs/guides/loss/`](../../docs/guides/loss/README.md) 维护，本文只保留与实现直接相关的契约细节。
+实现以 [`time_domain.py`](time_domain.py)、[`se_train_mr.py`](se_train_mr.py)、[`hybrid.py`](hybrid.py)（GTCRN 压缩谱项与 log-ratio 项）、[`model_specific/cofi_lite.py`](model_specific/cofi_lite.py)（CoFi-Lite HybridLoss）、[`mbrcl.py`](mbrcl.py)、[`tap.py`](tap.py)、[`complex_mask.py`](complex_mask.py) 和 [`composite.py`](composite.py) 为准；构建入口是 [`build.py`](build.py)。完整的 YAML 结构约束和多分辨率 schedule 说明见 [`Loss_Configuration_Guide.md`](../../docs/guides/loss/Loss_Configuration_Guide.md)；面向使用者的逐 Loss 公式、论文对照与归属边界由 [`docs/guides/loss/`](../../docs/guides/loss/README.md) 维护，本文只保留与实现直接相关的契约细节。
 
 ## 术语速查
 
@@ -82,6 +83,8 @@ GTCRN 两个 component 都声明 `SUPPORTS_DIRECT_SPECTRA`：谱进谱出模型�
 **GTCRN 官方前端证据与项目边界**：固定上游 commit [`502ebfab`](https://github.com/Xiaobin-Rong/gtcrn/tree/502ebfab64da7c4a9af78dcb9c6ceef1ebb01c73) 的 [`loss.py`](https://github.com/Xiaobin-Rong/gtcrn/blob/502ebfab64da7c4a9af78dcb9c6ceef1ebb01c73/loss.py) 直接接收 `pred_stft/true_stft`，谱项后用 `512/256/512 + sqrt-Hann` 分别 iSTFT，再在所得波形对上计算尺度投影 log-ratio；同 commit 的 [`infer.py`](https://github.com/Xiaobin-Rong/gtcrn/blob/502ebfab64da7c4a9af78dcb9c6ceef1ebb01c73/infer.py) 则在 STFT 与 iSTFT 两端都使用同一 `sqrt-Hann`。该配对只是官方手工、无包络归一化 WOLA 前端的产物：分析窗与合成窗逐点相乘得到普通 Hann，50% overlap 下相邻 Hann 的 overlap-add 包络为常数，从而在无归一化条件下避免窗函数引入周期性幅度起伏；它不是公式本身的要求。同作者的 [`SEtrain/loss_factory.py`](https://github.com/Xiaobin-Rong/SEtrain/blob/3ec437d1adef76376775caa9e639d01208426380/loss_factory.py) 又提供了 waveform `HybridLoss` 证据：谱项用普通 Hann STFT，而投影项直接使用同一 `y_pred/y_true` raw waveform pair，说明作者代码族本身就存在“公式保持、前端几何随承载框架变化”的实现。
 
 本项目据此做的是与官方 `HybridLoss` **公式逐项对齐的组件拆分**：`GTCRNCompressedSpectralLoss` 对应官方 30/70 加权的压缩 RI/magnitude 项，`GTCRNLogRatioLoss` 对应尺度投影 log-ratio 项（`-log10(ratio+eps)`，非 dB）；`CompositeLoss` 将同一 raw `(enhanced, clean)` pair 和同一个 `lengths` 同时交给两个 component，`lengths=None` 时两者都消费完整波形，不做项目侧 trim。两个 component 都可额外接收由同一顶层 STFT 产生的 direct spectra，这不改变 raw pair 的共同调用语义。direct 路径的 iSTFT 完整继承模型顶层 `stft` 的有效 `n_fft` / `hop_length` / `win_length` / `window` / `center` / `normalized`，analysis/synthesis 使用同一普通窗（hann/hamming），NOLA 与几何合法性由 `resolve_stft_config` 在构造期校验，并依赖 `torch.istft` 自带的窗包络归一化对一致谱精确重建——官方 sqrt-Hann 两端配对只是其手工无归一化 WOLA 前端的产物，本项目不需要复制。
+
+`CoFiLiteHybridLoss`（`core/losses/model_specific/cofi_lite.py`）是 CoFi-Lite 上游 `loss_factory.py::HybridLoss` 的单 loss 逐项移植：普通 Hann STFT、`center=True`、默认 `30/70/c=0.3/eps=1e-12`，压缩谱项与 `-2*log10(||projection||/||residual||)` 的 SI-SNR 项在类内一次计算。它不声明 `SUPPORTS_DIRECT_SPECTRA`，并声明 `USE_FRAMEWORK_STFT_DEFAULTS=False`，始终使用自身构造参数/默认几何而不继承顶层 `stft`；因此始终使用 raw `(enhanced, clean)` waveform pair。提供 `lengths` 时谱项按有效 STFT 帧 mask 归约，SI-SNR 项将 padding 区置零，固定长度输入与上游公式逐项一致。配置见 `configs/se/dns_challenge3/cofi_lite_causal_offline.yaml`。
 
 模型顶层 `stft` 是生产分析几何的单一事实来源，完整有效参数为 `n_fft` / `hop_length` / `win_length` / `window` / `center` / `normalized`。框架要求 `n_fft`、`hop_length`，省略 `win_length`、`window`、`center`、`normalized` 时分别解析为 `n_fft`、`hann`、`true`、`false`，再向显式接受这些参数的 Loss 注入有效值。普通 STFT-aware Loss 保留显式 `args` 的 `setdefault` 覆盖语义；MBRCL 声明严格匹配，只要存在顶层上下文，其显式 STFT 参数就必须与框架有效值一致（window 名大小写不敏感），否则构建期 fail-fast。固定预训练几何的类可声明 `USE_FRAMEWORK_STFT_DEFAULTS = False` 完全退出注入；**`TAPLoss`/`AcousticLoss` 即采用该退出契约**，因为其 estimator 输入固定为 16 kHz、`512/160/512`、矩形窗与 `center=True`。
 

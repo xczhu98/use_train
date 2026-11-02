@@ -1531,8 +1531,13 @@ def _run_se_adapter_inference(
         else None,
     )
     stft_cfg = cfg.get("stft")
+    allow_no_stft = (cfg.get("meta") or {}).get("allow_no_stft", False)
     if not isinstance(stft_cfg, Mapping) or not stft_cfg:
-        raise ValueError("SE adapter inference requires a top-level stft config")
+        if not allow_no_stft:
+            raise ValueError("SE adapter inference requires a top-level stft config")
+        # CoFi-Lite 等 checkpoint 训练的 waveform-native 模型没有框架 STFT；
+        # SEInferenceAdapter 的自有前端路径由 stft=None 触发。
+        stft_cfg = None
     sample_rate = cfg.get("data", {}).get("sample_rate")
     if not isinstance(sample_rate, int) or sample_rate <= 0:
         raise ValueError("SE adapter inference requires data.sample_rate")
@@ -1542,12 +1547,12 @@ def _run_se_adapter_inference(
         cfg,
         checkpoint_path,
         device,
-        stft_cfg=dict(stft_cfg),
+        stft_cfg=dict(stft_cfg) if stft_cfg else None,
         expected_checkpoint_fingerprint=checkpoint_fingerprint,
     )
     adapter = SEInferenceAdapter(
         model,
-        stft=dict(stft_cfg),
+        stft=dict(stft_cfg) if stft_cfg else None,
         sample_rate=sample_rate,
     ).to(device)
     items = _scp_items(input_scp, output_path, roles=("noisy",))
@@ -1788,7 +1793,14 @@ def run_inference_se(
     checkpoint_path = absolute_path(checkpoint)
     output_path = absolute_path(output_dir)
     cfg_probe, _ = load_pipeline_config(config_path)
-    if input_scp is not None and not cfg_probe.get("stft") and (cfg_probe.get("meta") or {}).get("allow_no_stft", False):
+    probe_waveform_native = (
+        not cfg_probe.get("stft")
+        and (cfg_probe.get("meta") or {}).get("allow_no_stft", False)
+    )
+    probe_model_artifacts = probe_waveform_native and bool(
+        configured_checkpoint_files(cfg_probe.get("model", {}))
+    )
+    if input_scp is not None and probe_model_artifacts:
         return _run_se_waveform_adapter_inference(
             config_path=config_path, checkpoint_path=checkpoint_path,
             input_scp=input_scp, output_path=output_path, device=device,
@@ -1796,7 +1808,10 @@ def run_inference_se(
             allow_partial=allow_partial, skip_existing=skip_existing,
             chunk_seconds=chunk_seconds,
         )
-    if input_scp is not None and isinstance(cfg_probe.get("stft"), Mapping) and cfg_probe.get("stft"):
+    if input_scp is not None and (
+        (isinstance(cfg_probe.get("stft"), Mapping) and cfg_probe.get("stft"))
+        or probe_waveform_native
+    ):
         return _run_se_adapter_inference(
             config_path=config_path, checkpoint_path=checkpoint_path,
             input_scp=input_scp or input_dir, output_path=output_path, device=device,
